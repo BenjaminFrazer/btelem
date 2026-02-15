@@ -305,6 +305,56 @@ static void test_drain_packed_filtered(void)
     printf(" OK\n");
 }
 
+static void test_enum_schema_serialize(void)
+{
+    printf("test_enum_schema_serialize...");
+
+    /* Set up a fresh context with an enum field */
+    memset(ring_mem, 0, sizeof(ring_mem));
+    int rc = btelem_init(&ctx, ring_mem, RING_ENTRIES);
+    assert(rc == 0);
+
+    struct enum_test_data { uint8_t state; uint32_t value; };
+    static const char *state_labels[] = { "IDLE", "RUNNING", "FAULT" };
+    BTELEM_ENUM_DEF(test_state, state_labels);
+    static const struct btelem_field_def enum_fields[] = {
+        BTELEM_FIELD_ENUM(struct enum_test_data, state, test_state),
+        BTELEM_FIELD(struct enum_test_data, value, BTELEM_U32),
+    };
+    BTELEM_SCHEMA_ENTRY(ENUM_TEST, 0, "enum_test", "Enum test",
+                        struct enum_test_data, enum_fields);
+    btelem_register(&ctx, &btelem_schema_ENUM_TEST);
+
+    uint8_t buf[8192];
+    int len = btelem_schema_serialize(&ctx, buf, sizeof(buf));
+    assert(len > 0);
+
+    /* Expected: header + 1 schema_wire + uint16_t enum_count + 1 enum_wire */
+    int expected = (int)(sizeof(struct btelem_schema_header)
+                       + sizeof(struct btelem_schema_wire)
+                       + sizeof(uint16_t)
+                       + sizeof(struct btelem_enum_wire));
+    assert(len == expected);
+
+    /* Verify the enum section */
+    size_t enum_offset = sizeof(struct btelem_schema_header)
+                       + sizeof(struct btelem_schema_wire);
+    uint16_t enum_count;
+    memcpy(&enum_count, buf + enum_offset, sizeof(uint16_t));
+    assert(enum_count == 1);
+
+    const struct btelem_enum_wire *ew =
+        (const struct btelem_enum_wire *)(buf + enum_offset + sizeof(uint16_t));
+    assert(ew->schema_id == 0);
+    assert(ew->field_index == 0);
+    assert(ew->label_count == 3);
+    assert(strcmp(ew->labels[0], "IDLE") == 0);
+    assert(strcmp(ew->labels[1], "RUNNING") == 0);
+    assert(strcmp(ew->labels[2], "FAULT") == 0);
+
+    printf(" OK (%d bytes)\n", len);
+}
+
 /* ---- Main ---- */
 
 int main(void)
@@ -321,6 +371,7 @@ int main(void)
     test_schema_serialize_roundtrip();
     test_drain_packed();
     test_drain_packed_filtered();
+    test_enum_schema_serialize();
 
     printf("\nAll tests passed.\n");
     return 0;

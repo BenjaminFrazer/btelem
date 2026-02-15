@@ -200,8 +200,25 @@ int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_
         if (ctx->schema[i]) count++;
     }
 
+    /* Count enum fields across all schemas */
+    uint16_t enum_count = 0;
+    for (uint16_t i = 0; i < ctx->schema_count; i++) {
+        const struct btelem_schema_entry *e = ctx->schema[i];
+        if (!e) continue;
+        uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
+                    ? e->field_count : BTELEM_MAX_FIELDS;
+        for (uint16_t f = 0; f < fc; f++) {
+            if (e->fields[f].type == BTELEM_ENUM && e->fields[f].enum_def)
+                enum_count++;
+        }
+    }
+
     size_t needed = sizeof(struct btelem_schema_header)
                   + (size_t)count * sizeof(struct btelem_schema_wire);
+    if (enum_count > 0)
+        needed += sizeof(uint16_t)
+                + (size_t)enum_count * sizeof(struct btelem_enum_wire);
+
     if (buf_size < needed)
         return -1;
 
@@ -237,6 +254,36 @@ int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_
             fw->size   = e->fields[f].size;
             fw->type   = e->fields[f].type;
             fw->count  = e->fields[f].count;
+        }
+    }
+
+    /* Append enum metadata section */
+    if (enum_count > 0) {
+        uint8_t *p = (uint8_t *)buf + sizeof(*hdr)
+                   + (size_t)count * sizeof(struct btelem_schema_wire);
+        memcpy(p, &enum_count, sizeof(uint16_t));
+        p += sizeof(uint16_t);
+
+        for (uint16_t i = 0; i < ctx->schema_count; i++) {
+            const struct btelem_schema_entry *e = ctx->schema[i];
+            if (!e) continue;
+            uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
+                        ? e->field_count : BTELEM_MAX_FIELDS;
+            for (uint16_t f = 0; f < fc; f++) {
+                if (e->fields[f].type != BTELEM_ENUM || !e->fields[f].enum_def)
+                    continue;
+                struct btelem_enum_wire *ew = (struct btelem_enum_wire *)p;
+                ew->schema_id = e->id;
+                ew->field_index = f;
+                const struct btelem_enum_def *ed = e->fields[f].enum_def;
+                uint8_t lc = ed->label_count < BTELEM_ENUM_MAX_VALUES
+                           ? ed->label_count : BTELEM_ENUM_MAX_VALUES;
+                ew->label_count = lc;
+                for (uint8_t li = 0; li < lc; li++)
+                    strncpy(ew->labels[li], ed->labels[li],
+                            BTELEM_ENUM_LABEL_MAX - 1);
+                p += sizeof(struct btelem_enum_wire);
+            }
         }
     }
 

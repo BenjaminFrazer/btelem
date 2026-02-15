@@ -45,6 +45,7 @@ class _CachedSeries:
     timestamps: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
     values: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
     dirty: bool = True
+    enum_labels: list[str] | None = None
     # DPG widget tags — recreated on subplot rebuild
     line_tag: int | str | None = None
     scatter_tag: int | str | None = None
@@ -80,12 +81,14 @@ class SubPlot:
     def has_series(self, entry_name: str, field_name: str) -> bool:
         return self._series_key(entry_name, field_name) in self._series
 
-    def add_series(self, entry_name: str, field_name: str) -> None:
+    def add_series(self, entry_name: str, field_name: str,
+                   enum_labels: list[str] | None = None) -> None:
         key = self._series_key(entry_name, field_name)
         if key in self._series:
             return
         cs = _CachedSeries(entry_name=entry_name, field_name=field_name,
-                           color_index=self._color_index)
+                           color_index=self._color_index,
+                           enum_labels=enum_labels)
         self._color_index += 1
         self._series[key] = cs
         if self.y_axis_tag is not None:
@@ -134,30 +137,48 @@ class SubPlot:
         color = _PALETTE[cs.color_index % len(_PALETTE)]
         label = f"{cs.entry_name}.{cs.field_name}"
 
-        cs.line_tag = dpg.add_line_series([], [], label=label,
-                                           parent=self.y_axis_tag)
-        # ## prefix hides scatter from legend
-        cs.scatter_tag = dpg.add_scatter_series([], [], label=f"##{label}_sc",
-                                                 parent=self.y_axis_tag,
-                                                 show=False)
+        if cs.enum_labels:
+            cs.line_tag = dpg.add_stair_series([], [], label=label,
+                                                parent=self.y_axis_tag)
+            cs.scatter_tag = None
+            # Set custom Y-axis ticks for enum labels
+            ticks = tuple((lbl, float(i)) for i, lbl in enumerate(cs.enum_labels))
+            dpg.set_axis_ticks(self.y_axis_tag, ticks)
+            n = len(cs.enum_labels)
+            dpg.set_axis_limits(self.y_axis_tag, -0.5, n - 0.5)
 
-        with dpg.theme() as lt:
-            with dpg.theme_component(dpg.mvLineSeries):
-                dpg.add_theme_color(dpg.mvPlotCol_Line, color,
-                                    category=dpg.mvThemeCat_Plots)
-        cs.line_theme_tag = lt
-        dpg.bind_item_theme(cs.line_tag, lt)
+            with dpg.theme() as lt:
+                with dpg.theme_component(dpg.mvStairSeries):
+                    dpg.add_theme_color(dpg.mvPlotCol_Line, color,
+                                        category=dpg.mvThemeCat_Plots)
+            cs.line_theme_tag = lt
+            dpg.bind_item_theme(cs.line_tag, lt)
+            cs.scatter_theme_tag = None
+        else:
+            cs.line_tag = dpg.add_line_series([], [], label=label,
+                                               parent=self.y_axis_tag)
+            # ## prefix hides scatter from legend
+            cs.scatter_tag = dpg.add_scatter_series([], [], label=f"##{label}_sc",
+                                                     parent=self.y_axis_tag,
+                                                     show=False)
 
-        with dpg.theme() as st:
-            with dpg.theme_component(dpg.mvScatterSeries):
-                dpg.add_theme_color(dpg.mvPlotCol_Line, color,
-                                    category=dpg.mvThemeCat_Plots)
-                dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, color,
-                                    category=dpg.mvThemeCat_Plots)
-                dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, color,
-                                    category=dpg.mvThemeCat_Plots)
-        cs.scatter_theme_tag = st
-        dpg.bind_item_theme(cs.scatter_tag, st)
+            with dpg.theme() as lt:
+                with dpg.theme_component(dpg.mvLineSeries):
+                    dpg.add_theme_color(dpg.mvPlotCol_Line, color,
+                                        category=dpg.mvThemeCat_Plots)
+            cs.line_theme_tag = lt
+            dpg.bind_item_theme(cs.line_tag, lt)
+
+            with dpg.theme() as st:
+                with dpg.theme_component(dpg.mvScatterSeries):
+                    dpg.add_theme_color(dpg.mvPlotCol_Line, color,
+                                        category=dpg.mvThemeCat_Plots)
+                    dpg.add_theme_color(dpg.mvPlotCol_MarkerFill, color,
+                                        category=dpg.mvThemeCat_Plots)
+                    dpg.add_theme_color(dpg.mvPlotCol_MarkerOutline, color,
+                                        category=dpg.mvThemeCat_Plots)
+            cs.scatter_theme_tag = st
+            dpg.bind_item_theme(cs.scatter_tag, st)
 
     def _delete_dpg_series(self, cs: _CachedSeries) -> None:
         for tag in (cs.line_tag, cs.scatter_tag,
@@ -188,15 +209,31 @@ class SubPlot:
                 x = cs.timestamps.tolist()
                 y = cs.values.tolist()
                 dpg.configure_item(cs.line_tag, x=x, y=y)
-                dpg.configure_item(cs.scatter_tag, x=x, y=y)
+                if cs.scatter_tag is not None:
+                    dpg.configure_item(cs.scatter_tag, x=x, y=y)
+
+    def _has_enum_series(self) -> bool:
+        return any(cs.enum_labels for cs in self._series.values())
 
     def fit_y(self) -> None:
-        if self.y_axis_tag is not None:
+        if self.y_axis_tag is None:
+            return
+        if self._has_enum_series():
+            # Keep fixed Y range for enum labels
+            for cs in self._series.values():
+                if cs.enum_labels:
+                    n = len(cs.enum_labels)
+                    dpg.set_axis_limits(self.y_axis_tag, -0.5, n - 0.5)
+                    break
+        else:
             dpg.fit_axis_data(self.y_axis_tag)
 
     def set_y_lock(self, locked: bool) -> None:
         """When locked, ImPlot auto-fits Y each frame and ignores scroll zoom on Y."""
         if self.y_axis_tag is not None:
+            # Don't auto-fit Y for enum subplots — they have fixed tick range
+            if locked and self._has_enum_series():
+                return
             dpg.configure_item(self.y_axis_tag, auto_fit=locked)
 
     def set_no_inputs(self, no_inputs: bool) -> None:

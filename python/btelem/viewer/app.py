@@ -254,9 +254,16 @@ class ViewerApp:
                        field_name: str) -> None:
         """Called when a field is dragged onto a specific subplot."""
         assert self._plot_panel is not None
+        # Look up enum_labels from the provider's channel info
+        enum_labels = None
+        if self._provider is not None:
+            for ch in self._provider.channels():
+                if ch.entry_name == entry_name and ch.field_name == field_name:
+                    enum_labels = ch.enum_labels
+                    break
         for sp in self._plot_panel.subplots:
             if sp.id == subplot_id:
-                sp.add_series(entry_name, field_name)
+                sp.add_series(entry_name, field_name, enum_labels=enum_labels)
                 self._plot_panel.mark_dirty()
                 self._plot_panel.update_cache()
                 self._plot_panel.push_data()

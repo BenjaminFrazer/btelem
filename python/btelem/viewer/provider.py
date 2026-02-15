@@ -23,6 +23,7 @@ class ChannelInfo:
     field_name: str
     field_type: str  # human-readable, e.g. "F32", "U16"
     field_count: int
+    enum_labels: list[str] | None = None
 
 
 @dataclass
@@ -209,5 +210,6 @@ def _channels_from_schema(schema: Any) -> list[ChannelInfo]:
                 field_name=f.name,
                 field_type=f.type.name,
                 field_count=f.count,
+                enum_labels=getattr(f, "enum_labels", None),
             ))
     return channels

@@ -36,6 +36,10 @@ struct motor_state {
     float current;
 };
 
+struct system_status {
+    uint8_t state;   /* enum: IDLE, STARTING, RUNNING, STOPPING, FAULT */
+};
+
 /* -------------------------------------------------------------------------
  * 2. Schema
  * ---------------------------------------------------------------------- */
@@ -54,6 +58,17 @@ static const struct btelem_field_def motor_fields[] = {
 };
 BTELEM_SCHEMA_ENTRY(MOTOR, 1, "motor_state", "Motor controller",
                     struct motor_state, motor_fields);
+
+static const char *system_state_labels[] = {
+    "IDLE", "STARTING", "RUNNING", "STOPPING", "FAULT"
+};
+BTELEM_ENUM_DEF(system_state, system_state_labels);
+
+static const struct btelem_field_def status_fields[] = {
+    BTELEM_FIELD_ENUM(struct system_status, state, system_state),
+};
+BTELEM_SCHEMA_ENTRY(STATUS, 2, "system_status", "System state machine",
+                    struct system_status, status_fields);
 
 /* -------------------------------------------------------------------------
  * 3. Signal handling
@@ -104,6 +119,11 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
                    + gauss(0.1f),
     };
     BTELEM_LOG(ctx, MOTOR, m);
+
+    /* system_status: cycle through states every 2 seconds */
+    int phase = (int)(t / 2.0) % 5;
+    struct system_status st = { .state = (uint8_t)phase };
+    BTELEM_LOG(ctx, STATUS, st);
 }
 
 /* -------------------------------------------------------------------------
@@ -132,6 +152,7 @@ int main(void)
     btelem_init(&ctx, ring_mem, ring_entries);
     btelem_register(&ctx, &btelem_schema_SENSOR);
     btelem_register(&ctx, &btelem_schema_MOTOR);
+    btelem_register(&ctx, &btelem_schema_STATUS);
 
     struct btelem_server *srv = btelem_serve(&ctx, "0.0.0.0", PORT);
     if (!srv) {

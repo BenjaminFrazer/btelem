@@ -49,6 +49,7 @@ enum btelem_type {
     BTELEM_F64,
     BTELEM_BOOL,
     BTELEM_BYTES,
+    BTELEM_ENUM = 12,  /* uint8 storage, labels in schema metadata */
 };
 
 /* --------------------------------------------------------------------------
@@ -70,6 +71,15 @@ struct btelem_entry {
 #define BTELEM_ENTRY_SIZE (sizeof(struct btelem_entry))
 
 /* --------------------------------------------------------------------------
+ * Enum definitions (for BTELEM_ENUM fields)
+ * ----------------------------------------------------------------------- */
+
+struct btelem_enum_def {
+    const char *const *labels;
+    uint8_t            label_count;
+};
+
+/* --------------------------------------------------------------------------
  * Schema: field definitions and entry descriptors
  * ----------------------------------------------------------------------- */
 
@@ -79,6 +89,7 @@ struct btelem_field_def {
     uint16_t    size;
     uint8_t     type;       /* enum btelem_type */
     uint8_t     count;      /* 1 for scalar, >1 for array */
+    const struct btelem_enum_def *enum_def;  /* NULL for non-enum */
 };
 
 struct btelem_schema_entry {
@@ -100,7 +111,7 @@ struct btelem_schema_entry {
       (uint16_t)offsetof(stype, member), \
       (uint16_t)sizeof(((stype *)0)->member), \
       (uint8_t)(btype), \
-      1 }
+      1, NULL }
 
 /* Define an array field */
 #define BTELEM_ARRAY_FIELD(stype, member, btype, cnt) \
@@ -108,7 +119,21 @@ struct btelem_schema_entry {
       (uint16_t)offsetof(stype, member), \
       (uint16_t)sizeof(((stype *)0)->member), \
       (uint8_t)(btype), \
-      (uint8_t)(cnt) }
+      (uint8_t)(cnt), NULL }
+
+/* Define an enum label set */
+#define BTELEM_ENUM_DEF(name, labels_arr) \
+    static const struct btelem_enum_def btelem_enumdef_##name = { \
+        .labels = (labels_arr), \
+        .label_count = (uint8_t)(sizeof(labels_arr) / sizeof((labels_arr)[0])), \
+    }
+
+/* Define an enum field (uint8 storage with labels) */
+#define BTELEM_FIELD_ENUM(stype, member, enum_name) \
+    { #member, \
+      (uint16_t)offsetof(stype, member), \
+      (uint16_t)sizeof(((stype *)0)->member), \
+      BTELEM_ENUM, 1, &btelem_enumdef_##enum_name }
 
 /* Declare a complete schema entry (creates the schema_entry const) */
 #define BTELEM_SCHEMA_ENTRY(tag, _id, _name, _desc, stype, _fields) \
@@ -158,6 +183,22 @@ struct __attribute__((packed)) btelem_schema_header {
 _Static_assert(sizeof(struct btelem_field_wire)    == 70,   "btelem_field_wire packing");
 _Static_assert(sizeof(struct btelem_schema_wire)   == 1318, "btelem_schema_wire packing");
 _Static_assert(sizeof(struct btelem_schema_header) == 3,    "btelem_schema_header packing");
+
+/* --------------------------------------------------------------------------
+ * Enum metadata wire format (appended after schema entries)
+ * ----------------------------------------------------------------------- */
+
+#define BTELEM_ENUM_LABEL_MAX  32   /* max chars per label (incl. null) */
+#define BTELEM_ENUM_MAX_VALUES 32   /* max values per enum field */
+
+struct __attribute__((packed)) btelem_enum_wire {
+    uint16_t schema_id;                                            /*    2 */
+    uint16_t field_index;                                          /*    2 */
+    uint8_t  label_count;                                          /*    1 */
+    char     labels[BTELEM_ENUM_MAX_VALUES][BTELEM_ENUM_LABEL_MAX]; /* 1024 */
+};
+
+_Static_assert(sizeof(struct btelem_enum_wire) == 1029, "btelem_enum_wire packing");
 
 /* --------------------------------------------------------------------------
  * Entry wire format (packed, for batch transport)

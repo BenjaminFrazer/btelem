@@ -295,6 +295,81 @@ def test_read_c_generated_log():
     print(" OK")
 
 
+def test_enum_schema_roundtrip():
+    """Test Schema.to_bytes / from_bytes preserves enum labels."""
+    print("test_enum_schema_roundtrip...", end="")
+
+    schema = Schema([
+        SchemaEntry(0, "motor", "Motor", 5, [
+            FieldDef("state", 0, 1, BtelemType.ENUM, 1,
+                     enum_labels=["IDLE", "STARTING", "RUNNING", "FAULT"]),
+            FieldDef("rpm", 1, 4, BtelemType.F32),
+        ]),
+    ])
+
+    blob = schema.to_bytes()
+    schema2 = Schema.from_bytes(blob)
+
+    assert len(schema2.entries) == 1
+    f0 = schema2.entries[0].fields[0]
+    assert f0.name == "state"
+    assert f0.type == BtelemType.ENUM
+    assert f0.enum_labels == ["IDLE", "STARTING", "RUNNING", "FAULT"]
+
+    # Non-enum field should have no labels
+    f1 = schema2.entries[0].fields[1]
+    assert f1.enum_labels is None
+
+    print(" OK")
+
+
+def test_enum_decode():
+    """Test Schema.decode maps enum uint8 to label strings."""
+    print("test_enum_decode...", end="")
+
+    schema = Schema([
+        SchemaEntry(0, "test", "Test", 1, [
+            FieldDef("state", 0, 1, BtelemType.ENUM, 1,
+                     enum_labels=["OFF", "ON", "ERROR"]),
+        ]),
+    ])
+
+    # state=1 -> "ON"
+    result = schema.decode(0, bytes([1]))
+    assert result["state"] == "ON"
+
+    # state=0 -> "OFF"
+    result = schema.decode(0, bytes([0]))
+    assert result["state"] == "OFF"
+
+    # state=5 -> raw int (out of range)
+    result = schema.decode(0, bytes([5]))
+    assert result["state"] == 5
+
+    print(" OK")
+
+
+def test_enum_backward_compat():
+    """Old schema blobs (no enum section) still parse correctly."""
+    print("test_enum_backward_compat...", end="")
+
+    # Build a schema without enums and serialize
+    schema = Schema([
+        SchemaEntry(0, "test", "Test", 4, [
+            FieldDef("value", 0, 4, BtelemType.U32),
+        ]),
+    ])
+
+    blob = schema.to_bytes()
+
+    # Parse — should succeed without enum section
+    schema2 = Schema.from_bytes(blob)
+    assert len(schema2.entries) == 1
+    assert schema2.entries[0].fields[0].enum_labels is None
+
+    print(" OK")
+
+
 if __name__ == "__main__":
     print("btelem Python tests")
     print("====================\n")
@@ -307,5 +382,8 @@ if __name__ == "__main__":
     test_log_file_roundtrip()
     test_log_file_time_range()
     test_read_c_generated_log()
+    test_enum_schema_roundtrip()
+    test_enum_decode()
+    test_enum_backward_compat()
 
     print("\nAll tests passed.")

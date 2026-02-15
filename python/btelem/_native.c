@@ -65,6 +65,7 @@ type_to_npy(uint8_t btype)
     case BTELEM_F64:  return NPY_FLOAT64;
     case BTELEM_BOOL: return NPY_BOOL;
     case BTELEM_BYTES: return NPY_UINT8;
+    case BTELEM_ENUM: return NPY_UINT8;
     default:          return -1;
     }
 }
@@ -73,7 +74,7 @@ static int
 type_element_size(uint8_t btype)
 {
     switch (btype) {
-    case BTELEM_U8:   case BTELEM_I8:   case BTELEM_BOOL: case BTELEM_BYTES: return 1;
+    case BTELEM_U8:   case BTELEM_I8:   case BTELEM_BOOL: case BTELEM_BYTES: case BTELEM_ENUM: return 1;
     case BTELEM_U16:  case BTELEM_I16:  return 2;
     case BTELEM_U32:  case BTELEM_I32:  case BTELEM_F32:  return 4;
     case BTELEM_U64:  case BTELEM_I64:  case BTELEM_F64:  return 8;

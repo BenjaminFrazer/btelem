@@ -21,6 +21,7 @@ class BtelemType(IntEnum):
     F64 = 9
     BOOL = 10
     BYTES = 11
+    ENUM = 12
 
 
 # struct format chars indexed by BtelemType (little-endian base)
@@ -37,6 +38,7 @@ _TYPE_FMT = {
     BtelemType.F64: "d",
     BtelemType.BOOL: "?",
     BtelemType.BYTES: None,  # handled separately
+    BtelemType.ENUM: "B",    # uint8 storage
 }
 
 # Wire format constants (must match btelem_types.h)
@@ -56,6 +58,12 @@ _SCHEMA_WIRE_HEADER_SIZE = struct.calcsize(_SCHEMA_WIRE_FMT)  # 198
 _SCHEMA_WIRE_SIZE = _SCHEMA_WIRE_HEADER_SIZE + MAX_FIELDS * _FIELD_WIRE_SIZE  # 1318
 
 
+_ENUM_LABEL_MAX = 32
+_ENUM_MAX_VALUES = 32
+_ENUM_WIRE_FMT = f"<HHB{_ENUM_MAX_VALUES * _ENUM_LABEL_MAX}s"
+_ENUM_WIRE_SIZE = struct.calcsize(_ENUM_WIRE_FMT)  # 1029
+
+
 @dataclass
 class FieldDef:
     name: str
@@ -63,6 +71,7 @@ class FieldDef:
     size: int
     type: BtelemType
     count: int = 1
+    enum_labels: list[str] | None = None
 
 
 @dataclass
@@ -116,7 +125,10 @@ class Schema:
                 result[f.name] = list(values)
             else:
                 fmt = f"{self._prefix}{fmt_char}"
-                result[f.name] = struct.unpack_from(fmt, payload, f.offset)[0]
+                val = struct.unpack_from(fmt, payload, f.offset)[0]
+                if f.type == BtelemType.ENUM and f.enum_labels and val < len(f.enum_labels):
+                    val = f.enum_labels[val]
+                result[f.name] = val
 
         return result
 
@@ -152,7 +164,28 @@ class Schema:
             entries.append(SchemaEntry(eid, name, desc, payload_size, fields))
             pos += _SCHEMA_WIRE_SIZE
 
-        return cls(entries, endianness)
+        schema = cls(entries, endianness)
+
+        # Parse optional enum metadata section
+        if pos + 2 <= len(data):
+            enum_count = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            for _ in range(enum_count):
+                if pos + _ENUM_WIRE_SIZE > len(data):
+                    break
+                sid, fidx, lcount, labels_raw = struct.unpack_from(
+                    _ENUM_WIRE_FMT, data, pos)
+                pos += _ENUM_WIRE_SIZE
+                labels: list[str] = []
+                for li in range(lcount):
+                    off = li * _ENUM_LABEL_MAX
+                    raw = labels_raw[off:off + _ENUM_LABEL_MAX]
+                    labels.append(raw.split(b"\x00", 1)[0].decode("utf-8"))
+                entry = schema.entries.get(sid)
+                if entry and fidx < len(entry.fields):
+                    entry.fields[fidx].enum_labels = labels
+
+        return schema
 
     def to_bytes(self) -> bytes:
         """Serialise schema to packed struct wire format."""
@@ -174,5 +207,24 @@ class Schema:
                                  f.offset, f.size, f.type, f.count)
 
             buf.extend(entry_buf)
+
+        # Append enum metadata for fields with enum_labels
+        enum_fields: list[tuple[int, int, list[str]]] = []
+        for e in self.entries.values():
+            for fi, f in enumerate(e.fields[:MAX_FIELDS]):
+                if f.enum_labels:
+                    enum_fields.append((e.id, fi, f.enum_labels))
+
+        if enum_fields:
+            buf.extend(struct.pack("<H", len(enum_fields)))
+            for sid, fidx, labels in enum_fields:
+                lcount = min(len(labels), _ENUM_MAX_VALUES)
+                labels_raw = bytearray(_ENUM_MAX_VALUES * _ENUM_LABEL_MAX)
+                for li in range(lcount):
+                    encoded = labels[li].encode("utf-8")[:_ENUM_LABEL_MAX - 1]
+                    off = li * _ENUM_LABEL_MAX
+                    labels_raw[off:off + len(encoded)] = encoded
+                buf.extend(struct.pack(_ENUM_WIRE_FMT,
+                                       sid, fidx, lcount, bytes(labels_raw)))
 
         return bytes(buf)
