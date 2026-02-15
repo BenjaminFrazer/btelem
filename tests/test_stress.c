@@ -408,7 +408,9 @@ static int run_tcp(int port)
     btelem_register(&ctx, &btelem_schema_STRESS);
 
     /* Start the trace server */
-    struct btelem_server *srv = btelem_serve(&ctx, "127.0.0.1", (uint16_t)port);
+    static uint8_t schema_buf[BTELEM_SCHEMA_BUF_SIZE];
+    struct btelem_server *srv = btelem_serve(&ctx, "127.0.0.1", (uint16_t)port,
+                                             schema_buf, sizeof(schema_buf));
     if (!srv) {
         fprintf(stderr, "btelem_serve failed\n");
         return 1;

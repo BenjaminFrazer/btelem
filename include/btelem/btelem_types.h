@@ -200,6 +200,13 @@ struct __attribute__((packed)) btelem_enum_wire {
 
 _Static_assert(sizeof(struct btelem_enum_wire) == 1029, "btelem_enum_wire packing");
 
+/** Worst-case serialized schema size (suitable for static allocation). */
+#define BTELEM_SCHEMA_BUF_SIZE \
+    (sizeof(struct btelem_schema_header) \
+   + BTELEM_MAX_SCHEMA_ENTRIES * sizeof(struct btelem_schema_wire) \
+   + sizeof(uint16_t) \
+   + BTELEM_MAX_SCHEMA_ENTRIES * BTELEM_MAX_FIELDS * sizeof(struct btelem_enum_wire))
+
 /* --------------------------------------------------------------------------
  * Entry wire format (packed, for batch transport)
  *

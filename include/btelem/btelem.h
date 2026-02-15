@@ -79,15 +79,15 @@ int btelem_register(struct btelem_ctx *ctx, const struct btelem_schema_entry *en
     do { \
         _Static_assert(sizeof(data) <= BTELEM_MAX_PAYLOAD, \
                        "btelem: payload exceeds BTELEM_MAX_PAYLOAD"); \
-        struct btelem_ring *_r = (ctx)->ring; \
-        uint64_t _slot = btelem_atomic_fetch_add_relaxed(&_r->head, 1); \
-        struct btelem_entry *_e = &_r->entries[_slot & _r->mask]; \
-        btelem_atomic_store_rel((btelem_atomic_u64 *)&_e->seq, 0); \
-        _e->timestamp = BTELEM_TIMESTAMP(); \
-        _e->id = BTELEM_ID_##tag; \
-        _e->payload_size = (uint16_t)sizeof(data); \
-        memcpy(_e->payload, &(data), sizeof(data)); \
-        btelem_atomic_store_rel((btelem_atomic_u64 *)&_e->seq, _slot + 1); \
+        struct btelem_ring *_btlm_r = (ctx)->ring; \
+        uint64_t _btlm_slot = btelem_atomic_fetch_add_relaxed(&_btlm_r->head, 1); \
+        struct btelem_entry *_btlm_e = &_btlm_r->entries[_btlm_slot & _btlm_r->mask]; \
+        btelem_atomic_store_rel((btelem_atomic_u64 *)&_btlm_e->seq, 0); \
+        _btlm_e->timestamp = BTELEM_TIMESTAMP(); \
+        _btlm_e->id = BTELEM_ID_##tag; \
+        _btlm_e->payload_size = (uint16_t)sizeof(data); \
+        memcpy(_btlm_e->payload, &(data), sizeof(data)); \
+        btelem_atomic_store_rel((btelem_atomic_u64 *)&_btlm_e->seq, _btlm_slot + 1); \
     } while (0)
 
 /* --------------------------------------------------------------------------
@@ -144,9 +144,9 @@ int btelem_drain(struct btelem_ctx *ctx, int client_id,
 
 /**
  * Serialise the full schema into `buf`.
- * @param buf       Output buffer.
- * @param buf_size  Size of buf in bytes.
- * @return Number of bytes written, or -1 if buf too small.
+ * @param buf       Output buffer, or NULL to query the required size.
+ * @param buf_size  Size of buf in bytes (ignored when buf is NULL).
+ * @return Number of bytes written (or required when buf is NULL), or -1 on error.
  */
 int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_size);
 

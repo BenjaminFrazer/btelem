@@ -191,7 +191,7 @@ int btelem_drain(struct btelem_ctx *ctx, int client_id,
 
 int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_size)
 {
-    if (!ctx || !buf)
+    if (!ctx)
         return -1;
 
     /* Count registered entries */
@@ -218,6 +218,10 @@ int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_
     if (enum_count > 0)
         needed += sizeof(uint16_t)
                 + (size_t)enum_count * sizeof(struct btelem_enum_wire);
+
+    /* Size-query mode: buf=NULL returns required size without writing */
+    if (!buf)
+        return (int)needed;
 
     if (buf_size < needed)
         return -1;

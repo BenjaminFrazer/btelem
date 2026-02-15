@@ -24,6 +24,9 @@ struct btelem_server {
     volatile int         running;
     pthread_t            accept_thread;
 
+    const void          *schema_blob;
+    int                  schema_len;
+
     pthread_mutex_t      clients_mu;
     struct client_conn   clients[BTELEM_SERVE_MAX_CLIENTS];
 };
@@ -56,16 +59,12 @@ static void *client_thread(void *arg)
     struct btelem_ctx *ctx = srv->ctx;
     uint8_t pkt_buf[BTELEM_SERVE_PKT_BUF];
 
-    /* Send length-prefixed schema blob */
-    {
-        uint8_t schema_buf[8192];
-        int slen = btelem_schema_serialize(ctx, schema_buf, sizeof(schema_buf));
-        if (slen > 0) {
-            uint32_t schema_len = (uint32_t)slen;
-            if (send_all(conn->fd, &schema_len, 4) < 0 ||
-                send_all(conn->fd, schema_buf, schema_len) < 0)
-                goto done;
-        }
+    /* Send length-prefixed schema blob (pre-serialized at server start) */
+    if (srv->schema_len > 0) {
+        uint32_t slen = (uint32_t)srv->schema_len;
+        if (send_all(conn->fd, &slen, 4) < 0 ||
+            send_all(conn->fd, srv->schema_blob, srv->schema_len) < 0)
+            goto done;
     }
 
     /* Drain loop: send length-prefixed packed batches */
@@ -152,7 +151,8 @@ static void *accept_thread(void *arg)
  * ----------------------------------------------------------------------- */
 
 struct btelem_server *btelem_serve(struct btelem_ctx *ctx,
-                                   const char *ip, uint16_t port)
+                                   const char *ip, uint16_t port,
+                                   void *schema_buf, size_t schema_buf_size)
 {
     if (!ctx)
         return NULL;
@@ -194,6 +194,17 @@ struct btelem_server *btelem_serve(struct btelem_ctx *ctx,
     srv->listen_fd = lsock;
     srv->running = 1;
     pthread_mutex_init(&srv->clients_mu, NULL);
+
+    /* Serialize schema into caller-supplied buffer */
+    int slen = btelem_schema_serialize(ctx, schema_buf, schema_buf_size);
+    if (slen < 0) {
+        close(lsock);
+        pthread_mutex_destroy(&srv->clients_mu);
+        free(srv);
+        return NULL;
+    }
+    srv->schema_blob = schema_buf;
+    srv->schema_len = slen;
 
     for (int i = 0; i < BTELEM_SERVE_MAX_CLIENTS; i++) {
         srv->clients[i].fd = -1;
