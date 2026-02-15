@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: btelem
+Version: 0.1.0
+Summary: Binary telemetry decoder and tooling
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.20
+Provides-Extra: serial
+Requires-Dist: pyserial; extra == "serial"
+Provides-Extra: viewer
+Requires-Dist: dearpygui>=2.0; extra == "viewer"

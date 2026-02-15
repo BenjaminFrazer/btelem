@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64", "numpy>=1.20"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btelem"
+version = "0.1.0"
+description = "Binary telemetry decoder and tooling"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+serial = ["pyserial"]
+viewer = ["dearpygui>=2.0"]
+
+[project.scripts]
+btelem = "btelem.cli:main"
+btelem-viewer = "btelem.viewer:launch"

@@ -1,0 +1,7 @@
+numpy>=1.20
+
+[serial]
+pyserial
+
+[viewer]
+dearpygui>=2.0
