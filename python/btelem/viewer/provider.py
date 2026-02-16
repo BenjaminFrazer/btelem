@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import struct
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+
+from btelem.decoder import DecodedEntry, decode_packet
 
 
 @dataclass
@@ -55,6 +58,15 @@ class Provider(ABC):
     def is_live(self) -> bool:
         """True if this provider streams live data."""
 
+    @property
+    @abstractmethod
+    def schema(self) -> Any:
+        """Return the Schema object."""
+
+    @abstractmethod
+    def recent_events(self) -> list[DecodedEntry]:
+        """Return decoded entries added since last call."""
+
     def poll(self) -> bool:
         """Read from transport (live mode).  Return True if new data arrived.
 
@@ -94,10 +106,18 @@ class BtelemFileProvider(Provider):
 
         # Extract schema via LogReader (Capture doesn't expose field metadata)
         reader = LogReader(path)
-        schema = reader.open()
+        self._schema = reader.open()
+
+        # Read all decoded events for the event log
+        self._event_buf: list[DecodedEntry] = list(reader.entries())
+        self._events_delivered = False
         reader.close()
 
-        self._channels = _channels_from_schema(schema)
+        self._channels = _channels_from_schema(self._schema)
+
+    @property
+    def schema(self) -> Any:
+        return self._schema
 
     def channels(self) -> list[ChannelInfo]:
         return self._channels
@@ -121,6 +141,12 @@ class BtelemFileProvider(Provider):
     def is_live(self) -> bool:
         return False
 
+    def recent_events(self) -> list[DecodedEntry]:
+        if not self._events_delivered:
+            self._events_delivered = True
+            return self._event_buf
+        return []
+
     def close(self) -> None:
         self._capture.close()
 
@@ -137,12 +163,21 @@ class BtelemLiveProvider(Provider):
         from btelem.capture import LiveCapture
 
         self._transport = transport
+        self._schema = schema
         self._live = LiveCapture(schema_bytes)
         self._channels = _channels_from_schema(schema)
         self._has_data = False
 
+        # Event buffering for event log
+        self._event_buf: deque[DecodedEntry] = deque(maxlen=10000)
+        self._event_cursor: int = 0
+
         # Stream framing buffer (4-byte length prefix)
         self._buf = bytearray()
+
+    @property
+    def schema(self) -> Any:
+        return self._schema
 
     def channels(self) -> list[ChannelInfo]:
         return self._channels
@@ -189,11 +224,22 @@ class BtelemLiveProvider(Provider):
             pkt_bytes = bytes(self._buf[4:total])
             del self._buf[:total]
             self._live.add_packet(pkt_bytes)
+            self._event_buf.extend(
+                decode_packet(self._schema, pkt_bytes))
             got_packet = True
 
         if got_packet:
             self._has_data = True
         return got_packet
+
+    def recent_events(self) -> list[DecodedEntry]:
+        buf = self._event_buf
+        cursor = self._event_cursor
+        if cursor >= len(buf):
+            return []
+        events = list(buf)[cursor:]
+        self._event_cursor = len(buf)
+        return events
 
     def close(self) -> None:
         self._transport.close()

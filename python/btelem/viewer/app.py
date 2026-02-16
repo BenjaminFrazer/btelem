@@ -1,8 +1,11 @@
-"""DearPyGui application shell — layout, menu bar, dialogs, main loop."""
+"""DearPyGui application shell — dockable layout, viewport menu bar, main loop."""
 
 from __future__ import annotations
 
 import logging
+import os
+import zlib
+from pathlib import Path
 
 import numpy as np
 import dearpygui.dearpygui as dpg
@@ -10,8 +13,22 @@ import dearpygui.dearpygui as dpg
 from .provider import Provider, BtelemFileProvider, BtelemLiveProvider
 from .tree import TreeExplorer, FieldStats
 from .plots import PlotPanel
+from .event_log import EventLogManager
 
 logger = logging.getLogger(__name__)
+
+
+def _imgui_hash(s: str, seed: int = 0) -> int:
+    """Replicate ImGui's ImHashStr for null-terminated strings.
+
+    Handles the ### convention: CRC32 resets at ``###`` so only the part
+    from ``###`` onwards determines the ID.
+    """
+    data = s.encode("utf-8")
+    idx = data.find(b"###")
+    if idx >= 0:
+        return zlib.crc32(data[idx:]) & 0xFFFFFFFF
+    return zlib.crc32(data, seed) & 0xFFFFFFFF
 
 
 class ViewerApp:
@@ -21,6 +38,7 @@ class ViewerApp:
         self._provider: Provider | None = None
         self._tree: TreeExplorer | None = None
         self._plot_panel: PlotPanel | None = None
+        self._event_log_mgr: EventLogManager | None = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -31,50 +49,145 @@ class ViewerApp:
                             format="%(name)s: %(message)s")
 
         dpg.create_context()
+
+        ini_path = self._get_ini_path()
+        dpg.configure_app(docking=True, docking_space=True,
+                          init_file=ini_path, auto_save_init_file=True)
+
         dpg.create_viewport(title="btelem viewer", width=1280, height=720)
 
         self._build_layout()
         self._build_file_dialog()
 
+        # Write default docked layout if no ini exists yet.
+        # Must happen after _build_layout (UUIDs assigned) and before
+        # setup_dearpygui (which loads the ini).
+        if not os.path.exists(ini_path):
+            self._write_default_ini(ini_path)
+
         dpg.setup_dearpygui()
         dpg.show_viewport()
 
-    def _build_layout(self) -> None:
-        with dpg.window(tag="primary_window"):
-            # Menu bar
-            with dpg.menu_bar():
-                with dpg.menu(label="File"):
-                    dpg.add_menu_item(label="Open File...",
-                                      callback=self._on_open_file)
-                    dpg.add_menu_item(label="Connect Live...",
-                                      callback=self._on_show_live_dialog)
-                    dpg.add_separator()
-                    dpg.add_menu_item(label="Close Source",
-                                      callback=self._on_close_source)
-                    dpg.add_separator()
-                    dpg.add_menu_item(label="Quit",
-                                      callback=lambda: dpg.stop_dearpygui())
+    @staticmethod
+    def _get_ini_path() -> str:
+        config_dir = Path.home() / ".config" / "btelem"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        return str(config_dir / "layout.ini")
 
-            # Status bar (above panels so height=-1 doesn't push it off)
+    @staticmethod
+    def _write_default_ini(path: str) -> None:
+        """Write a default docked layout ini for first launch.
+
+        Computes ImGui window IDs from DearPyGui's internal labels
+        (``"Label###<uuid>"``) using the same CRC32 hash that ImGui uses.
+        If any ID is wrong (e.g. different ImGui version), ImGui simply
+        ignores the ini and windows float — graceful degradation.
+        """
+        # DearPyGui internal labels: "Label###<uuid>"
+        tree_uuid = dpg.get_alias_id("tree_window")
+        plot_uuid = dpg.get_alias_id("plot_window")
+        elog_uuid = dpg.get_alias_id("event_log_window_1")
+
+        tree_label = f"Tree###{tree_uuid}"
+        plot_label = f"Plots###{plot_uuid}"
+        elog_label = f"Event Log 1###{elog_uuid}"
+
+        tree_wid = _imgui_hash(tree_label)
+        plot_wid = _imgui_hash(plot_label)
+        elog_wid = _imgui_hash(elog_label)
+
+        # Viewport dockspace: ImGui's IMGUI_VIEWPORT_DEFAULT_ID = 0x11111111
+        viewport_id = 0x11111111
+        host_name = f"WindowOverViewport_{viewport_id:08X}"
+        host_wid = _imgui_hash(host_name)
+        ds_id = _imgui_hash("DockSpaceOverViewport", host_wid)
+
+        # Arbitrary dock node IDs (must be unique)
+        n_left = 0x00000003
+        n_right_split = 0x00000006
+        n_center = 0x00000004
+        n_right = 0x00000005
+
+        # Layout: Tree(250) | Plots(740) | EventLog(290)  total ~1280
+        ini = (
+            f"[Window][{host_name}]\n"
+            f"Pos=0,0\nSize=1280,720\nCollapsed=0\n\n"
+            f"[Window][{tree_label}]\n"
+            f"Pos=0,19\nSize=250,701\nCollapsed=0\n"
+            f"DockId=0x{n_left:08X},0\n\n"
+            f"[Window][{plot_label}]\n"
+            f"Pos=252,19\nSize=740,701\nCollapsed=0\n"
+            f"DockId=0x{n_center:08X},0\n\n"
+            f"[Window][{elog_label}]\n"
+            f"Pos=994,19\nSize=286,701\nCollapsed=0\n"
+            f"DockId=0x{n_right:08X},0\n\n"
+            f"[Docking][Data]\n"
+            f"DockSpace "
+            f"ID=0x{ds_id:08X} Window=0x{host_wid:08X} "
+            f"Pos=0,19 Size=1280,701 Split=X\n"
+            f"  DockNode  "
+            f"ID=0x{n_left:08X} Parent=0x{ds_id:08X} "
+            f"SizeRef=250,701 Selected=0x{tree_wid:08X}\n"
+            f"  DockNode  "
+            f"ID=0x{n_right_split:08X} Parent=0x{ds_id:08X} "
+            f"SizeRef=1030,701 Split=X\n"
+            f"    DockNode "
+            f"ID=0x{n_center:08X} Parent=0x{n_right_split:08X} "
+            f"SizeRef=740,701 Selected=0x{plot_wid:08X}\n"
+            f"    DockNode "
+            f"ID=0x{n_right:08X} Parent=0x{n_right_split:08X} "
+            f"SizeRef=286,701 Selected=0x{elog_wid:08X}\n"
+        )
+
+        try:
+            with open(path, "w") as f:
+                f.write(ini)
+            logger.info("wrote default layout ini: %s", path)
+        except OSError as e:
+            logger.warning("could not write default ini: %s", e)
+
+    def _build_layout(self) -> None:
+        # Viewport menu bar — stays visible regardless of docking
+        with dpg.viewport_menu_bar():
+            with dpg.menu(label="File"):
+                dpg.add_menu_item(label="Open File...",
+                                  callback=self._on_open_file)
+                dpg.add_menu_item(label="Connect Live...",
+                                  callback=self._on_show_live_dialog)
+                dpg.add_separator()
+                dpg.add_menu_item(label="Close Source",
+                                  callback=self._on_close_source)
+                dpg.add_separator()
+                dpg.add_menu_item(label="Quit",
+                                  callback=lambda: dpg.stop_dearpygui())
+
+            with dpg.menu(label="View"):
+                dpg.add_menu_item(label="+ Add Event Log",
+                                  callback=self._on_add_event_log)
+                dpg.add_separator()
+                dpg.add_menu_item(label="Reset Layout",
+                                  callback=self._on_reset_layout)
+
+            # Status text in the menu bar
             dpg.add_text("Status: No source loaded.", tag="status_bar")
 
-            # Main horizontal group: tree | plot
-            with dpg.group(horizontal=True):
-                # Left panel: tree explorer
-                with dpg.child_window(width=250, height=-1, tag="tree_panel",
-                                      border=True):
-                    dpg.add_text("No source loaded.", tag="tree_placeholder")
+        # Dockable tree window
+        with dpg.window(label="Tree", tag="tree_window", no_close=True,
+                        width=250, height=500, pos=[0, 30]):
+            dpg.add_text("No source loaded.", tag="tree_placeholder")
 
-                # Right panel: plot area
-                with dpg.child_window(width=-1, height=-1, tag="plot_panel",
-                                      border=True):
-                    pass
+        # Dockable plot window
+        with dpg.window(label="Plots", tag="plot_window", no_close=True,
+                        width=800, height=500, pos=[260, 30]):
+            pass
 
-        dpg.set_primary_window("primary_window", True)
+        # Create tree explorer and plot panel (they accept parent tags)
+        self._tree = TreeExplorer("tree_window")
+        self._plot_panel = PlotPanel("plot_window", on_drop=self._on_field_drop)
 
-        # Create tree explorer and plot panel
-        self._tree = TreeExplorer("tree_panel")
-        self._plot_panel = PlotPanel("plot_panel", on_drop=self._on_field_drop)
+        # Event log manager — default first table with stable tag for ini
+        self._event_log_mgr = EventLogManager()
+        self._event_log_mgr.add_table(window_tag="event_log_window_1")
 
     def _build_file_dialog(self) -> None:
         with dpg.file_dialog(directory_selector=False, show=False,
@@ -215,6 +328,12 @@ class ViewerApp:
 
         self._plot_panel.set_provider(provider)
 
+        # Set up event log
+        if self._event_log_mgr is not None:
+            self._event_log_mgr.set_provider(provider)
+            events = provider.recent_events()
+            self._event_log_mgr.append_events(events)
+
         # Get channel stats and build tree
         channels = provider.channels()
         logger.info("loaded %d channels", len(channels))
@@ -239,6 +358,8 @@ class ViewerApp:
             self._plot_panel.clear()
         if self._tree is not None:
             self._tree.clear()
+        if self._event_log_mgr is not None:
+            self._event_log_mgr.clear()
         if dpg.does_item_exist("tree_placeholder"):
             dpg.show_item("tree_placeholder")
         self._set_status("No source loaded.")
@@ -269,6 +390,18 @@ class ViewerApp:
                 self._plot_panel.push_data()
                 self._plot_panel.request_fit()
                 break
+
+    def _on_add_event_log(self) -> None:
+        if self._event_log_mgr is not None:
+            self._event_log_mgr.add_table()
+
+    def _on_reset_layout(self) -> None:
+        ini_path = self._get_ini_path()
+        try:
+            os.remove(ini_path)
+        except FileNotFoundError:
+            pass
+        self._set_status("Layout reset. Restart to apply.")
 
     # ------------------------------------------------------------------
     # Stats
@@ -318,6 +451,10 @@ class ViewerApp:
                 # Update stats in tree
                 if self._tree is not None and self._provider is not None:
                     self._tree.update_stats(self._compute_stats(self._provider))
+                # Append new events to event log
+                if self._event_log_mgr is not None and self._provider is not None:
+                    events = self._provider.recent_events()
+                    self._event_log_mgr.append_events(events)
 
             # 3. Per-frame tick (deferred fit, live scrolling)
             if self._plot_panel is not None:
