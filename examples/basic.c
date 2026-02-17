@@ -154,11 +154,10 @@ int main(void)
     btelem_register(&ctx, &btelem_schema_MOTOR);
     btelem_register(&ctx, &btelem_schema_STATUS);
 
-    static uint8_t schema_buf[BTELEM_SCHEMA_BUF_SIZE];
+    static struct btelem_server srv;
+    memset(&srv, 0, sizeof(srv));
 
-    struct btelem_server *srv = btelem_serve(&ctx, "0.0.0.0", PORT,
-                                             schema_buf, sizeof(schema_buf));
-    if (!srv) {
+    if (btelem_serve(&srv, &ctx, "0.0.0.0", PORT) < 0) {
         fprintf(stderr, "failed to start server on port %d\n", PORT);
         free(ring_mem);
         return 1;
@@ -188,7 +187,7 @@ int main(void)
     }
 
     printf("\nShutting down...\n");
-    btelem_server_stop(srv);
+    btelem_server_stop(&srv);
     free(ring_mem);
 
     return 0;

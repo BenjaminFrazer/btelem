@@ -295,6 +295,117 @@ int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_
 }
 
 /* --------------------------------------------------------------------------
+ * Schema streaming (zero-alloc, callback-based)
+ * ----------------------------------------------------------------------- */
+
+static void serialize_one_entry(const struct btelem_schema_entry *e,
+                                struct btelem_schema_wire *w)
+{
+    memset(w, 0, sizeof(*w));
+    w->id = e->id;
+    w->payload_size = e->payload_size;
+    w->field_count = e->field_count;
+    strncpy(w->name, e->name, BTELEM_NAME_MAX - 1);
+    if (e->description)
+        strncpy(w->description, e->description, BTELEM_DESC_MAX - 1);
+
+    uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
+                ? e->field_count : BTELEM_MAX_FIELDS;
+    for (uint16_t f = 0; f < fc; f++) {
+        struct btelem_field_wire *fw = &w->fields[f];
+        strncpy(fw->name, e->fields[f].name, BTELEM_NAME_MAX - 1);
+        fw->offset = e->fields[f].offset;
+        fw->size   = e->fields[f].size;
+        fw->type   = e->fields[f].type;
+        fw->count  = e->fields[f].count;
+    }
+}
+
+static void serialize_one_enum(const struct btelem_schema_entry *e,
+                               uint16_t field_index,
+                               struct btelem_enum_wire *ew)
+{
+    memset(ew, 0, sizeof(*ew));
+    ew->schema_id = e->id;
+    ew->field_index = field_index;
+    const struct btelem_enum_def *ed = e->fields[field_index].enum_def;
+    uint8_t lc = ed->label_count < BTELEM_ENUM_MAX_VALUES
+               ? ed->label_count : BTELEM_ENUM_MAX_VALUES;
+    ew->label_count = lc;
+    for (uint8_t li = 0; li < lc; li++)
+        strncpy(ew->labels[li], ed->labels[li], BTELEM_ENUM_LABEL_MAX - 1);
+}
+
+int btelem_schema_stream(const struct btelem_ctx *ctx,
+                         btelem_schema_emit_fn emit, void *user)
+{
+    if (!ctx || !emit)
+        return -1;
+
+    int total = 0;
+
+    /* 1. Header */
+    uint16_t count = 0;
+    uint16_t enum_count = 0;
+    for (uint16_t i = 0; i < ctx->schema_count; i++) {
+        const struct btelem_schema_entry *e = ctx->schema[i];
+        if (!e) continue;
+        count++;
+        uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
+                    ? e->field_count : BTELEM_MAX_FIELDS;
+        for (uint16_t f = 0; f < fc; f++) {
+            if (e->fields[f].type == BTELEM_ENUM && e->fields[f].enum_def)
+                enum_count++;
+        }
+    }
+
+    struct btelem_schema_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.endianness = ctx->endianness;
+    hdr.entry_count = count;
+    if (emit(&hdr, sizeof(hdr), user) != 0)
+        return -1;
+    total += (int)sizeof(hdr);
+
+    /* 2. Schema entries, one at a time */
+    for (uint16_t i = 0; i < ctx->schema_count; i++) {
+        const struct btelem_schema_entry *e = ctx->schema[i];
+        if (!e) continue;
+
+        struct btelem_schema_wire w;
+        serialize_one_entry(e, &w);
+        if (emit(&w, sizeof(w), user) != 0)
+            return -1;
+        total += (int)sizeof(w);
+    }
+
+    /* 3. Enum section */
+    if (enum_count > 0) {
+        if (emit(&enum_count, sizeof(uint16_t), user) != 0)
+            return -1;
+        total += (int)sizeof(uint16_t);
+
+        for (uint16_t i = 0; i < ctx->schema_count; i++) {
+            const struct btelem_schema_entry *e = ctx->schema[i];
+            if (!e) continue;
+            uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
+                        ? e->field_count : BTELEM_MAX_FIELDS;
+            for (uint16_t f = 0; f < fc; f++) {
+                if (e->fields[f].type != BTELEM_ENUM || !e->fields[f].enum_def)
+                    continue;
+                struct btelem_enum_wire ew;
+                serialize_one_enum(e, f, &ew);
+                if (emit(&ew, sizeof(ew), user) != 0)
+                    return -1;
+                total += (int)sizeof(ew);
+            }
+        }
+    }
+
+    return total;
+}
+
+/* --------------------------------------------------------------------------
  * Packed batch drain
  *
  * Builds: [packet_header(8)][entry_header(16) × N][payload_buffer]

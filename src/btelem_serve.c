@@ -7,29 +7,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-#define BTELEM_SERVE_MAX_CLIENTS 16
 #define BTELEM_SERVE_PKT_BUF    65536
-
-struct client_conn {
-    int                  fd;
-    int                  btelem_client_id;
-    struct btelem_server *server;
-    pthread_t            thread;
-    int                  active;
-};
-
-struct btelem_server {
-    struct btelem_ctx    *ctx;
-    int                  listen_fd;
-    volatile int         running;
-    pthread_t            accept_thread;
-
-    const void          *schema_blob;
-    int                  schema_len;
-
-    pthread_mutex_t      clients_mu;
-    struct client_conn   clients[BTELEM_SERVE_MAX_CLIENTS];
-};
 
 /* --------------------------------------------------------------------------
  * Helpers
@@ -48,22 +26,43 @@ static int send_all(int fd, const void *data, size_t len)
     return 0;
 }
 
+/* Callback context for streaming schema over a socket */
+struct schema_send_ctx {
+    int fd;
+    int error;
+};
+
+static int schema_send_chunk(const void *chunk, size_t len, void *user)
+{
+    struct schema_send_ctx *sc = (struct schema_send_ctx *)user;
+    if (send_all(sc->fd, chunk, len) < 0) {
+        sc->error = 1;
+        return -1;
+    }
+    return 0;
+}
+
 /* --------------------------------------------------------------------------
- * Client thread: send schema, then drain loop
+ * Client thread: stream schema, then drain loop
  * ----------------------------------------------------------------------- */
 
 static void *client_thread(void *arg)
 {
-    struct client_conn *conn = (struct client_conn *)arg;
+    struct btelem_client_conn *conn = (struct btelem_client_conn *)arg;
     struct btelem_server *srv = conn->server;
     struct btelem_ctx *ctx = srv->ctx;
     uint8_t pkt_buf[BTELEM_SERVE_PKT_BUF];
 
-    /* Send length-prefixed schema blob (pre-serialized at server start) */
-    if (srv->schema_len > 0) {
-        uint32_t slen = (uint32_t)srv->schema_len;
-        if (send_all(conn->fd, &slen, 4) < 0 ||
-            send_all(conn->fd, srv->schema_blob, srv->schema_len) < 0)
+    /* Send length-prefixed schema, streamed chunk-by-chunk */
+    int schema_size = btelem_schema_serialize(ctx, NULL, 0);
+    if (schema_size > 0) {
+        uint32_t slen = (uint32_t)schema_size;
+        if (send_all(conn->fd, &slen, 4) < 0)
+            goto done;
+
+        struct schema_send_ctx sc = { .fd = conn->fd, .error = 0 };
+        btelem_schema_stream(ctx, schema_send_chunk, &sc);
+        if (sc.error)
             goto done;
     }
 
@@ -131,7 +130,7 @@ static void *accept_thread(void *arg)
             continue;
         }
 
-        struct client_conn *conn = &srv->clients[slot];
+        struct btelem_client_conn *conn = &srv->clients[slot];
         conn->fd = fd;
         conn->btelem_client_id = btelem_cid;
         conn->server = srv;
@@ -150,16 +149,15 @@ static void *accept_thread(void *arg)
  * Public API
  * ----------------------------------------------------------------------- */
 
-struct btelem_server *btelem_serve(struct btelem_ctx *ctx,
-                                   const char *ip, uint16_t port,
-                                   void *schema_buf, size_t schema_buf_size)
+int btelem_serve(struct btelem_server *srv, struct btelem_ctx *ctx,
+                 const char *ip, uint16_t port)
 {
-    if (!ctx)
-        return NULL;
+    if (!srv || !ctx)
+        return -1;
 
     int lsock = socket(AF_INET, SOCK_STREAM, 0);
     if (lsock < 0)
-        return NULL;
+        return -1;
 
     int opt = 1;
     setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -176,35 +174,18 @@ struct btelem_server *btelem_serve(struct btelem_ctx *ctx,
 
     if (bind(lsock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(lsock);
-        return NULL;
+        return -1;
     }
 
     if (listen(lsock, 8) < 0) {
         close(lsock);
-        return NULL;
-    }
-
-    struct btelem_server *srv = calloc(1, sizeof(*srv));
-    if (!srv) {
-        close(lsock);
-        return NULL;
+        return -1;
     }
 
     srv->ctx = ctx;
     srv->listen_fd = lsock;
     srv->running = 1;
     pthread_mutex_init(&srv->clients_mu, NULL);
-
-    /* Serialize schema into caller-supplied buffer */
-    int slen = btelem_schema_serialize(ctx, schema_buf, schema_buf_size);
-    if (slen < 0) {
-        close(lsock);
-        pthread_mutex_destroy(&srv->clients_mu);
-        free(srv);
-        return NULL;
-    }
-    srv->schema_blob = schema_buf;
-    srv->schema_len = slen;
 
     for (int i = 0; i < BTELEM_SERVE_MAX_CLIENTS; i++) {
         srv->clients[i].fd = -1;
@@ -214,16 +195,15 @@ struct btelem_server *btelem_serve(struct btelem_ctx *ctx,
     if (pthread_create(&srv->accept_thread, NULL, accept_thread, srv) != 0) {
         close(lsock);
         pthread_mutex_destroy(&srv->clients_mu);
-        free(srv);
-        return NULL;
+        return -1;
     }
 
-    return srv;
+    return 0;
 }
 
 void btelem_server_stop(struct btelem_server *server)
 {
-    if (!server)
+    if (!server || !server->running)
         return;
 
     server->running = 0;
@@ -261,5 +241,4 @@ void btelem_server_stop(struct btelem_server *server)
     }
 
     pthread_mutex_destroy(&server->clients_mu);
-    free(server);
 }

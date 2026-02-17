@@ -150,6 +150,32 @@ int btelem_drain(struct btelem_ctx *ctx, int client_id,
  */
 int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_size);
 
+/**
+ * Callback for btelem_schema_stream().
+ * Called once per fixed-size chunk (header, schema entry, enum entry).
+ * @param chunk  Pointer to the chunk data.
+ * @param len    Length of the chunk in bytes.
+ * @param user   User context.
+ * @return 0 to continue, non-zero to abort.
+ */
+typedef int (*btelem_schema_emit_fn)(const void *chunk, size_t len, void *user);
+
+/**
+ * Stream the schema in fixed-size chunks via callback.
+ *
+ * Emits the schema one piece at a time using only stack space (~1.3 KB).
+ * Chunk order: header, schema entries (one per call), enum count + enum
+ * entries (one per call).  The total byte count across all chunks equals
+ * what btelem_schema_serialize(ctx, NULL, 0) would return.
+ *
+ * @param ctx   Context with registered schemas.
+ * @param emit  Callback invoked for each chunk.
+ * @param user  Passed through to emit.
+ * @return Total bytes emitted, or -1 on error / callback abort.
+ */
+int btelem_schema_stream(const struct btelem_ctx *ctx,
+                         btelem_schema_emit_fn emit, void *user);
+
 /* --------------------------------------------------------------------------
  * Packed batch drain (for transport)
  *

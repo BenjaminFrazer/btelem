@@ -408,10 +408,9 @@ static int run_tcp(int port)
     btelem_register(&ctx, &btelem_schema_STRESS);
 
     /* Start the trace server */
-    static uint8_t schema_buf[BTELEM_SCHEMA_BUF_SIZE];
-    struct btelem_server *srv = btelem_serve(&ctx, "127.0.0.1", (uint16_t)port,
-                                             schema_buf, sizeof(schema_buf));
-    if (!srv) {
+    static struct btelem_server srv;
+    memset(&srv, 0, sizeof(srv));
+    if (btelem_serve(&srv, &ctx, "127.0.0.1", (uint16_t)port) < 0) {
         fprintf(stderr, "btelem_serve failed\n");
         return 1;
     }
@@ -440,7 +439,7 @@ static int run_tcp(int port)
     /* Let the drain loop flush remaining data */
     usleep(50000);
 
-    btelem_server_stop(srv);
+    btelem_server_stop(&srv);
 
     printf("TCP mode done.\n");
     return 0;
