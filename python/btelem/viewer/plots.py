@@ -306,6 +306,243 @@ class SubPlot:
             self._on_drop(self.id, entry_name, field_name)
 
 
+@dataclass
+class _TimingRow:
+    """One row in a timing diagram — stores timestamps for vertical tick marks."""
+    key: str
+    label: str
+    entry_name: str
+    field_name: str
+    row_index: int = 0
+    color_index: int = 0
+    timestamps: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
+    values: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
+    dirty: bool = True
+    line_tag: int | str | None = None
+    line_theme_tag: int | str | None = None
+
+
+class TimingSubPlot:
+    """Timing diagram — thin vertical lines at event timestamps, one row per signal."""
+
+    is_timing = True
+
+    def __init__(self, subplot_id: int,
+                 on_drop: callable | None = None,
+                 on_remove: callable | None = None) -> None:
+        self.id = subplot_id
+        self._rows: dict[str, _TimingRow] = {}
+        self._on_drop = on_drop
+        self._on_remove = on_remove
+        self._color_index = 0
+        self.plot_tag: int | str | None = None
+        self.x_axis_tag: int | str | None = None
+        self.y_axis_tag: int | str | None = None
+        self._legend_tag: int | str | None = None
+        self._popup_tag: int | str | None = None
+
+    # -- series interface (duck-types with SubPlot) --
+
+    def has_series(self, entry_name: str, field_name: str) -> bool:
+        return f"{entry_name}.{field_name}" in self._rows
+
+    def add_series(self, entry_name: str, field_name: str,
+                   enum_labels: list[str] | None = None) -> None:
+        key = f"{entry_name}.{field_name}"
+        if key in self._rows:
+            return
+        self._add_row(key, f"{entry_name}.{field_name}",
+                       entry_name, field_name)
+
+    def add_entry_row(self, entry_name: str, query_field: str) -> None:
+        """Add a single row for an entire entry type."""
+        if entry_name in self._rows:
+            return
+        self._add_row(entry_name, entry_name, entry_name, query_field)
+
+    def _add_row(self, key: str, label: str,
+                 entry_name: str, field_name: str) -> None:
+        row = _TimingRow(
+            key=key, label=label,
+            entry_name=entry_name, field_name=field_name,
+            row_index=len(self._rows),
+            color_index=self._color_index,
+        )
+        self._color_index += 1
+        self._rows[key] = row
+        if self.y_axis_tag is not None:
+            self._create_dpg_row(row)
+            self._update_y_ticks()
+            self._rebuild_popup()
+
+    def remove_series(self, entry_name: str, field_name: str) -> None:
+        key = f"{entry_name}.{field_name}"
+        self._remove_row(key)
+
+    def _remove_row(self, key: str) -> None:
+        row = self._rows.pop(key, None)
+        if row is None:
+            return
+        self._delete_dpg_row(row)
+        for i, r in enumerate(self._rows.values()):
+            r.row_index = i
+        self._update_y_ticks()
+        self.push_data()
+        self._rebuild_popup()
+
+    def clear_series(self) -> None:
+        for row in self._rows.values():
+            self._delete_dpg_row(row)
+        self._rows.clear()
+        self._color_index = 0
+        self._update_y_ticks()
+        self._rebuild_popup()
+
+    def get_all_series(self) -> list[_TimingRow]:
+        return list(self._rows.values())
+
+    # -- widget lifecycle --
+
+    def create_widgets(self, parent: int | str) -> None:
+        self.plot_tag = dpg.add_plot(
+            label=f"Timing {self.id}",
+            parent=parent,
+            anti_aliased=True,
+            drop_callback=self._drop_callback,
+            payload_type="btelem_field",
+        )
+        self._legend_tag = dpg.add_plot_legend(parent=self.plot_tag)
+        self.x_axis_tag = dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)",
+                                             parent=self.plot_tag)
+        self.y_axis_tag = dpg.add_plot_axis(dpg.mvYAxis, label="",
+                                             parent=self.plot_tag)
+
+        for row in self._rows.values():
+            self._create_dpg_row(row)
+        self._update_y_ticks()
+        self._rebuild_popup()
+
+    def _create_dpg_row(self, row: _TimingRow) -> None:
+        if self.y_axis_tag is None:
+            return
+        color = _PALETTE[row.color_index % len(_PALETTE)]
+        row.line_tag = dpg.add_line_series([], [], label=row.label,
+                                            parent=self.y_axis_tag)
+        with dpg.theme() as lt:
+            with dpg.theme_component(dpg.mvLineSeries):
+                dpg.add_theme_color(dpg.mvPlotCol_Line, color,
+                                    category=dpg.mvThemeCat_Plots)
+        row.line_theme_tag = lt
+        dpg.bind_item_theme(row.line_tag, lt)
+
+    def _delete_dpg_row(self, row: _TimingRow) -> None:
+        for tag in (row.line_tag, row.line_theme_tag):
+            if tag is not None and dpg.does_item_exist(tag):
+                dpg.delete_item(tag)
+        row.line_tag = row.line_theme_tag = None
+
+    def _update_y_ticks(self) -> None:
+        if self.y_axis_tag is None:
+            return
+        n = len(self._rows)
+        if n > 0:
+            ticks = tuple((r.label, float(r.row_index))
+                          for r in self._rows.values())
+            dpg.set_axis_ticks(self.y_axis_tag, ticks)
+            dpg.set_axis_limits(self.y_axis_tag, -0.5, n - 0.5)
+        else:
+            dpg.reset_axis_ticks(self.y_axis_tag)
+
+    def destroy_widgets(self) -> None:
+        for row in self._rows.values():
+            if row.line_theme_tag is not None and dpg.does_item_exist(row.line_theme_tag):
+                dpg.delete_item(row.line_theme_tag)
+            row.line_tag = row.line_theme_tag = None
+        self.plot_tag = None
+        self.x_axis_tag = None
+        self.y_axis_tag = None
+        self._legend_tag = None
+        self._popup_tag = None
+
+    # -- data --
+
+    def push_data(self) -> None:
+        for row in self._rows.values():
+            if row.line_tag is None or len(row.timestamps) == 0:
+                continue
+            # NaN-separated vertical segments: (t, r-0.4) → (t, r+0.4) → NaN
+            n = len(row.timestamps)
+            x = np.empty(n * 3, dtype=np.float64)
+            y = np.empty(n * 3, dtype=np.float64)
+            r = float(row.row_index)
+            x[0::3] = row.timestamps
+            x[1::3] = row.timestamps
+            x[2::3] = np.nan
+            y[0::3] = r - 0.4
+            y[1::3] = r + 0.4
+            y[2::3] = np.nan
+            dpg.configure_item(row.line_tag, x=x.tolist(), y=y.tolist())
+
+    def fit_y(self) -> None:
+        if self.y_axis_tag is None:
+            return
+        n = len(self._rows)
+        if n > 0:
+            dpg.set_axis_limits(self.y_axis_tag, -0.5, n - 0.5)
+
+    def set_y_lock(self, locked: bool) -> None:
+        pass  # Y is always fixed for timing plots
+
+    def set_no_inputs(self, no_inputs: bool) -> None:
+        if self.plot_tag is not None:
+            dpg.configure_item(self.plot_tag, no_inputs=no_inputs)
+
+    def update_scatter_visibility(self, x_min: float, x_max: float) -> None:
+        pass
+
+    def is_legend_hovered(self) -> bool:
+        return self._legend_tag is not None and dpg.is_item_hovered(self._legend_tag)
+
+    # -- popup --
+
+    def _rebuild_popup(self) -> None:
+        if self._popup_tag is not None and dpg.does_item_exist(self._popup_tag):
+            dpg.delete_item(self._popup_tag)
+            self._popup_tag = None
+
+        with dpg.window(popup=True, show=False, no_title_bar=True) as popup:
+            self._popup_tag = popup
+            for row in self._rows.values():
+                dpg.add_menu_item(
+                    label=f"Remove {row.label}",
+                    callback=self._remove_row_cb,
+                    user_data=row.key,
+                )
+            if self._rows:
+                dpg.add_separator()
+            dpg.add_menu_item(label="Clear All",
+                              callback=lambda: self.clear_series())
+            dpg.add_menu_item(label="Remove Plot",
+                              callback=lambda: self._remove_via_menu())
+
+    def show_popup(self) -> None:
+        if self._popup_tag is not None and dpg.does_item_exist(self._popup_tag):
+            dpg.configure_item(self._popup_tag, show=True,
+                               pos=dpg.get_mouse_pos(local=False))
+
+    def _remove_row_cb(self, sender, app_data, user_data) -> None:
+        self._remove_row(user_data)
+
+    def _remove_via_menu(self) -> None:
+        if self._on_remove is not None:
+            self._on_remove(self.id)
+
+    def _drop_callback(self, sender: int, app_data: object) -> None:
+        if self._on_drop is not None and app_data is not None:
+            entry_name, field_name = app_data
+            self._on_drop(self.id, entry_name, field_name)
+
+
 class PlotPanel:
     """Manages N subplots in a vertical stack with linked X-axes."""
 
@@ -319,7 +556,7 @@ class PlotPanel:
         self._live_window_sec: float = 10.0
         self._fit_frames: int = 0
 
-        self.subplots: list[SubPlot] = []
+        self.subplots: list[SubPlot | TimingSubPlot] = []
         self._subplots_container: int | str | None = None
         self._toolbar: int | str | None = None
         self._follow_btn: int | str | None = None
@@ -350,6 +587,8 @@ class PlotPanel:
         )
         dpg.add_button(label="+ Add Plot", parent=self._toolbar,
                         callback=lambda: self.add_plot())
+        dpg.add_button(label="+ Add Timing", parent=self._toolbar,
+                        callback=lambda: self.add_timing_plot())
         dpg.add_button(label="Clear All", parent=self._toolbar,
                         callback=lambda: self.clear_all_series())
         dpg.add_button(label="Reset Data", parent=self._toolbar,
@@ -435,6 +674,13 @@ class PlotPanel:
 
     def add_plot(self) -> SubPlot:
         sp = self._add_subplot()
+        self._rebuild_subplots()
+        return sp
+
+    def add_timing_plot(self) -> TimingSubPlot:
+        sid = _next_id()
+        sp = TimingSubPlot(sid, on_drop=self._on_drop, on_remove=self.remove_plot)
+        self.subplots.append(sp)
         self._rebuild_subplots()
         return sp
 
