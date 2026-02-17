@@ -73,6 +73,7 @@ class SubPlot:
         self.plot_tag: int | str | None = None
         self.x_axis_tag: int | str | None = None
         self.y_axis_tag: int | str | None = None
+        self._legend_tag: int | str | None = None
         self._popup_tag: int | str | None = None
 
     def _series_key(self, entry_name: str, field_name: str) -> str:
@@ -119,7 +120,7 @@ class SubPlot:
             payload_type="btelem_field",
         )
 
-        dpg.add_plot_legend(parent=self.plot_tag)
+        self._legend_tag = dpg.add_plot_legend(parent=self.plot_tag)
 
         self.x_axis_tag = dpg.add_plot_axis(dpg.mvXAxis, label="Time (s)",
                                              parent=self.plot_tag)
@@ -199,6 +200,7 @@ class SubPlot:
         self.plot_tag = None
         self.x_axis_tag = None
         self.y_axis_tag = None
+        self._legend_tag = None
         self._popup_tag = None
 
     def push_data(self) -> None:
@@ -256,15 +258,16 @@ class SubPlot:
     def get_all_series(self) -> list[_CachedSeries]:
         return list(self._series.values())
 
+    def is_legend_hovered(self) -> bool:
+        return self._legend_tag is not None and dpg.is_item_hovered(self._legend_tag)
+
     def _rebuild_popup(self) -> None:
-        """Rebuild the right-click context menu with current series list."""
-        if self.plot_tag is None:
-            return
+        """Rebuild the right-click popup window for the legend."""
         if self._popup_tag is not None and dpg.does_item_exist(self._popup_tag):
             dpg.delete_item(self._popup_tag)
             self._popup_tag = None
 
-        with dpg.popup(self.plot_tag, mousebutton=dpg.mvMouseButton_Right) as popup:
+        with dpg.window(popup=True, show=False, no_title_bar=True) as popup:
             self._popup_tag = popup
             for cs in self._series.values():
                 label = f"{cs.entry_name}.{cs.field_name}"
@@ -279,6 +282,12 @@ class SubPlot:
                               callback=lambda: self._clear_via_menu())
             dpg.add_menu_item(label="Remove Plot",
                               callback=lambda: self._remove_via_menu())
+
+    def show_popup(self) -> None:
+        """Show the popup window at the current mouse position."""
+        if self._popup_tag is not None and dpg.does_item_exist(self._popup_tag):
+            dpg.configure_item(self._popup_tag, show=True,
+                               pos=dpg.get_mouse_pos(local=False))
 
     def _remove_series_cb(self, sender: int, app_data: object,
                           user_data: tuple[str, str]) -> None:
@@ -370,7 +379,17 @@ class PlotPanel:
     def _setup_wheel_handler(self) -> None:
         with dpg.handler_registry() as hr:
             dpg.add_mouse_wheel_handler(callback=self._on_mouse_wheel)
+            dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Right,
+                                        callback=self._on_right_click)
         self._wheel_handler = hr
+
+    def _on_right_click(self, sender: int, app_data: int) -> None:
+        if not dpg.is_key_down(dpg.mvKey_LControl) and not dpg.is_key_down(dpg.mvKey_RControl):
+            return
+        for sp in self.subplots:
+            if sp.plot_tag is not None and dpg.is_item_hovered(sp.plot_tag):
+                sp.show_popup()
+                return
 
     def _on_mouse_wheel(self, sender: int, app_data: float) -> None:
         if self._mode != XAxisMode.FOLLOW:

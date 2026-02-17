@@ -26,6 +26,12 @@ def _fmt_stats(s: FieldStats) -> str:
     return f"n={s.count}  [{s.min_val:.4g}, {s.max_val:.4g}]"
 
 
+def _entry_label(entry_name: str, count: int) -> str:
+    if count > 0:
+        return f"{entry_name}  (n={count})"
+    return entry_name
+
+
 class TreeExplorer:
     """Builds a DearPyGui tree from provider channels.
 
@@ -35,48 +41,137 @@ class TreeExplorer:
     def __init__(self, parent: int | str) -> None:
         self._parent = parent
         self._group: int | str | None = None
+        self._tree_group: int | str | None = None
+        self._channels: list[ChannelInfo] = []
+        self._stats: dict[tuple[str, str], FieldStats] | None = None
+        self._filter_text: str = ""
+        self._entry_nodes: dict[str, int | str] = {}
 
     def build(self, channels: list[ChannelInfo],
               stats: dict[tuple[str, str], FieldStats] | None = None) -> None:
         """(Re)build the tree from a list of channels."""
+        self._channels = channels
+        self._stats = stats
+        self._filter_text = ""
+
         if self._group is not None and dpg.does_item_exist(self._group):
             dpg.delete_item(self._group)
 
         self._group = dpg.add_group(parent=self._parent)
+        dpg.add_input_text(
+            hint="Search signals...",
+            parent=self._group,
+            callback=self._on_filter_changed,
+        )
+        dpg.add_separator(parent=self._group)
+
+        self._tree_group = None
+        self._rebuild_tree()
+
+    def _rebuild_tree(self) -> None:
+        """Rebuild tree content below the search bar."""
+        if self._tree_group is not None and dpg.does_item_exist(self._tree_group):
+            dpg.delete_item(self._tree_group)
+
+        self._tree_group = dpg.add_group(parent=self._group)
+        self._entry_nodes.clear()
 
         grouped: dict[str, list[ChannelInfo]] = defaultdict(list)
-        for ch in channels:
+        for ch in self._channels:
             grouped[ch.entry_name].append(ch)
 
+        filt = self._filter_text.lower()
+
         for entry_name, fields in grouped.items():
-            with dpg.tree_node(label=entry_name, parent=self._group,
-                               default_open=True):
-                for ch in fields:
+            # Determine visible fields based on filter
+            if filt:
+                entry_match = filt in entry_name.lower()
+                field_matches = [ch for ch in fields
+                                 if filt in ch.field_name.lower()]
+                if not entry_match and not field_matches:
+                    continue
+                visible_fields = fields if entry_match else field_matches
+            else:
+                visible_fields = fields
+
+            entry_count = self._entry_sample_count(entry_name, fields)
+            label = _entry_label(entry_name, entry_count)
+
+            # Expand nodes when filtering to show results
+            default_open = bool(filt)
+
+            with dpg.tree_node(label=label, parent=self._tree_group,
+                               default_open=default_open) as node_id:
+                self._entry_nodes[entry_name] = node_id
+                with dpg.drag_payload(
+                    parent=node_id,
+                    drag_data=(entry_name, None),
+                    payload_type="btelem_field",
+                ):
+                    dpg.add_text(entry_name)
+                for ch in visible_fields:
                     with dpg.group(horizontal=True):
-                        label = dpg.add_text(
+                        text = dpg.add_text(
                             f"{ch.field_name} ({ch.field_type})",
                         )
                         with dpg.drag_payload(
-                            parent=label,
+                            parent=text,
                             drag_data=(ch.entry_name, ch.field_name),
                             payload_type="btelem_field",
                         ):
                             dpg.add_text(f"{ch.entry_name}.{ch.field_name}")
                         s = FieldStats(0, None, None)
-                        if stats:
-                            s = stats.get((ch.entry_name, ch.field_name), s)
+                        if self._stats:
+                            s = self._stats.get(
+                                (ch.entry_name, ch.field_name), s)
                         tag = _stats_tag(ch.entry_name, ch.field_name)
                         dpg.add_text(_fmt_stats(s), tag=tag,
                                      color=(150, 150, 150))
 
+    def _entry_sample_count(self, entry_name: str,
+                            fields: list[ChannelInfo]) -> int:
+        """Return the sample count for an entry (max across its fields)."""
+        if not self._stats:
+            return 0
+        count = 0
+        for ch in fields:
+            s = self._stats.get((ch.entry_name, ch.field_name))
+            if s:
+                count = max(count, s.count)
+        return count
+
+    def _on_filter_changed(self, sender, app_data) -> None:
+        self._filter_text = app_data
+        self._rebuild_tree()
+
     def update_stats(self, stats: dict[tuple[str, str], FieldStats]) -> None:
         """Update stats labels in-place."""
+        self._stats = stats
+
+        # Update field-level stats
         for (entry_name, field_name), s in stats.items():
             tag = _stats_tag(entry_name, field_name)
             if dpg.does_item_exist(tag):
                 dpg.set_value(tag, _fmt_stats(s))
 
+        # Update entry-level sample counts in tree node labels
+        grouped: dict[str, list[ChannelInfo]] = defaultdict(list)
+        for ch in self._channels:
+            grouped[ch.entry_name].append(ch)
+
+        for entry_name, node_id in self._entry_nodes.items():
+            if dpg.does_item_exist(node_id):
+                fields = grouped.get(entry_name, [])
+                count = self._entry_sample_count(entry_name, fields)
+                dpg.configure_item(
+                    node_id, label=_entry_label(entry_name, count))
+
     def clear(self) -> None:
         if self._group is not None and dpg.does_item_exist(self._group):
             dpg.delete_item(self._group)
             self._group = None
+        self._tree_group = None
+        self._entry_nodes.clear()
+        self._channels = []
+        self._stats = None
+        self._filter_text = ""

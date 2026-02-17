@@ -372,19 +372,35 @@ class ViewerApp:
     # ------------------------------------------------------------------
 
     def _on_field_drop(self, subplot_id: int, entry_name: str,
-                       field_name: str) -> None:
-        """Called when a field is dragged onto a specific subplot."""
+                       field_name: str | None) -> None:
+        """Called when a field or entry is dragged onto a specific subplot.
+
+        When *field_name* is ``None`` the entire entry was dragged, so all
+        of its fields are added to the subplot.
+        """
         assert self._plot_panel is not None
-        # Look up enum_labels from the provider's channel info
-        enum_labels = None
-        if self._provider is not None:
+        if self._provider is None:
+            return
+
+        # Build list of (entry, field, enum_labels) to add
+        if field_name is None:
+            series_to_add = [
+                (ch.entry_name, ch.field_name, ch.enum_labels)
+                for ch in self._provider.channels()
+                if ch.entry_name == entry_name
+            ]
+        else:
+            enum_labels = None
             for ch in self._provider.channels():
                 if ch.entry_name == entry_name and ch.field_name == field_name:
                     enum_labels = ch.enum_labels
                     break
+            series_to_add = [(entry_name, field_name, enum_labels)]
+
         for sp in self._plot_panel.subplots:
             if sp.id == subplot_id:
-                sp.add_series(entry_name, field_name, enum_labels=enum_labels)
+                for en, fn, el in series_to_add:
+                    sp.add_series(en, fn, enum_labels=el)
                 self._plot_panel.mark_dirty()
                 self._plot_panel.update_cache()
                 self._plot_panel.push_data()
