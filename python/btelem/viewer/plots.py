@@ -624,7 +624,7 @@ class TimingSubPlot:
 class PlotPanel:
     """Manages N subplots in a vertical stack with linked X-axes."""
 
-    _TICK_INTERVAL: float = 1.0 / 15  # throttle expensive per-frame work
+    _TICK_INTERVAL: float = 1.0 / 30  # throttle expensive per-frame work
 
     def __init__(self, parent: int | str, on_drop: callable | None = None) -> None:
         self._parent = parent

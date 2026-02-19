@@ -35,7 +35,8 @@ def _imgui_hash(s: str, seed: int = 0) -> int:
 class ViewerApp:
     """Top-level viewer application."""
 
-    _UPDATE_INTERVAL: float = 1.0 / 15  # cap live updates at ~15 Hz
+    _UPDATE_INTERVAL: float = 1.0 / 30  # cap live updates at ~30 Hz
+    _STATS_INTERVAL: float = 2.0       # full tree stats refresh every 2 s
 
     def __init__(self) -> None:
         self._provider: Provider | None = None
@@ -43,6 +44,7 @@ class ViewerApp:
         self._plot_panel: PlotPanel | None = None
         self._event_log_mgr: EventLogManager | None = None
         self._last_update_time: float = 0.0
+        self._last_stats_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Setup
@@ -491,24 +493,6 @@ class ViewerApp:
                 stats[(ch.entry_name, ch.field_name)] = FieldStats(0, None, None)
         return stats
 
-    @staticmethod
-    def _stats_from_cache(plot_panel: PlotPanel) -> dict[tuple[str, str], FieldStats]:
-        """Compute stats from already-cached series data (no provider queries)."""
-        stats: dict[tuple[str, str], FieldStats] = {}
-        for sp in plot_panel.subplots:
-            for cs in sp.get_all_series():
-                key = (cs.entry_name, cs.field_name)
-                if key in stats:
-                    continue
-                n = len(cs.values)
-                if n > 0:
-                    stats[key] = FieldStats(
-                        n, float(np.min(cs.values)),
-                        float(np.max(cs.values)))
-                else:
-                    stats[key] = FieldStats(0, None, None)
-        return stats
-
     # ------------------------------------------------------------------
     # Status bar
     # ------------------------------------------------------------------
@@ -543,7 +527,7 @@ class ViewerApp:
                 if self._provider.poll():
                     pending_data = True
 
-            # 2. Throttle expensive updates to ~15 Hz
+            # 2. Throttle plot updates to ~30 Hz
             now = time.monotonic()
             if pending_data and self._plot_panel is not None \
                     and (now - self._last_update_time) >= self._UPDATE_INTERVAL:
@@ -553,10 +537,6 @@ class ViewerApp:
                 self._plot_panel.mark_dirty()
                 self._plot_panel.update_cache()
                 self._plot_panel.push_data()
-                # Update stats in tree (from cached series, no re-query)
-                if self._tree is not None:
-                    self._tree.update_stats(
-                        self._stats_from_cache(self._plot_panel))
                 # Append new events to event log
                 if self._event_log_mgr is not None and self._provider is not None:
                     events = self._provider.recent_events()
@@ -565,7 +545,13 @@ class ViewerApp:
                 if self._provider is not None:
                     self._update_live_status()
 
-            # 3. Per-frame tick (deferred fit, live scrolling)
+            # 3. Slow-cadence full stats refresh (all channels, every 2 s)
+            if self._provider is not None and self._tree is not None \
+                    and (now - self._last_stats_time) >= self._STATS_INTERVAL:
+                self._last_stats_time = now
+                self._tree.update_stats(self._compute_stats(self._provider))
+
+            # 4. Per-frame tick (deferred fit, live scrolling)
             if self._plot_panel is not None:
                 self._plot_panel.tick()
             if self._event_log_mgr is not None:
