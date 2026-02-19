@@ -329,7 +329,8 @@ _Static_assert(sizeof(struct btelem_index_footer) == 16, "btelem_index_footer pa
 
 struct btelem_client {
     uint64_t cursor;            /* absolute read position */
-    uint64_t filter;            /* bitmask: bit N set = accept schema ID N */
+    uint8_t  filter[BTELEM_MAX_SCHEMA_ENTRIES]; /* 1 = accept schema ID N */
+    int      filter_active;     /* 0 = accept all */
     uint64_t dropped;           /* cumulative entries lost to overwrite */
     uint64_t dropped_reported;  /* dropped count already sent in packets */
     int      active;

@@ -97,9 +97,11 @@ int btelem_register(struct btelem_ctx *ctx, const struct btelem_schema_entry *en
 /**
  * Register a new client.  Returns client ID (0..MAX-1) or -1 if full.
  * The client starts at the current head (no historical data).
- * filter_mask: bitmask of schema IDs to accept. 0 = accept all.
+ * filter_ids/filter_count: list of schema IDs to accept.
+ * NULL/0 = accept all.
  */
-int btelem_client_open(struct btelem_ctx *ctx, uint64_t filter_mask);
+int btelem_client_open(struct btelem_ctx *ctx,
+                       const uint16_t *filter_ids, int filter_count);
 
 /**
  * Close a client, freeing the slot.
@@ -107,9 +109,12 @@ int btelem_client_open(struct btelem_ctx *ctx, uint64_t filter_mask);
 void btelem_client_close(struct btelem_ctx *ctx, int client_id);
 
 /**
- * Update a client's filter mask.  0 = accept all.
+ * Update a client's filter.
+ * filter_ids/filter_count: list of schema IDs to accept.
+ * NULL/0 = accept all.
  */
-void btelem_client_set_filter(struct btelem_ctx *ctx, int client_id, uint64_t filter_mask);
+void btelem_client_set_filter(struct btelem_ctx *ctx, int client_id,
+                              const uint16_t *filter_ids, int filter_count);
 
 /**
  * Get the number of entries available to read for a client, and how many

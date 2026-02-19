@@ -264,7 +264,7 @@ static int run_test_case(const struct test_case *tc)
     struct consumer_arg cargs[MAX_CONSUMERS];
     for (int i = 0; i < tc->num_consumers; i++) {
         memset(&cargs[i], 0, sizeof(cargs[i]));
-        cargs[i].client_id = btelem_client_open(&ctx, 0);
+        cargs[i].client_id = btelem_client_open(&ctx, NULL, 0);
         cargs[i].delay_us = tc->consumer_delay_us;
         cargs[i].stats.num_producers = tc->num_producers;
         if (cargs[i].client_id < 0) {

@@ -58,7 +58,7 @@ static void test_basic_log_drain(void)
     printf("test_basic_log_drain...");
     setup();
 
-    int client = btelem_client_open(&ctx, 0);
+    int client = btelem_client_open(&ctx, NULL, 0);
     assert(client >= 0);
 
     struct test_data d;
@@ -87,7 +87,7 @@ static void test_wrap_around(void)
     printf("test_wrap_around...");
     setup();
 
-    int client = btelem_client_open(&ctx, 0);
+    int client = btelem_client_open(&ctx, NULL, 0);
 
     /* Fill the ring completely, then overflow by 4 */
     struct test_data d;
@@ -123,7 +123,8 @@ static void test_filter(void)
     btelem_register(&ctx, &btelem_schema_OTHER);
 
     /* Client that only accepts ID 1 */
-    int client = btelem_client_open(&ctx, 1ULL << 1);
+    uint16_t filter_ids[] = {1};
+    int client = btelem_client_open(&ctx, filter_ids, 1);
 
     struct test_data d;
     d.value = 10;
@@ -147,8 +148,8 @@ static void test_multiple_clients(void)
     printf("test_multiple_clients...");
     setup();
 
-    int c1 = btelem_client_open(&ctx, 0);
-    int c2 = btelem_client_open(&ctx, 0);
+    int c1 = btelem_client_open(&ctx, NULL, 0);
+    int c2 = btelem_client_open(&ctx, NULL, 0);
     assert(c1 != c2);
 
     struct test_data d;
@@ -215,7 +216,7 @@ static void test_drain_packed(void)
     printf("test_drain_packed...");
     setup();
 
-    int client = btelem_client_open(&ctx, 0);
+    int client = btelem_client_open(&ctx, NULL, 0);
 
     struct test_data d1 = {.value = 0xDEADBEEF};
     struct test_data d2 = {.value = 0xCAFEBABE};
@@ -277,7 +278,8 @@ static void test_drain_packed_filtered(void)
     btelem_register(&ctx, &btelem_schema_OTHER2);
 
     /* Client only accepts ID 1 */
-    int client = btelem_client_open(&ctx, 1ULL << 1);
+    uint16_t filter_ids2[] = {1};
+    int client = btelem_client_open(&ctx, filter_ids2, 1);
 
     struct test_data d;
     d.value = 10;
@@ -313,7 +315,7 @@ static void test_drain_packed_dropped(void)
     printf("test_drain_packed_dropped...");
     setup();
 
-    int client = btelem_client_open(&ctx, 0);
+    int client = btelem_client_open(&ctx, NULL, 0);
 
     /* Fill the ring and overflow by 4 entries */
     struct test_data d;

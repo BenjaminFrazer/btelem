@@ -60,7 +60,8 @@ int btelem_register(struct btelem_ctx *ctx, const struct btelem_schema_entry *en
  * Client management
  * ----------------------------------------------------------------------- */
 
-int btelem_client_open(struct btelem_ctx *ctx, uint64_t filter_mask)
+int btelem_client_open(struct btelem_ctx *ctx,
+                       const uint16_t *filter_ids, int filter_count)
 {
     if (!ctx)
         return -1;
@@ -68,7 +69,12 @@ int btelem_client_open(struct btelem_ctx *ctx, uint64_t filter_mask)
     for (int i = 0; i < BTELEM_MAX_CLIENTS; i++) {
         if (!ctx->clients[i].active) {
             ctx->clients[i].cursor  = btelem_atomic_load_acq(&ctx->ring->head);
-            ctx->clients[i].filter  = filter_mask;
+            memset(ctx->clients[i].filter, 0, sizeof(ctx->clients[i].filter));
+            ctx->clients[i].filter_active = (filter_ids && filter_count > 0);
+            for (int f = 0; f < filter_count; f++) {
+                if (filter_ids[f] < BTELEM_MAX_SCHEMA_ENTRIES)
+                    ctx->clients[i].filter[filter_ids[f]] = 1;
+            }
             ctx->clients[i].dropped = 0;
             ctx->clients[i].dropped_reported = 0;
             ctx->clients[i].active  = 1;
@@ -85,11 +91,18 @@ void btelem_client_close(struct btelem_ctx *ctx, int client_id)
     ctx->clients[client_id].active = 0;
 }
 
-void btelem_client_set_filter(struct btelem_ctx *ctx, int client_id, uint64_t filter_mask)
+void btelem_client_set_filter(struct btelem_ctx *ctx, int client_id,
+                              const uint16_t *filter_ids, int filter_count)
 {
     if (!ctx || client_id < 0 || client_id >= BTELEM_MAX_CLIENTS)
         return;
-    ctx->clients[client_id].filter = filter_mask;
+    memset(ctx->clients[client_id].filter, 0,
+           sizeof(ctx->clients[client_id].filter));
+    ctx->clients[client_id].filter_active = (filter_ids && filter_count > 0);
+    for (int f = 0; f < filter_count; f++) {
+        if (filter_ids[f] < BTELEM_MAX_SCHEMA_ENTRIES)
+            ctx->clients[client_id].filter[filter_ids[f]] = 1;
+    }
 }
 
 uint64_t btelem_client_available(struct btelem_ctx *ctx, int client_id, uint64_t *dropped)
@@ -171,8 +184,8 @@ int btelem_drain(struct btelem_ctx *ctx, int client_id,
 
         c->cursor++;
 
-        /* Apply filter: if filter is non-zero, check bitmask */
-        if (c->filter && !(c->filter & (1ULL << local.id)))
+        /* Apply filter */
+        if (c->filter_active && !c->filter[local.id])
             continue;
 
         if (emit(&local, user) != 0)
@@ -571,7 +584,7 @@ int btelem_drain_packed(struct btelem_ctx *ctx, int client_id,
         c->cursor++;
 
         /* Apply filter */
-        if (c->filter && !(c->filter & (1ULL << local.id)))
+        if (c->filter_active && !c->filter[local.id])
             continue;
 
         /* Check payload space incrementally */

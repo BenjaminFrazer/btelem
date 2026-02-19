@@ -106,7 +106,7 @@ static void *accept_thread(void *arg)
         if (fd < 0)
             break;
 
-        int btelem_cid = btelem_client_open(srv->ctx, 0);
+        int btelem_cid = btelem_client_open(srv->ctx, NULL, 0);
         if (btelem_cid < 0) {
             close(fd);
             continue;
