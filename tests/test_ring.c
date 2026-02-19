@@ -228,6 +228,7 @@ static void test_drain_packed(void)
     const struct btelem_packet_header *pkt = (const struct btelem_packet_header *)buf;
     assert(pkt->entry_count == 2);
     assert(pkt->payload_size == 2 * sizeof(struct test_data));
+    assert(pkt->dropped == 0);
 
     /* Verify entry table */
     const struct btelem_entry_header *table =
@@ -248,7 +249,7 @@ static void test_drain_packed(void)
     memcpy(&val, payload_base + table[1].payload_offset, 4);
     assert(val == 0xCAFEBABE);
 
-    /* Expected total: header(8) + 2*entry(32) + 2*payload(8) = 48 */
+    /* Expected total: header(16) + 2*entry(32) + 2*payload(8) = 56 */
     int expected = (int)(sizeof(struct btelem_packet_header)
                        + 2 * sizeof(struct btelem_entry_header)
                        + 2 * sizeof(struct test_data));
@@ -300,6 +301,42 @@ static void test_drain_packed_filtered(void)
     uint32_t val;
     memcpy(&val, payload_base, 4);
     assert(val == 20);
+
+    btelem_client_close(&ctx, client);
+    printf(" OK\n");
+}
+
+static void test_drain_packed_dropped(void)
+{
+    printf("test_drain_packed_dropped...");
+    setup();
+
+    int client = btelem_client_open(&ctx, 0);
+
+    /* Fill the ring and overflow by 4 entries */
+    struct test_data d;
+    for (uint32_t i = 0; i < RING_ENTRIES + 4; i++) {
+        d.value = i;
+        BTELEM_LOG(&ctx, TEST, d);
+    }
+
+    uint8_t buf[16384];
+    int n = btelem_drain_packed(&ctx, client, buf, sizeof(buf));
+    assert(n > 0);
+
+    const struct btelem_packet_header *pkt = (const struct btelem_packet_header *)buf;
+    /* Should have RING_ENTRIES entries (the newest ones) */
+    assert(pkt->entry_count == RING_ENTRIES);
+    /* 4 entries were overwritten before we could read them */
+    assert(pkt->dropped == 4);
+
+    /* Second drain: no new drops */
+    d.value = 999;
+    BTELEM_LOG(&ctx, TEST, d);
+    n = btelem_drain_packed(&ctx, client, buf, sizeof(buf));
+    assert(n > 0);
+    pkt = (const struct btelem_packet_header *)buf;
+    assert(pkt->dropped == 0);
 
     btelem_client_close(&ctx, client);
     printf(" OK\n");
@@ -371,6 +408,7 @@ int main(void)
     test_schema_serialize_roundtrip();
     test_drain_packed();
     test_drain_packed_filtered();
+    test_drain_packed_dropped();
     test_enum_schema_serialize();
 
     printf("\nAll tests passed.\n");

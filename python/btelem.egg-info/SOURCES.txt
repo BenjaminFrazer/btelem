@@ -16,6 +16,8 @@ btelem.egg-info/requires.txt
 btelem.egg-info/top_level.txt
 btelem/viewer/__init__.py
 btelem/viewer/app.py
+btelem/viewer/cursors.py
+btelem/viewer/event_log.py
 btelem/viewer/plots.py
 btelem/viewer/provider.py
 btelem/viewer/tree.py

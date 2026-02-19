@@ -211,7 +211,7 @@ _Static_assert(sizeof(struct btelem_enum_wire) == 1029, "btelem_enum_wire packin
  * Entry wire format (packed, for batch transport)
  *
  * Packet layout:
- *   [btelem_packet_header]                   8 bytes
+ *   [btelem_packet_header]                  16 bytes
  *   [btelem_entry_header × entry_count]     16 bytes each (fixed stride)
  *   [payload buffer]                         tightly packed, variable
  *
@@ -221,9 +221,11 @@ _Static_assert(sizeof(struct btelem_enum_wire) == 1029, "btelem_enum_wire packin
  * ----------------------------------------------------------------------- */
 
 struct __attribute__((packed)) btelem_packet_header {
-    uint16_t entry_count;               /*  2 */
+    uint16_t entry_count;               /*  2  entries in this packet */
     uint16_t flags;                     /*  2  (reserved) */
-    uint32_t payload_size;              /*  4  (total payload buffer bytes) */
+    uint32_t payload_size;              /*  4  total payload buffer bytes */
+    uint32_t dropped;                   /*  4  entries dropped since last packet */
+    uint32_t _reserved;                 /*  4  (reserved) */
 };
 
 struct __attribute__((packed)) btelem_entry_header {
@@ -233,7 +235,7 @@ struct __attribute__((packed)) btelem_entry_header {
     uint64_t timestamp;                 /*  8 */
 };
 
-_Static_assert(sizeof(struct btelem_packet_header) == 8,  "btelem_packet_header packing");
+_Static_assert(sizeof(struct btelem_packet_header) == 16, "btelem_packet_header packing");
 _Static_assert(sizeof(struct btelem_entry_header)  == 16, "btelem_entry_header packing");
 
 /* --------------------------------------------------------------------------
@@ -273,6 +275,7 @@ struct btelem_client {
     uint64_t cursor;            /* absolute read position */
     uint64_t filter;            /* bitmask: bit N set = accept schema ID N */
     uint64_t dropped;           /* cumulative entries lost to overwrite */
+    uint64_t dropped_reported;  /* dropped count already sent in packets */
     int      active;
 };
 

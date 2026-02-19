@@ -67,6 +67,11 @@ class Provider(ABC):
     def recent_events(self) -> list[DecodedEntry]:
         """Return decoded entries added since last call."""
 
+    @property
+    def dropped_count(self) -> int:
+        """Total entries dropped by the producer (overwritten before read)."""
+        return 0
+
     def poll(self) -> bool:
         """Read from transport (live mode).  Return True if new data arrived.
 
@@ -167,10 +172,11 @@ class BtelemLiveProvider(Provider):
         self._live = LiveCapture(schema_bytes)
         self._channels = _channels_from_schema(schema)
         self._has_data = False
+        self._dropped: int = 0
 
         # Event buffering for event log
         self._event_buf: deque[DecodedEntry] = deque(maxlen=10000)
-        self._event_cursor: int = 0
+        self._pending_events: list[DecodedEntry] = []
 
         # Stream framing buffer (4-byte length prefix)
         self._buf = bytearray()
@@ -200,6 +206,10 @@ class BtelemLiveProvider(Provider):
     def is_live(self) -> bool:
         return True
 
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped
+
     def poll(self) -> bool:
         """Read from transport, extract packets, feed to LiveCapture.
 
@@ -224,8 +234,10 @@ class BtelemLiveProvider(Provider):
             pkt_bytes = bytes(self._buf[4:total])
             del self._buf[:total]
             self._live.add_packet(pkt_bytes)
-            self._event_buf.extend(
-                decode_packet(self._schema, pkt_bytes))
+            result = decode_packet(self._schema, pkt_bytes)
+            self._dropped += result.dropped
+            self._event_buf.extend(result.entries)
+            self._pending_events.extend(result.entries)
             got_packet = True
 
         if got_packet:
@@ -233,12 +245,10 @@ class BtelemLiveProvider(Provider):
         return got_packet
 
     def recent_events(self) -> list[DecodedEntry]:
-        buf = self._event_buf
-        cursor = self._event_cursor
-        if cursor >= len(buf):
+        if not self._pending_events:
             return []
-        events = list(buf)[cursor:]
-        self._event_cursor = len(buf)
+        events = self._pending_events
+        self._pending_events = []
         return events
 
     def close(self) -> None:

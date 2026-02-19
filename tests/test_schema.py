@@ -82,12 +82,13 @@ def test_decode_packet():
         (0, 2000, struct.pack("<I", 99)),
     ])
 
-    results = decode_packet(schema, packet)
-    assert len(results) == 2
-    assert results[0].fields["value"] == 42
-    assert results[0].timestamp == 1000
-    assert results[1].fields["value"] == 99
-    assert results[1].timestamp == 2000
+    result = decode_packet(schema, packet)
+    assert result.dropped == 0
+    assert len(result.entries) == 2
+    assert result.entries[0].fields["value"] == 42
+    assert result.entries[0].timestamp == 1000
+    assert result.entries[1].fields["value"] == 99
+    assert result.entries[1].timestamp == 2000
 
     print(" OK")
 
@@ -112,9 +113,9 @@ def test_decode_packet_filtered():
     ])
 
     # Only decode motor entries (id=1)
-    results = decode_packet(schema, packet, filter_ids={1})
-    assert len(results) == 1
-    assert results[0].fields["rpm"] == 20
+    result = decode_packet(schema, packet, filter_ids={1})
+    assert len(result.entries) == 1
+    assert result.entries[0].fields["rpm"] == 20
 
     print(" OK")
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 import enum
 import itertools
 import logging
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
 import dearpygui.dearpygui as dpg
 
 from .provider import Provider
+from .cursors import CursorManager
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,7 @@ class SubPlot:
         self.y_axis_tag: int | str | None = None
         self._legend_tag: int | str | None = None
         self._popup_tag: int | str | None = None
+        self._last_fit_y: tuple[float, float, float] | None = None  # (y_min, y_max, pad)
 
     def _series_key(self, entry_name: str, field_name: str) -> str:
         return f"{entry_name}.{field_name}"
@@ -221,22 +224,45 @@ class SubPlot:
         if self.y_axis_tag is None:
             return
         if self._has_enum_series():
-            # Keep fixed Y range for enum labels
             for cs in self._series.values():
                 if cs.enum_labels:
                     n = len(cs.enum_labels)
                     dpg.set_axis_limits(self.y_axis_tag, -0.5, n - 0.5)
                     break
         else:
-            dpg.fit_axis_data(self.y_axis_tag)
+            # Fit Y to samples visible in the current X viewport
+            if self.x_axis_tag is None:
+                return
+            try:
+                x_min, x_max = dpg.get_axis_limits(self.x_axis_tag)
+            except Exception:
+                return
+            y_min = y_max = None
+            for cs in self._series.values():
+                if len(cs.timestamps) == 0:
+                    continue
+                lo = int(np.searchsorted(cs.timestamps, x_min))
+                hi = int(np.searchsorted(cs.timestamps, x_max, side='right'))
+                if lo >= hi:
+                    continue
+                visible = cs.values[lo:hi]
+                vmin, vmax = float(np.nanmin(visible)), float(np.nanmax(visible))
+                if y_min is None or vmin < y_min:
+                    y_min = vmin
+                if y_max is None or vmax > y_max:
+                    y_max = vmax
+            if y_min is not None:
+                pad = max((y_max - y_min) * 0.05, 1e-6)
+                new_state = (round(y_min, 2), round(y_max, 2), round(pad, 2))
+                if new_state != self._last_fit_y:
+                    logger.info("[fit_y] subplot %d: y=[%.4f, %.4f] pad=%.4f",
+                                self.id, y_min, y_max, pad)
+                    self._last_fit_y = new_state
+                dpg.set_axis_limits(self.y_axis_tag, y_min - pad, y_max + pad)
 
     def set_y_lock(self, locked: bool) -> None:
-        """When locked, ImPlot auto-fits Y each frame and ignores scroll zoom on Y."""
-        if self.y_axis_tag is not None:
-            # Don't auto-fit Y for enum subplots — they have fixed tick range
-            if locked and self._has_enum_series():
-                return
-            dpg.configure_item(self.y_axis_tag, auto_fit=locked)
+        """When locked, we manually fit Y each frame from visible samples."""
+        pass  # Y fitting is handled by fit_y() called from PlotPanel.tick()
 
     def set_no_inputs(self, no_inputs: bool) -> None:
         """Disable ImPlot's native mouse interaction (pan/zoom/box-select)."""
@@ -555,6 +581,7 @@ class PlotPanel:
         self._auto_y = True
         self._live_window_sec: float = 10.0
         self._fit_frames: int = 0
+        self._unlock_x_frames: int = 0
 
         self.subplots: list[SubPlot | TimingSubPlot] = []
         self._subplots_container: int | str | None = None
@@ -564,6 +591,14 @@ class PlotPanel:
         self._auto_y_cb: int | str | None = None
 
         self._build_toolbar()
+
+        # Marker mode label + cursor manager
+        self._marker_label = dpg.add_text(
+            "MARKER MODE", parent=self._toolbar,
+            show=False, color=(255, 255, 0, 255))
+        self._cursor_mgr = CursorManager(self)
+        self._cursor_mgr.set_marker_label(self._marker_label)
+
         self._add_subplot()
         self._rebuild_subplots()
         self._setup_wheel_handler()
@@ -615,11 +650,109 @@ class PlotPanel:
         for sp in self.subplots:
             sp.set_y_lock(locked)
 
+    _ZOOM_FACTOR = 0.80
+    _PAN_FRACTION = 0.20
+    _GG_TIMEOUT = 0.4  # seconds to complete gg chord
+
+    def _on_key_f(self, sender: int, app_data: int) -> None:
+        if self._mode == XAxisMode.FOLLOW:
+            self.set_mode(XAxisMode.MANUAL)
+        else:
+            self.set_mode(XAxisMode.FOLLOW)
+
+    def _set_x_limits_manual(self, x_min: float, x_max: float) -> None:
+        """Set X limits in manual mode, deferring unlock to the next frame."""
+        for sp in self.subplots:
+            if sp.x_axis_tag is not None:
+                dpg.set_axis_limits(sp.x_axis_tag, x_min, x_max)
+        self._unlock_x_frames = 2
+
+    def _zoom(self, direction: int) -> None:
+        """Zoom X axis. direction > 0 = zoom in, < 0 = zoom out."""
+        factor = self._ZOOM_FACTOR if direction > 0 else 1.0 / self._ZOOM_FACTOR
+        if self._mode == XAxisMode.FOLLOW:
+            self._live_window_sec = max(0.5, min(3600.0,
+                                                  self._live_window_sec * factor))
+        else:
+            for sp in self.subplots:
+                if sp.x_axis_tag is None:
+                    continue
+                x_min, x_max = dpg.get_axis_limits(sp.x_axis_tag)
+                cx = (x_min + x_max) / 2
+                half = (x_max - x_min) / 2 * factor
+                self._set_x_limits_manual(cx - half, cx + half)
+                break  # linked axes — only need first
+
+    def _pan(self, direction: int) -> None:
+        """Pan X axis. direction > 0 = right, < 0 = left."""
+        if self._mode == XAxisMode.FOLLOW:
+            return  # follow mode auto-scrolls
+        for sp in self.subplots:
+            if sp.x_axis_tag is None:
+                continue
+            x_min, x_max = dpg.get_axis_limits(sp.x_axis_tag)
+            span = x_max - x_min
+            offset = span * self._PAN_FRACTION * direction
+            self._set_x_limits_manual(x_min + offset, x_max + offset)
+            break  # linked axes
+
+    def _on_key_j(self, sender: int, app_data: int) -> None:
+        self._zoom(1)
+
+    def _on_key_k(self, sender: int, app_data: int) -> None:
+        self._zoom(-1)
+
+    def _on_key_h(self, sender: int, app_data: int) -> None:
+        self._pan(-1)
+
+    def _on_key_l(self, sender: int, app_data: int) -> None:
+        self._pan(1)
+
+    def _on_key_g(self, sender: int, app_data: int) -> None:
+        now = time.monotonic()
+        if dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift):
+            # G (shift+g) — zoom right in on viewport center
+            self._zoom_to_center()
+            return
+        # gg chord detection
+        if hasattr(self, '_g_time') and (now - self._g_time) < self._GG_TIMEOUT:
+            self._g_time = 0
+            self.auto_range()
+        else:
+            self._g_time = now
+
+    def _zoom_to_center(self) -> None:
+        """Zoom X axis tightly around the center of the current viewport."""
+        factor = 0.05  # show 5% of current span
+        if self._mode == XAxisMode.FOLLOW:
+            self._live_window_sec = max(0.5, self._live_window_sec * factor)
+        else:
+            for sp in self.subplots:
+                if sp.x_axis_tag is None:
+                    continue
+                x_min, x_max = dpg.get_axis_limits(sp.x_axis_tag)
+                cx = (x_min + x_max) / 2
+                half = (x_max - x_min) / 2 * factor
+                self._set_x_limits_manual(cx - half, cx + half)
+                break
+
     def _setup_wheel_handler(self) -> None:
         with dpg.handler_registry() as hr:
             dpg.add_mouse_wheel_handler(callback=self._on_mouse_wheel)
             dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Right,
                                         callback=self._on_right_click)
+            dpg.add_key_press_handler(key=dpg.mvKey_F,
+                                      callback=self._on_key_f)
+            dpg.add_key_press_handler(key=dpg.mvKey_J,
+                                      callback=self._on_key_j)
+            dpg.add_key_press_handler(key=dpg.mvKey_K,
+                                      callback=self._on_key_k)
+            dpg.add_key_press_handler(key=dpg.mvKey_H,
+                                      callback=self._on_key_h)
+            dpg.add_key_press_handler(key=dpg.mvKey_L,
+                                      callback=self._on_key_l)
+            dpg.add_key_press_handler(key=dpg.mvKey_G,
+                                      callback=self._on_key_g)
         self._wheel_handler = hr
 
     def _on_right_click(self, sender: int, app_data: int) -> None:
@@ -645,8 +778,15 @@ class PlotPanel:
                                               self._live_window_sec * factor))
 
     def _update_plot_inputs(self) -> None:
-        """Disable ImPlot native mouse handling in follow mode."""
+        """Disable ImPlot native mouse handling in follow mode.
+
+        In marker mode we must re-enable inputs so get_plot_mouse_pos()
+        returns correct coordinates.  The cursor manager's _restore_limits
+        mechanism undoes any unwanted pan caused by the click.
+        """
         no_inputs = self._mode == XAxisMode.FOLLOW
+        if hasattr(self, '_cursor_mgr') and self._cursor_mgr._marker_mode:
+            no_inputs = False
         for sp in self.subplots:
             sp.set_no_inputs(no_inputs)
 
@@ -735,6 +875,10 @@ class PlotPanel:
         self._update_y_lock()
         self._update_plot_inputs()
 
+        # Recreate cursor widgets in the new subplots
+        if hasattr(self, '_cursor_mgr'):
+            self._cursor_mgr.rebuild_widgets()
+
     def mark_dirty(self) -> None:
         for sp in self.subplots:
             for cs in sp.get_all_series():
@@ -796,10 +940,19 @@ class PlotPanel:
                         dpg.set_axis_limits_auto(sp.x_axis_tag)
             if self._mode == XAxisMode.FOLLOW:
                 self._live_window_sec = xr[1] - xr[0] + 2 * pad
-        for sp in self.subplots:
-            sp.fit_y()
+        # Defer Y fit — new X limits aren't visible to get_axis_limits()
+        # until after the next render frame.
+        self._fit_frames = 3
 
     def tick(self) -> None:
+        # Deferred X-axis unlock after keyboard zoom/pan
+        if self._unlock_x_frames > 0:
+            self._unlock_x_frames -= 1
+            if self._unlock_x_frames == 0 and self._mode == XAxisMode.MANUAL:
+                for sp in self.subplots:
+                    if sp.x_axis_tag is not None:
+                        dpg.set_axis_limits_auto(sp.x_axis_tag)
+
         if self._fit_frames > 0:
             self._fit_frames -= 1
             xr = self._get_x_range()
@@ -809,7 +962,9 @@ class PlotPanel:
                     if sp.x_axis_tag is not None:
                         dpg.set_axis_limits(sp.x_axis_tag,
                                             xr[0] - pad, xr[1] + pad)
-                        if self._mode == XAxisMode.MANUAL:
+                        # Unlock X only on the last frame so fit_y can
+                        # read the correct viewport on intermediate frames.
+                        if self._fit_frames == 0 and self._mode == XAxisMode.MANUAL:
                             dpg.set_axis_limits_auto(sp.x_axis_tag)
             for sp in self.subplots:
                 sp.fit_y()
@@ -840,6 +995,8 @@ class PlotPanel:
                 except Exception:
                     pass
 
+        self._cursor_mgr.tick()
+
     def _get_x_range(self) -> tuple[float, float] | None:
         """Return (t_min, t_max) across all series in all subplots."""
         t_min = t_max = None
@@ -856,6 +1013,7 @@ class PlotPanel:
         return None
 
     def clear(self) -> None:
+        self._cursor_mgr.clear()
         for sp in self.subplots:
             sp.clear_series()
         self.subplots.clear()
@@ -870,6 +1028,11 @@ class PlotPanel:
         self._follow_btn = None
         self._manual_btn = None
         self._auto_y_cb = None
+        self._marker_label = None
         self._build_toolbar()
+        self._marker_label = dpg.add_text(
+            "MARKER MODE", parent=self._toolbar,
+            show=False, color=(255, 255, 0, 255))
+        self._cursor_mgr.set_marker_label(self._marker_label)
         self._add_subplot()
         self._rebuild_subplots()

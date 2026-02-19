@@ -21,8 +21,8 @@ def read_stream_schema(transport: TCPTransport) -> Schema:
     return Schema.from_bytes(schema_bytes)
 
 # Wire format constants (must match btelem_types.h)
-PACKET_HEADER_FMT = "<HHI"
-PACKET_HEADER_SIZE = struct.calcsize(PACKET_HEADER_FMT)  # 8
+PACKET_HEADER_FMT = "<HHIII"
+PACKET_HEADER_SIZE = struct.calcsize(PACKET_HEADER_FMT)  # 16
 
 ENTRY_HEADER_FMT = "<HHIQ"
 ENTRY_HEADER_SIZE = struct.calcsize(ENTRY_HEADER_FMT)  # 16
@@ -38,20 +38,26 @@ class DecodedEntry:
     name: str | None = None
 
 
+@dataclass
+class PacketResult:
+    entries: list[DecodedEntry]
+    dropped: int
+
+
 def decode_packet(schema: Schema, data: bytes,
-                  filter_ids: set[int] | None = None) -> list[DecodedEntry]:
+                  filter_ids: set[int] | None = None) -> PacketResult:
     """Decode a packed batch packet into a list of entries.
 
     The packet format is:
-      [packet_header(8)][entry_header(16) × N][payload_buffer]
+      [packet_header(16)][entry_header(16) × N][payload_buffer]
 
     If filter_ids is given, only decode entries whose id is in the set.
     Other entries are skipped without touching their payload data.
     """
     if len(data) < PACKET_HEADER_SIZE:
-        return []
+        return PacketResult(entries=[], dropped=0)
 
-    entry_count, flags, payload_size = struct.unpack_from(
+    entry_count, flags, payload_size, dropped, _reserved = struct.unpack_from(
         PACKET_HEADER_FMT, data, 0
     )
 
@@ -84,7 +90,7 @@ def decode_packet(schema: Schema, data: bytes,
             name=name,
         ))
 
-    return results
+    return PacketResult(entries=results, dropped=dropped)
 
 
 class PacketDecoder:
@@ -101,6 +107,7 @@ class PacketDecoder:
         self.schema = schema
         self.filter_ids = filter_ids
         self.max_packet_size = max_packet_size
+        self.dropped: int = 0
         self._buf = bytearray()
 
     def feed(self, data: bytes) -> list[DecodedEntry]:
@@ -123,7 +130,9 @@ class PacketDecoder:
             pkt_data = bytes(self._buf[4:total])
             del self._buf[:total]
 
-            results.extend(decode_packet(self.schema, pkt_data, self.filter_ids))
+            result = decode_packet(self.schema, pkt_data, self.filter_ids)
+            self.dropped += result.dropped
+            results.extend(result.entries)
 
         return results
 

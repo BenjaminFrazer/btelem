@@ -70,6 +70,7 @@ int btelem_client_open(struct btelem_ctx *ctx, uint64_t filter_mask)
             ctx->clients[i].cursor  = btelem_atomic_load_acq(&ctx->ring->head);
             ctx->clients[i].filter  = filter_mask;
             ctx->clients[i].dropped = 0;
+            ctx->clients[i].dropped_reported = 0;
             ctx->clients[i].active  = 1;
             return i;
         }
@@ -408,7 +409,7 @@ int btelem_schema_stream(const struct btelem_ctx *ctx,
 /* --------------------------------------------------------------------------
  * Packed batch drain
  *
- * Builds: [packet_header(8)][entry_header(16) × N][payload_buffer]
+ * Builds: [packet_header(16)][entry_header(16) × N][payload_buffer]
  *
  * Single-pass approach:
  *   1. Estimate max_entries as upper bound for the entry table.
@@ -535,6 +536,11 @@ int btelem_drain_packed(struct btelem_ctx *ctx, int client_id,
     pkt->entry_count = entry_count;
     pkt->flags = 0;
     pkt->payload_size = payload_offset;
+
+    uint64_t drop_delta = c->dropped - c->dropped_reported;
+    pkt->dropped = (drop_delta > UINT32_MAX) ? UINT32_MAX : (uint32_t)drop_delta;
+    c->dropped_reported += pkt->dropped;
+    pkt->_reserved = 0;
 
     return (int)(sizeof(*pkt)
                + (size_t)entry_count * sizeof(struct btelem_entry_header)

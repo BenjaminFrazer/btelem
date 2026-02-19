@@ -103,19 +103,24 @@ class TreeExplorer:
             with dpg.tree_node(label=label, parent=self._tree_group,
                                default_open=default_open) as node_id:
                 self._entry_nodes[entry_name] = node_id
+                # Entry-level drag (all fields)
+                entry_btn = dpg.add_button(
+                    label=f"+ drag all fields", small=True,
+                )
                 with dpg.drag_payload(
-                    parent=node_id,
+                    parent=entry_btn,
                     drag_data=(entry_name, None),
                     payload_type="btelem_field",
                 ):
                     dpg.add_text(entry_name)
                 for ch in visible_fields:
                     with dpg.group(horizontal=True):
-                        text = dpg.add_text(
-                            f"{ch.field_name} ({ch.field_type})",
+                        btn = dpg.add_button(
+                            label=f"{ch.field_name} ({ch.field_type})",
+                            small=True,
                         )
                         with dpg.drag_payload(
-                            parent=text,
+                            parent=btn,
                             drag_data=(ch.entry_name, ch.field_name),
                             payload_type="btelem_field",
                         ):

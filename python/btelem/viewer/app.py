@@ -451,6 +451,17 @@ class ViewerApp:
     # Status bar
     # ------------------------------------------------------------------
 
+    def _update_live_status(self) -> None:
+        """Refresh the status bar with live session info."""
+        if self._provider is None or not self._provider.is_live:
+            return
+        channels = self._provider.channels()
+        tr = self._provider.time_range()
+        dur_str = f"{(tr[1] - tr[0]) / 1e9:.1f}s" if tr else "(no data)"
+        parts = [f"Live  |  {len(channels)} channels  |  {dur_str}"]
+        parts.append(f"Dropped: {self._provider.dropped_count}")
+        self._set_status("  |  ".join(parts))
+
     def _set_status(self, text: str) -> None:
         if dpg.does_item_exist("status_bar"):
             dpg.set_value("status_bar", f"Status: {text}")
@@ -478,10 +489,15 @@ class ViewerApp:
                 if self._event_log_mgr is not None and self._provider is not None:
                     events = self._provider.recent_events()
                     self._event_log_mgr.append_events(events)
+                # Update live status bar
+                if self._provider is not None:
+                    self._update_live_status()
 
             # 3. Per-frame tick (deferred fit, live scrolling)
             if self._plot_panel is not None:
                 self._plot_panel.tick()
+            if self._event_log_mgr is not None:
+                self._event_log_mgr.tick()
 
             dpg.render_dearpygui_frame()
 

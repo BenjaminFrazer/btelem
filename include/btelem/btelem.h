@@ -188,7 +188,7 @@ int btelem_schema_stream(const struct btelem_ctx *ctx,
  * Drain available entries for a client into a packed batch packet.
  *
  * Output buffer layout:
- *   btelem_packet_header          (8 bytes)
+ *   btelem_packet_header          (16 bytes)
  *   btelem_entry_header[N]        (16 bytes each)
  *   payload data                  (variable, tightly packed)
  *

@@ -78,7 +78,7 @@ def _packet_ts_range(data: bytes) -> tuple[int, int]:
 
 def _packet_size(data: bytes) -> int:
     """Compute total packet size from its header."""
-    entry_count, _, payload_size = struct.unpack_from(PACKET_HEADER_FMT, data, 0)
+    entry_count, _, payload_size, _, _ = struct.unpack_from(PACKET_HEADER_FMT, data, 0)
     return PACKET_HEADER_SIZE + entry_count * ENTRY_HEADER_SIZE + payload_size
 
 
@@ -96,7 +96,7 @@ def build_packet(entries: list[tuple[int, int, bytes]]) -> bytes:
         payload_parts.append(payload)
         offset += len(payload)
 
-    header = struct.pack(PACKET_HEADER_FMT, len(entries), 0, offset)
+    header = struct.pack(PACKET_HEADER_FMT, len(entries), 0, offset, 0, 0)
     return header + b"".join(table_parts) + b"".join(payload_parts)
 
 
@@ -242,7 +242,7 @@ class LogReader:
             if len(hdr_data) < PACKET_HEADER_SIZE:
                 break
 
-            entry_count, flags, payload_size = struct.unpack(
+            entry_count, flags, payload_size, _, _ = struct.unpack(
                 PACKET_HEADER_FMT, hdr_data
             )
 
@@ -252,7 +252,7 @@ class LogReader:
                 break
 
             packet = hdr_data + rest_data
-            yield from decode_packet(self._schema, packet, filter_ids)
+            yield from decode_packet(self._schema, packet, filter_ids).entries
 
     def _entries_indexed(self, ts_min: int | None, ts_max: int | None,
                          filter_ids: set[int] | None) -> Iterator[DecodedEntry]:
@@ -273,10 +273,10 @@ class LogReader:
                 PACKET_HEADER_SIZE + ie.entry_count * ENTRY_HEADER_SIZE
             )
             # Read payload size from header
-            _, _, payload_size = struct.unpack_from(PACKET_HEADER_FMT, pkt_data, 0)
+            _, _, payload_size, _, _ = struct.unpack_from(PACKET_HEADER_FMT, pkt_data, 0)
             pkt_data += self._f.read(payload_size)
 
-            for entry in decode_packet(self._schema, pkt_data, filter_ids):
+            for entry in decode_packet(self._schema, pkt_data, filter_ids).entries:
                 # Per-entry time filter (packet may partially overlap range)
                 if ts_min is not None and entry.timestamp < ts_min:
                     continue

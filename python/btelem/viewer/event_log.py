@@ -14,8 +14,8 @@ from .provider import Provider
 
 _id_counter = itertools.count(1)
 
-# Max DPG table rows before forcing a rebuild.  Keeps widget count bounded.
-_MAX_TABLE_ROWS = 10_000
+# Max DPG table rows displayed at once.  Oldest rows are deleted incrementally.
+_MAX_DISPLAY_ROWS = 1_000
 
 
 def _format_value(v: Any) -> str:
@@ -62,8 +62,9 @@ class EventLogTable:
         self._table: int | str | None = None
         self._table_parent: int | str | None = None
         self._drop_target: int | str | None = None
-        self._row_count: int = 0
+        self._row_ids: deque[int] = deque()  # DPG row item IDs
         self._follow: bool = True  # Tail mode by default
+        self._needs_scroll: bool = False
         self._head_btn: int | str | None = None
         self._tail_btn: int | str | None = None
 
@@ -105,8 +106,8 @@ class EventLogTable:
     def _set_follow(self, follow: bool) -> None:
         self._follow = follow
         self._update_follow_buttons()
-        if follow and self._table_parent is not None:
-            dpg.set_y_scroll(self._table_parent, -1.0)
+        if follow:
+            self._needs_scroll = True
         elif not follow and self._table_parent is not None:
             dpg.set_y_scroll(self._table_parent, 0.0)
 
@@ -122,7 +123,7 @@ class EventLogTable:
         if self._table is not None and dpg.does_item_exist(self._table):
             dpg.delete_item(self._table)
 
-        self._row_count = 0
+        self._row_ids.clear()
         self._table = dpg.add_table(
             parent=self._table_parent,
             header_row=True,
@@ -157,24 +158,26 @@ class EventLogTable:
                 continue
             self._add_row(ev, name)
 
-        # Rebuild if DPG widget count exceeds limit (prevents freeze)
-        if self._row_count > _MAX_TABLE_ROWS:
-            self._rebuild_table()
+        # Trim oldest rows incrementally to keep widget count bounded
+        while len(self._row_ids) > _MAX_DISPLAY_ROWS:
+            old_row = self._row_ids.popleft()
+            if dpg.does_item_exist(old_row):
+                dpg.delete_item(old_row)
 
-        # Auto-scroll to bottom in tail mode
-        if self._follow and self._table_parent is not None:
-            dpg.set_y_scroll(self._table_parent, -1.0)
+        # Defer auto-scroll to next frame (content height not yet recalculated)
+        if self._follow:
+            self._needs_scroll = True
 
     def _add_row(self, ev: DecodedEntry, name: str) -> None:
         t0 = self._t0_ns or 0
         t_sec = (ev.timestamp - t0) / 1e9
         summary = _format_summary(ev.fields)
 
-        with dpg.table_row(parent=self._table):
-            dpg.add_text(f"{t_sec:.4f}")
-            dpg.add_text(name)
-            dpg.add_text(summary)
-        self._row_count += 1
+        row = dpg.add_table_row(parent=self._table)
+        dpg.add_text(f"{t_sec:.4f}", parent=row)
+        dpg.add_text(name, parent=row)
+        dpg.add_text(summary, parent=row)
+        self._row_ids.append(row)
 
     def _on_drop(self, sender: int, app_data: object) -> None:
         if app_data is None:
@@ -229,14 +232,28 @@ class EventLogTable:
         """Rebuild table rows from buffer using current filters."""
         self._create_table()
 
-        for ev in list(self._buf):
+        # Only materialise the most recent _MAX_DISPLAY_ROWS matching events
+        filtered = [
+            ev for ev in self._buf
+            if not self._accepted_entries
+            or (ev.name or f"id={ev.id}") in self._accepted_entries
+        ]
+        for ev in filtered[-_MAX_DISPLAY_ROWS:]:
             name = ev.name or f"id={ev.id}"
-            if self._accepted_entries and name not in self._accepted_entries:
-                continue
             self._add_row(ev, name)
 
-        if self._follow and self._table_parent is not None:
-            dpg.set_y_scroll(self._table_parent, -1.0)
+        if self._follow:
+            self._needs_scroll = True
+
+    def tick(self) -> None:
+        """Called once per frame. Performs deferred scroll-to-bottom.
+
+        Content height is only valid after ``render_dearpygui_frame()``,
+        so scrolling must be deferred to the following frame.
+        """
+        if self._needs_scroll and self._follow and self._table_parent is not None:
+            dpg.set_y_scroll(self._table_parent, dpg.get_y_scroll_max(self._table_parent))
+            self._needs_scroll = False
 
     def clear(self) -> None:
         self._buf.clear()
@@ -314,6 +331,11 @@ class EventLogManager:
         self._global_buf.extend(events)
         for table in self._tables.values():
             table.append_events(events)
+
+    def tick(self) -> None:
+        """Per-frame tick — deferred scroll for all tables."""
+        for table in self._tables.values():
+            table.tick()
 
     def clear(self) -> None:
         self._global_buf.clear()
