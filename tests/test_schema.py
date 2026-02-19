@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 import struct
 
-from btelem.schema import Schema, SchemaEntry, FieldDef, BtelemType
+from btelem.schema import Schema, SchemaEntry, FieldDef, BitDef, BtelemType
 from btelem.decoder import decode_packet, PacketDecoder
 from btelem.storage import LogReader, LogWriter, build_packet
 
@@ -371,6 +371,105 @@ def test_enum_backward_compat():
     print(" OK")
 
 
+def test_bitfield_schema_roundtrip():
+    """Test Schema.to_bytes / from_bytes preserves bitfield metadata."""
+    print("test_bitfield_schema_roundtrip...", end="")
+
+    schema = Schema([
+        SchemaEntry(0, "gpio", "GPIO", 2, [
+            FieldDef("flags", 0, 2, BtelemType.BITFIELD, 1,
+                     bitfield_bits=[
+                         BitDef("enabled", 0, 1),
+                         BitDef("error", 1, 1),
+                         BitDef("mode", 2, 2),
+                         BitDef("channel", 4, 4),
+                     ]),
+        ]),
+    ])
+
+    blob = schema.to_bytes()
+    schema2 = Schema.from_bytes(blob)
+
+    assert len(schema2.entries) == 1
+    f0 = schema2.entries[0].fields[0]
+    assert f0.name == "flags"
+    assert f0.type == BtelemType.BITFIELD
+    assert f0.bitfield_bits is not None
+    assert len(f0.bitfield_bits) == 4
+    assert f0.bitfield_bits[0].name == "enabled"
+    assert f0.bitfield_bits[0].start == 0
+    assert f0.bitfield_bits[0].width == 1
+    assert f0.bitfield_bits[1].name == "error"
+    assert f0.bitfield_bits[2].name == "mode"
+    assert f0.bitfield_bits[2].start == 2
+    assert f0.bitfield_bits[2].width == 2
+    assert f0.bitfield_bits[3].name == "channel"
+    assert f0.bitfield_bits[3].start == 4
+    assert f0.bitfield_bits[3].width == 4
+
+    # Non-bitfield fields should have no bits
+    assert f0.enum_labels is None
+
+    print(" OK")
+
+
+def test_bitfield_decode():
+    """Test Schema.decode extracts bit sub-fields correctly."""
+    print("test_bitfield_decode...", end="")
+
+    schema = Schema([
+        SchemaEntry(0, "test", "Test", 2, [
+            FieldDef("flags", 0, 2, BtelemType.BITFIELD, 1,
+                     bitfield_bits=[
+                         BitDef("enabled", 0, 1),
+                         BitDef("error", 1, 1),
+                         BitDef("mode", 2, 2),
+                     ]),
+        ]),
+    ])
+
+    # flags = 0b00001101 = 13
+    # enabled = bit 0 = 1
+    # error   = bit 1 = 0
+    # mode    = bits 2-3 = 0b11 = 3
+    payload = struct.pack("<H", 0b00001101)
+    result = schema.decode(0, payload)
+    assert result["flags"]["enabled"] == 1
+    assert result["flags"]["error"] == 0
+    assert result["flags"]["mode"] == 3
+
+    # flags = 0b00000010 = 2
+    # enabled = 0, error = 1, mode = 0
+    payload = struct.pack("<H", 0b00000010)
+    result = schema.decode(0, payload)
+    assert result["flags"]["enabled"] == 0
+    assert result["flags"]["error"] == 1
+    assert result["flags"]["mode"] == 0
+
+    print(" OK")
+
+
+def test_bitfield_backward_compat():
+    """Old schema blobs (no bitfield section) still parse correctly."""
+    print("test_bitfield_backward_compat...", end="")
+
+    # Build a schema without bitfields and serialize
+    schema = Schema([
+        SchemaEntry(0, "test", "Test", 4, [
+            FieldDef("value", 0, 4, BtelemType.U32),
+        ]),
+    ])
+
+    blob = schema.to_bytes()
+
+    # Parse — should succeed without bitfield section
+    schema2 = Schema.from_bytes(blob)
+    assert len(schema2.entries) == 1
+    assert schema2.entries[0].fields[0].bitfield_bits is None
+
+    print(" OK")
+
+
 if __name__ == "__main__":
     print("btelem Python tests")
     print("====================\n")
@@ -386,5 +485,8 @@ if __name__ == "__main__":
     test_enum_schema_roundtrip()
     test_enum_decode()
     test_enum_backward_compat()
+    test_bitfield_schema_roundtrip()
+    test_bitfield_decode()
+    test_bitfield_backward_compat()
 
     print("\nAll tests passed.")

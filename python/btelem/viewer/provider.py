@@ -30,6 +30,7 @@ class ChannelInfo:
     field_type: str  # human-readable, e.g. "F32", "U16"
     field_count: int
     enum_labels: list[str] | None = None
+    bitfield_bits: list | None = None  # list[BitDef] when field is BITFIELD
 
 
 @dataclass
@@ -290,5 +291,6 @@ def _channels_from_schema(schema: Any) -> list[ChannelInfo]:
                 field_type=f.type.name,
                 field_count=f.count,
                 enum_labels=getattr(f, "enum_labels", None),
+                bitfield_bits=getattr(f, "bitfield_bits", None),
             ))
     return channels

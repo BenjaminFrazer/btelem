@@ -121,6 +121,9 @@ class TreeExplorer:
 
     def _build_scalar_field(self, ch: ChannelInfo) -> None:
         """Build a single draggable row for a scalar field."""
+        if ch.bitfield_bits:
+            self._build_bitfield(ch)
+            return
         with dpg.group(horizontal=True):
             btn = dpg.add_button(
                 label=f"{ch.field_name} ({ch.field_type})",
@@ -139,6 +142,41 @@ class TreeExplorer:
             tag = _stats_tag(ch.entry_name, ch.field_name)
             dpg.add_text(_fmt_stats(s), tag=tag,
                          color=(150, 150, 150))
+
+    def _build_bitfield(self, ch: ChannelInfo) -> None:
+        """Build a tree node for a bitfield with per-bit draggable children."""
+        s = FieldStats(0, None, None)
+        if self._stats:
+            s = self._stats.get((ch.entry_name, ch.field_name), s)
+
+        with dpg.tree_node(
+            label=f"{ch.field_name} (BITFIELD)  {_fmt_stats(s)}",
+            default_open=False,
+        ):
+            # Drag the whole bitfield (raw integer)
+            all_btn = dpg.add_button(
+                label=f"+ drag raw", small=True,
+            )
+            with dpg.drag_payload(
+                parent=all_btn,
+                drag_data=(ch.entry_name, ch.field_name, None),
+                payload_type="btelem_field",
+            ):
+                dpg.add_text(f"{ch.entry_name}.{ch.field_name}")
+            # Individual bit sub-fields
+            for i, bit in enumerate(ch.bitfield_bits):
+                width_str = f"[{bit.start}]" if bit.width == 1 \
+                    else f"[{bit.start}:{bit.start + bit.width - 1}]"
+                btn = dpg.add_button(
+                    label=f".{bit.name} {width_str}", small=True,
+                )
+                with dpg.drag_payload(
+                    parent=btn,
+                    drag_data=(ch.entry_name, ch.field_name, ("bit", i)),
+                    payload_type="btelem_field",
+                ):
+                    dpg.add_text(
+                        f"{ch.entry_name}.{ch.field_name}.{bit.name}")
 
     def _build_array_field(self, ch: ChannelInfo) -> None:
         """Build a tree node for an array field with per-element children."""

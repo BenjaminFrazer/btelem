@@ -71,6 +71,7 @@ type_to_npy(uint8_t btype)
     case BTELEM_BOOL: return NPY_BOOL;
     case BTELEM_BYTES: return NPY_UINT8;
     case BTELEM_ENUM: return NPY_UINT8;
+    case BTELEM_BITFIELD: return -1;  /* select by field->size at call site */
     default:          return -1;
     }
 }
@@ -83,6 +84,7 @@ type_element_size(uint8_t btype)
     case BTELEM_U16:  case BTELEM_I16:  return 2;
     case BTELEM_U32:  case BTELEM_I32:  case BTELEM_F32:  return 4;
     case BTELEM_U64:  case BTELEM_I64:  case BTELEM_F64:  return 8;
+    case BTELEM_BITFIELD: return 0;  /* use field->size directly at call site */
     default:          return 0;
     }
 }
@@ -493,9 +495,22 @@ Capture_series(CaptureObject *self, PyObject *args, PyObject *kwds)
     if (!field) { PyErr_Format(PyExc_KeyError, "Unknown field: '%s'", field_name); return NULL; }
 
     int npy_type = type_to_npy(field->type);
-    if (npy_type < 0) { PyErr_Format(PyExc_ValueError, "Unsupported field type: %d", field->type); return NULL; }
+    if (npy_type < 0) {
+        /* BITFIELD: select NPY dtype from storage size */
+        if (field->type == BTELEM_BITFIELD) {
+            switch (field->size) {
+            case 1: npy_type = NPY_UINT8; break;
+            case 2: npy_type = NPY_UINT16; break;
+            case 4: npy_type = NPY_UINT32; break;
+            default: PyErr_Format(PyExc_ValueError, "Unsupported bitfield size: %d", field->size); return NULL;
+            }
+        } else {
+            PyErr_Format(PyExc_ValueError, "Unsupported field type: %d", field->type); return NULL;
+        }
+    }
 
-    int field_bytes = type_element_size(field->type) * field->count;
+    int elem_sz = type_element_size(field->type);
+    int field_bytes = (elem_sz > 0) ? elem_sz * field->count : field->size;
 
     npy_intp N = count_entries(self->map, self->index, self->index_count,
                                entry->id, t0, use_t0, t1, use_t1);
@@ -567,7 +582,16 @@ Capture_table(CaptureObject *self, PyObject *args, PyObject *kwds)
     for (uint16_t fi = 0; fi < entry->field_count; fi++) {
         const struct btelem_field_wire *f = &entry->fields[fi];
         int npy_type = type_to_npy(f->type);
-        field_sizes[fi] = type_element_size(f->type) * f->count;
+        int elem_sz = type_element_size(f->type);
+        if (npy_type < 0 && f->type == BTELEM_BITFIELD) {
+            switch (f->size) {
+            case 1: npy_type = NPY_UINT8; break;
+            case 2: npy_type = NPY_UINT16; break;
+            case 4: npy_type = NPY_UINT32; break;
+            default: npy_type = NPY_UINT8; break;
+            }
+        }
+        field_sizes[fi] = (elem_sz > 0) ? elem_sz * f->count : f->size;
 
         if (f->count > 1) {
             npy_intp dims[2] = {N, f->count};
@@ -850,7 +874,16 @@ LiveCapture_series(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
     if (!field) { PyErr_Format(PyExc_KeyError, "Unknown field: '%s'", field_name); return NULL; }
 
     int npy_type = type_to_npy(field->type);
-    int field_bytes = type_element_size(field->type) * field->count;
+    if (npy_type < 0 && field->type == BTELEM_BITFIELD) {
+        switch (field->size) {
+        case 1: npy_type = NPY_UINT8; break;
+        case 2: npy_type = NPY_UINT16; break;
+        case 4: npy_type = NPY_UINT32; break;
+        default: npy_type = NPY_UINT8; break;
+        }
+    }
+    int elem_sz = type_element_size(field->type);
+    int field_bytes = (elem_sz > 0) ? elem_sz * field->count : field->size;
 
     npy_intp N = count_entries(self->buf, self->index, self->index_count,
                                entry->id, t0, use_t0, t1, use_t1);
@@ -922,7 +955,16 @@ LiveCapture_table(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
     for (uint16_t fi = 0; fi < entry->field_count; fi++) {
         const struct btelem_field_wire *f = &entry->fields[fi];
         int npy_type = type_to_npy(f->type);
-        field_sizes[fi] = type_element_size(f->type) * f->count;
+        int elem_sz = type_element_size(f->type);
+        if (npy_type < 0 && f->type == BTELEM_BITFIELD) {
+            switch (f->size) {
+            case 1: npy_type = NPY_UINT8; break;
+            case 2: npy_type = NPY_UINT16; break;
+            case 4: npy_type = NPY_UINT32; break;
+            default: npy_type = NPY_UINT8; break;
+            }
+        }
+        field_sizes[fi] = (elem_sz > 0) ? elem_sz * f->count : f->size;
 
         if (f->count > 1) {
             npy_intp dims[2] = {N, f->count};

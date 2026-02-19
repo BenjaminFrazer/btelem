@@ -45,6 +45,10 @@ struct system_status {
     uint8_t state;   /* enum: IDLE, STARTING, RUNNING, STOPPING, FAULT */
 };
 
+struct gpio_state {
+    uint16_t flags;  /* bitfield: enabled(1), error(1), mode(2), channel(4) */
+};
+
 /* -------------------------------------------------------------------------
  * 2. Schema
  * ---------------------------------------------------------------------- */
@@ -81,6 +85,20 @@ static const struct btelem_field_def status_fields[] = {
 };
 BTELEM_SCHEMA_ENTRY(STATUS, 2, "system_status", "System state machine",
                     struct system_status, status_fields);
+
+static const struct btelem_bit_def gpio_bits[] = {
+    BTELEM_BIT("enabled", 0, 1),
+    BTELEM_BIT("error",   1, 1),
+    BTELEM_BIT("mode",    2, 2),
+    BTELEM_BIT("channel", 4, 4),
+};
+BTELEM_BITFIELD_DEF(gpio_flags, gpio_bits);
+
+static const struct btelem_field_def gpio_fields[] = {
+    BTELEM_FIELD_BITFIELD(struct gpio_state, flags, gpio_flags),
+};
+BTELEM_SCHEMA_ENTRY(GPIO, 4, "gpio_state", "GPIO pin status",
+                    struct gpio_state, gpio_fields);
 
 /* -------------------------------------------------------------------------
  * 3. Signal handling
@@ -153,6 +171,15 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
     int phase = (int)(t / 2.0) % 8;
     struct system_status st = { .state = (uint8_t)phase };
     BTELEM_LOG(ctx, STATUS, st);
+
+    /* gpio_state: bitfield with rotating flags */
+    uint16_t gf = 0;
+    gf |= ((int)(t * 2.0) & 1);              /* enabled: toggles at 2 Hz */
+    gf |= (((int)(t / 5.0) & 1) << 1);       /* error: toggles every 5s */
+    gf |= (((int)(t / 3.0) % 4) << 2);       /* mode: cycles 0-3 */
+    gf |= (((int)(t) % 16) << 4);             /* channel: cycles 0-15 */
+    struct gpio_state gs = { .flags = gf };
+    BTELEM_LOG(ctx, GPIO, gs);
 }
 
 /* -------------------------------------------------------------------------
@@ -183,6 +210,7 @@ int main(void)
     btelem_register(&ctx, &btelem_schema_MOTOR);
     btelem_register(&ctx, &btelem_schema_IMU);
     btelem_register(&ctx, &btelem_schema_STATUS);
+    btelem_register(&ctx, &btelem_schema_GPIO);
 
     static struct btelem_server srv;
     memset(&srv, 0, sizeof(srv));

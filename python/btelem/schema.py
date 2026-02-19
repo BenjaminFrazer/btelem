@@ -22,6 +22,7 @@ class BtelemType(IntEnum):
     BOOL = 10
     BYTES = 11
     ENUM = 12
+    BITFIELD = 13
 
 
 # struct format chars indexed by BtelemType (little-endian base)
@@ -39,6 +40,7 @@ _TYPE_FMT = {
     BtelemType.BOOL: "?",
     BtelemType.BYTES: None,  # handled separately
     BtelemType.ENUM: "B",    # uint8 storage
+    BtelemType.BITFIELD: None,  # handled by size: 1→B, 2→H, 4→I
 }
 
 # Wire format constants (must match btelem_types.h)
@@ -63,6 +65,18 @@ _ENUM_MAX_VALUES = 64
 _ENUM_WIRE_FMT = f"<HHB{_ENUM_MAX_VALUES * _ENUM_LABEL_MAX}s"
 _ENUM_WIRE_SIZE = struct.calcsize(_ENUM_WIRE_FMT)  # 2053
 
+_BIT_NAME_MAX = 32
+_BITFIELD_MAX_BITS = 16
+_BITFIELD_WIRE_FMT = f"<HHB{_BITFIELD_MAX_BITS * _BIT_NAME_MAX}s{_BITFIELD_MAX_BITS}s{_BITFIELD_MAX_BITS}s"
+_BITFIELD_WIRE_SIZE = struct.calcsize(_BITFIELD_WIRE_FMT)  # 549
+
+
+@dataclass
+class BitDef:
+    name: str
+    start: int
+    width: int
+
 
 @dataclass
 class FieldDef:
@@ -72,6 +86,7 @@ class FieldDef:
     type: BtelemType
     count: int = 1
     enum_labels: list[str] | None = None
+    bitfield_bits: list[BitDef] | None = None
 
 
 @dataclass
@@ -116,6 +131,23 @@ class Schema:
         for f in schema.fields:
             if f.type == BtelemType.BYTES:
                 result[f.name] = payload[f.offset:f.offset + f.size]
+                continue
+
+            if f.type == BtelemType.BITFIELD:
+                # Read raw integer based on storage size
+                size_fmt = {1: "B", 2: "H", 4: "I"}.get(f.size)
+                if size_fmt is None:
+                    result[f.name] = payload[f.offset:f.offset + f.size]
+                    continue
+                raw = struct.unpack_from(f"{self._prefix}{size_fmt}", payload, f.offset)[0]
+                if f.bitfield_bits:
+                    bits: dict[str, int] = {}
+                    for bd in f.bitfield_bits:
+                        mask = (1 << bd.width) - 1
+                        bits[bd.name] = (raw >> bd.start) & mask
+                    result[f.name] = bits
+                else:
+                    result[f.name] = raw
                 continue
 
             fmt_char = _TYPE_FMT[f.type]
@@ -185,6 +217,26 @@ class Schema:
                 if entry and fidx < len(entry.fields):
                     entry.fields[fidx].enum_labels = labels
 
+        # Parse optional bitfield metadata section
+        if pos + 2 <= len(data):
+            bf_count = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            for _ in range(bf_count):
+                if pos + _BITFIELD_WIRE_SIZE > len(data):
+                    break
+                sid, fidx, bcount, names_raw, starts_raw, widths_raw = \
+                    struct.unpack_from(_BITFIELD_WIRE_FMT, data, pos)
+                pos += _BITFIELD_WIRE_SIZE
+                bits: list[BitDef] = []
+                for bi in range(bcount):
+                    name_off = bi * _BIT_NAME_MAX
+                    name = names_raw[name_off:name_off + _BIT_NAME_MAX].split(
+                        b"\x00", 1)[0].decode("utf-8")
+                    bits.append(BitDef(name, starts_raw[bi], widths_raw[bi]))
+                entry = schema.entries.get(sid)
+                if entry and fidx < len(entry.fields):
+                    entry.fields[fidx].bitfield_bits = bits
+
         return schema
 
     def to_bytes(self) -> bytes:
@@ -208,23 +260,47 @@ class Schema:
 
             buf.extend(entry_buf)
 
-        # Append enum metadata for fields with enum_labels
+        # Append enum metadata (always write count, even if 0)
         enum_fields: list[tuple[int, int, list[str]]] = []
         for e in self.entries.values():
             for fi, f in enumerate(e.fields[:MAX_FIELDS]):
                 if f.enum_labels:
                     enum_fields.append((e.id, fi, f.enum_labels))
 
-        if enum_fields:
-            buf.extend(struct.pack("<H", len(enum_fields)))
-            for sid, fidx, labels in enum_fields:
-                lcount = min(len(labels), _ENUM_MAX_VALUES)
-                labels_raw = bytearray(_ENUM_MAX_VALUES * _ENUM_LABEL_MAX)
-                for li in range(lcount):
-                    encoded = labels[li].encode("utf-8")[:_ENUM_LABEL_MAX - 1]
-                    off = li * _ENUM_LABEL_MAX
-                    labels_raw[off:off + len(encoded)] = encoded
-                buf.extend(struct.pack(_ENUM_WIRE_FMT,
-                                       sid, fidx, lcount, bytes(labels_raw)))
+        buf.extend(struct.pack("<H", len(enum_fields)))
+        for sid, fidx, labels in enum_fields:
+            lcount = min(len(labels), _ENUM_MAX_VALUES)
+            labels_raw = bytearray(_ENUM_MAX_VALUES * _ENUM_LABEL_MAX)
+            for li in range(lcount):
+                encoded = labels[li].encode("utf-8")[:_ENUM_LABEL_MAX - 1]
+                off = li * _ENUM_LABEL_MAX
+                labels_raw[off:off + len(encoded)] = encoded
+            buf.extend(struct.pack(_ENUM_WIRE_FMT,
+                                   sid, fidx, lcount, bytes(labels_raw)))
+
+        # Append bitfield metadata (always write count, even if 0)
+        bf_fields: list[tuple[int, int, list[BitDef]]] = []
+        for e in self.entries.values():
+            for fi, f in enumerate(e.fields[:MAX_FIELDS]):
+                if f.bitfield_bits:
+                    bf_fields.append((e.id, fi, f.bitfield_bits))
+
+        buf.extend(struct.pack("<H", len(bf_fields)))
+        for sid, fidx, bits in bf_fields:
+            bcount = min(len(bits), _BITFIELD_MAX_BITS)
+            names_raw = bytearray(_BITFIELD_MAX_BITS * _BIT_NAME_MAX)
+            starts_raw = bytearray(_BITFIELD_MAX_BITS)
+            widths_raw = bytearray(_BITFIELD_MAX_BITS)
+            for bi in range(bcount):
+                encoded = bits[bi].name.encode("utf-8")[:_BIT_NAME_MAX - 1]
+                off = bi * _BIT_NAME_MAX
+                names_raw[off:off + len(encoded)] = encoded
+                starts_raw[bi] = bits[bi].start
+                widths_raw[bi] = bits[bi].width
+            buf.extend(struct.pack(_BITFIELD_WIRE_FMT,
+                                   sid, fidx, bcount,
+                                   bytes(names_raw),
+                                   bytes(starts_raw),
+                                   bytes(widths_raw)))
 
         return bytes(buf)

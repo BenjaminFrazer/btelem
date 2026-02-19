@@ -400,6 +400,17 @@ class ViewerApp:
                 for ch in self._provider.channels():
                     if ch.entry_name == entry_name:
                         self._add_channel_series(sp, ch)
+            elif isinstance(element_index, tuple) and len(element_index) == 2 \
+                    and element_index[0] == "bit":
+                # Single bitfield sub-field drop
+                bit_idx = element_index[1]
+                for ch in self._provider.channels():
+                    if ch.entry_name == entry_name and ch.field_name == field_name:
+                        if ch.bitfield_bits and bit_idx < len(ch.bitfield_bits):
+                            bit = ch.bitfield_bits[bit_idx]
+                            sp.add_series(entry_name, field_name,
+                                          bit_def=bit)
+                        break
             elif element_index is not None:
                 # Single array element drop
                 enum_labels = None
@@ -430,8 +441,11 @@ class ViewerApp:
 
     @staticmethod
     def _add_channel_series(sp, ch: ChannelInfo) -> None:
-        """Add series for a channel, expanding array fields into per-element series."""
-        if ch.field_count > 1:
+        """Add series for a channel, expanding array/bitfield fields."""
+        if ch.bitfield_bits:
+            for bit in ch.bitfield_bits:
+                sp.add_series(ch.entry_name, ch.field_name, bit_def=bit)
+        elif ch.field_count > 1:
             for i in range(ch.field_count):
                 sp.add_series(ch.entry_name, ch.field_name,
                               enum_labels=ch.enum_labels, element_index=i)

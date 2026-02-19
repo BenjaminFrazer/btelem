@@ -187,7 +187,9 @@ static void test_schema_serialize_roundtrip(void)
     uint8_t buf[4096];
     int len = btelem_schema_serialize(&ctx, buf, sizeof(buf));
     int expected = (int)(sizeof(struct btelem_schema_header)
-                       + 1 * sizeof(struct btelem_schema_wire));
+                       + 1 * sizeof(struct btelem_schema_wire)
+                       + sizeof(uint16_t)   /* enum_count = 0 */
+                       + sizeof(uint16_t)); /* bitfield_count = 0 */
     assert(len == expected);
 
     /* Verify via packed header struct */
@@ -366,11 +368,13 @@ static void test_enum_schema_serialize(void)
     int len = btelem_schema_serialize(&ctx, buf, sizeof(buf));
     assert(len > 0);
 
-    /* Expected: header + 1 schema_wire + uint16_t enum_count + 1 enum_wire */
+    /* Expected: header + 1 schema_wire + uint16(enum_count=1) + 1 enum_wire
+     *         + uint16(bitfield_count=0) */
     int expected = (int)(sizeof(struct btelem_schema_header)
                        + sizeof(struct btelem_schema_wire)
                        + sizeof(uint16_t)
-                       + sizeof(struct btelem_enum_wire));
+                       + sizeof(struct btelem_enum_wire)
+                       + sizeof(uint16_t));  /* bitfield_count = 0 */
     assert(len == expected);
 
     /* Verify the enum section */
@@ -388,6 +392,68 @@ static void test_enum_schema_serialize(void)
     assert(strcmp(ew->labels[0], "IDLE") == 0);
     assert(strcmp(ew->labels[1], "RUNNING") == 0);
     assert(strcmp(ew->labels[2], "FAULT") == 0);
+
+    printf(" OK (%d bytes)\n", len);
+}
+
+static void test_bitfield_schema_serialize(void)
+{
+    printf("test_bitfield_schema_serialize...");
+
+    /* Set up a fresh context with a bitfield field */
+    memset(ring_mem, 0, sizeof(ring_mem));
+    int rc = btelem_init(&ctx, ring_mem, RING_ENTRIES);
+    assert(rc == 0);
+
+    struct bf_test_data { uint16_t flags; };
+    static const struct btelem_bit_def bf_bits[] = {
+        BTELEM_BIT("enabled", 0, 1),
+        BTELEM_BIT("error",   1, 1),
+        BTELEM_BIT("mode",    2, 2),
+    };
+    BTELEM_BITFIELD_DEF(test_bf, bf_bits);
+    static const struct btelem_field_def bf_fields[] = {
+        BTELEM_FIELD_BITFIELD(struct bf_test_data, flags, test_bf),
+    };
+    BTELEM_SCHEMA_ENTRY(BF_TEST, 0, "bf_test", "Bitfield test",
+                        struct bf_test_data, bf_fields);
+    btelem_register(&ctx, &btelem_schema_BF_TEST);
+
+    uint8_t buf[8192];
+    int len = btelem_schema_serialize(&ctx, buf, sizeof(buf));
+    assert(len > 0);
+
+    /* Expected: header + 1 schema_wire + uint16(enum_count=0) + uint16(bf_count=1)
+     * + 1 bitfield_wire */
+    int expected = (int)(sizeof(struct btelem_schema_header)
+                       + sizeof(struct btelem_schema_wire)
+                       + sizeof(uint16_t)  /* enum_count = 0 */
+                       + sizeof(uint16_t)  /* bitfield_count = 1 */
+                       + sizeof(struct btelem_bitfield_wire));
+    assert(len == expected);
+
+    /* Verify the bitfield section */
+    size_t bf_offset = sizeof(struct btelem_schema_header)
+                     + sizeof(struct btelem_schema_wire)
+                     + sizeof(uint16_t);  /* skip enum_count */
+    uint16_t bf_count;
+    memcpy(&bf_count, buf + bf_offset, sizeof(uint16_t));
+    assert(bf_count == 1);
+
+    const struct btelem_bitfield_wire *bw =
+        (const struct btelem_bitfield_wire *)(buf + bf_offset + sizeof(uint16_t));
+    assert(bw->schema_id == 0);
+    assert(bw->field_index == 0);
+    assert(bw->bit_count == 3);
+    assert(strcmp(bw->names[0], "enabled") == 0);
+    assert(strcmp(bw->names[1], "error") == 0);
+    assert(strcmp(bw->names[2], "mode") == 0);
+    assert(bw->starts[0] == 0);
+    assert(bw->starts[1] == 1);
+    assert(bw->starts[2] == 2);
+    assert(bw->widths[0] == 1);
+    assert(bw->widths[1] == 1);
+    assert(bw->widths[2] == 2);
 
     printf(" OK (%d bytes)\n", len);
 }
@@ -410,6 +476,7 @@ int main(void)
     test_drain_packed_filtered();
     test_drain_packed_dropped();
     test_enum_schema_serialize();
+    test_bitfield_schema_serialize();
 
     printf("\nAll tests passed.\n");
     return 0;

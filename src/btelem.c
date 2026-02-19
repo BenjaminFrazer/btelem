@@ -190,6 +190,10 @@ int btelem_drain(struct btelem_ctx *ctx, int client_id,
  * Wire format: btelem_schema_header + N * btelem_schema_wire (packed structs)
  * ----------------------------------------------------------------------- */
 
+static void serialize_one_bitfield(const struct btelem_schema_entry *e,
+                                   uint16_t field_index,
+                                   struct btelem_bitfield_wire *bw);
+
 int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_size)
 {
     if (!ctx)
@@ -201,8 +205,9 @@ int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_
         if (ctx->schema[i]) count++;
     }
 
-    /* Count enum fields across all schemas */
+    /* Count enum and bitfield fields across all schemas */
     uint16_t enum_count = 0;
+    uint16_t bitfield_count = 0;
     for (uint16_t i = 0; i < ctx->schema_count; i++) {
         const struct btelem_schema_entry *e = ctx->schema[i];
         if (!e) continue;
@@ -211,14 +216,17 @@ int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_
         for (uint16_t f = 0; f < fc; f++) {
             if (e->fields[f].type == BTELEM_ENUM && e->fields[f].enum_def)
                 enum_count++;
+            if (e->fields[f].type == BTELEM_BITFIELD && e->fields[f].bitfield_def)
+                bitfield_count++;
         }
     }
 
     size_t needed = sizeof(struct btelem_schema_header)
-                  + (size_t)count * sizeof(struct btelem_schema_wire);
-    if (enum_count > 0)
-        needed += sizeof(uint16_t)
-                + (size_t)enum_count * sizeof(struct btelem_enum_wire);
+                  + (size_t)count * sizeof(struct btelem_schema_wire)
+                  + sizeof(uint16_t)
+                  + (size_t)enum_count * sizeof(struct btelem_enum_wire)
+                  + sizeof(uint16_t)
+                  + (size_t)bitfield_count * sizeof(struct btelem_bitfield_wire);
 
     /* Size-query mode: buf=NULL returns required size without writing */
     if (!buf)
@@ -262,8 +270,8 @@ int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_
         }
     }
 
-    /* Append enum metadata section */
-    if (enum_count > 0) {
+    /* Append enum metadata section (always write count, even if 0) */
+    {
         uint8_t *p = (uint8_t *)buf + sizeof(*hdr)
                    + (size_t)count * sizeof(struct btelem_schema_wire);
         memcpy(p, &enum_count, sizeof(uint16_t));
@@ -288,6 +296,24 @@ int btelem_schema_serialize(const struct btelem_ctx *ctx, void *buf, size_t buf_
                     strncpy(ew->labels[li], ed->labels[li],
                             BTELEM_ENUM_LABEL_MAX - 1);
                 p += sizeof(struct btelem_enum_wire);
+            }
+        }
+
+        /* Append bitfield metadata section (always write count, even if 0) */
+        memcpy(p, &bitfield_count, sizeof(uint16_t));
+        p += sizeof(uint16_t);
+
+        for (uint16_t i = 0; i < ctx->schema_count; i++) {
+            const struct btelem_schema_entry *e = ctx->schema[i];
+            if (!e) continue;
+            uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
+                        ? e->field_count : BTELEM_MAX_FIELDS;
+            for (uint16_t f = 0; f < fc; f++) {
+                if (e->fields[f].type != BTELEM_BITFIELD || !e->fields[f].bitfield_def)
+                    continue;
+                struct btelem_bitfield_wire *bw = (struct btelem_bitfield_wire *)p;
+                serialize_one_bitfield(e, f, bw);
+                p += sizeof(struct btelem_bitfield_wire);
             }
         }
     }
@@ -340,6 +366,26 @@ static void serialize_one_enum(const struct btelem_schema_entry *e,
     }
 }
 
+static void serialize_one_bitfield(const struct btelem_schema_entry *e,
+                                   uint16_t field_index,
+                                   struct btelem_bitfield_wire *bw)
+{
+    memset(bw, 0, sizeof(*bw));
+    bw->schema_id = e->id;
+    bw->field_index = field_index;
+    const struct btelem_bitfield_def *bd = e->fields[field_index].bitfield_def;
+    uint8_t bc = bd->bit_count < BTELEM_BITFIELD_MAX_BITS
+               ? bd->bit_count : BTELEM_BITFIELD_MAX_BITS;
+    bw->bit_count = bc;
+    for (uint8_t bi = 0; bi < bc; bi++) {
+        if (bd->bits[bi].name)
+            strncpy(bw->names[bi], bd->bits[bi].name,
+                    BTELEM_BIT_NAME_MAX - 1);
+        bw->starts[bi] = bd->bits[bi].start;
+        bw->widths[bi] = bd->bits[bi].width;
+    }
+}
+
 int btelem_schema_stream(const struct btelem_ctx *ctx,
                          btelem_schema_emit_fn emit, void *user)
 {
@@ -351,6 +397,7 @@ int btelem_schema_stream(const struct btelem_ctx *ctx,
     /* 1. Header */
     uint16_t count = 0;
     uint16_t enum_count = 0;
+    uint16_t bitfield_count = 0;
     for (uint16_t i = 0; i < ctx->schema_count; i++) {
         const struct btelem_schema_entry *e = ctx->schema[i];
         if (!e) continue;
@@ -360,6 +407,8 @@ int btelem_schema_stream(const struct btelem_ctx *ctx,
         for (uint16_t f = 0; f < fc; f++) {
             if (e->fields[f].type == BTELEM_ENUM && e->fields[f].enum_def)
                 enum_count++;
+            if (e->fields[f].type == BTELEM_BITFIELD && e->fields[f].bitfield_def)
+                bitfield_count++;
         }
     }
 
@@ -383,26 +432,45 @@ int btelem_schema_stream(const struct btelem_ctx *ctx,
         total += (int)sizeof(w);
     }
 
-    /* 3. Enum section */
-    if (enum_count > 0) {
-        if (emit(&enum_count, sizeof(uint16_t), user) != 0)
-            return -1;
-        total += (int)sizeof(uint16_t);
+    /* 3. Enum section (always emit count, even if 0) */
+    if (emit(&enum_count, sizeof(uint16_t), user) != 0)
+        return -1;
+    total += (int)sizeof(uint16_t);
 
-        for (uint16_t i = 0; i < ctx->schema_count; i++) {
-            const struct btelem_schema_entry *e = ctx->schema[i];
-            if (!e) continue;
-            uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
-                        ? e->field_count : BTELEM_MAX_FIELDS;
-            for (uint16_t f = 0; f < fc; f++) {
-                if (e->fields[f].type != BTELEM_ENUM || !e->fields[f].enum_def)
-                    continue;
-                struct btelem_enum_wire ew;
-                serialize_one_enum(e, f, &ew);
-                if (emit(&ew, sizeof(ew), user) != 0)
-                    return -1;
-                total += (int)sizeof(ew);
-            }
+    for (uint16_t i = 0; i < ctx->schema_count; i++) {
+        const struct btelem_schema_entry *e = ctx->schema[i];
+        if (!e) continue;
+        uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
+                    ? e->field_count : BTELEM_MAX_FIELDS;
+        for (uint16_t f = 0; f < fc; f++) {
+            if (e->fields[f].type != BTELEM_ENUM || !e->fields[f].enum_def)
+                continue;
+            struct btelem_enum_wire ew;
+            serialize_one_enum(e, f, &ew);
+            if (emit(&ew, sizeof(ew), user) != 0)
+                return -1;
+            total += (int)sizeof(ew);
+        }
+    }
+
+    /* 4. Bitfield section (always emit count, even if 0) */
+    if (emit(&bitfield_count, sizeof(uint16_t), user) != 0)
+        return -1;
+    total += (int)sizeof(uint16_t);
+
+    for (uint16_t i = 0; i < ctx->schema_count; i++) {
+        const struct btelem_schema_entry *e = ctx->schema[i];
+        if (!e) continue;
+        uint16_t fc = e->field_count < BTELEM_MAX_FIELDS
+                    ? e->field_count : BTELEM_MAX_FIELDS;
+        for (uint16_t f = 0; f < fc; f++) {
+            if (e->fields[f].type != BTELEM_BITFIELD || !e->fields[f].bitfield_def)
+                continue;
+            struct btelem_bitfield_wire bw;
+            serialize_one_bitfield(e, f, &bw);
+            if (emit(&bw, sizeof(bw), user) != 0)
+                return -1;
+            total += (int)sizeof(bw);
         }
     }
 

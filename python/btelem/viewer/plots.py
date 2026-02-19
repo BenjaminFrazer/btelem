@@ -49,6 +49,7 @@ class _CachedSeries:
     values: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
     dirty: bool = True
     enum_labels: list[str] | None = None
+    bit_def: Any = None  # BitDef for bitfield sub-field extraction
     _enum_tick_max: int = -1  # highest enum value reflected in axis ticks
     # DPG widget tags — recreated on subplot rebuild
     line_tag: int | str | None = None
@@ -83,25 +84,34 @@ class SubPlot:
 
     @staticmethod
     def _series_key(entry_name: str, field_name: str,
-                    element_index: int | None = None) -> str:
+                    element_index: int | None = None,
+                    bit_def: object = None) -> str:
+        if bit_def is not None:
+            return f"{entry_name}.{field_name}.{bit_def.name}"
         if element_index is not None:
             return f"{entry_name}.{field_name}[{element_index}]"
         return f"{entry_name}.{field_name}"
 
     def has_series(self, entry_name: str, field_name: str,
-                   element_index: int | None = None) -> bool:
-        return self._series_key(entry_name, field_name, element_index) in self._series
+                   element_index: int | None = None,
+                   bit_def: object = None) -> bool:
+        return self._series_key(entry_name, field_name, element_index, bit_def) in self._series
 
     def add_series(self, entry_name: str, field_name: str,
                    enum_labels: list[str] | None = None,
-                   element_index: int | None = None) -> None:
-        key = self._series_key(entry_name, field_name, element_index)
+                   element_index: int | None = None,
+                   bit_def: object = None) -> None:
+        key = self._series_key(entry_name, field_name, element_index, bit_def)
         if key in self._series:
             return
+        # For width==1 bitfield flags, use stair series rendering
+        if bit_def is not None and bit_def.width == 1:
+            enum_labels = ["0", "1"]
         cs = _CachedSeries(entry_name=entry_name, field_name=field_name,
                            color_index=self._color_index,
                            element_index=element_index,
-                           enum_labels=enum_labels)
+                           enum_labels=enum_labels,
+                           bit_def=bit_def)
         self._color_index += 1
         self._series[key] = cs
         if self.y_axis_tag is not None:
@@ -149,7 +159,9 @@ class SubPlot:
         if self.y_axis_tag is None:
             return
         color = _PALETTE[cs.color_index % len(_PALETTE)]
-        if cs.element_index is not None:
+        if cs.bit_def is not None:
+            label = f"{cs.entry_name}.{cs.field_name}.{cs.bit_def.name}"
+        elif cs.element_index is not None:
             label = f"{cs.entry_name}.{cs.field_name}[{cs.element_index}]"
         else:
             label = f"{cs.entry_name}.{cs.field_name}"
@@ -321,14 +333,16 @@ class SubPlot:
         with dpg.window(popup=True, show=False, no_title_bar=True) as popup:
             self._popup_tag = popup
             for cs in self._series.values():
-                if cs.element_index is not None:
+                if cs.bit_def is not None:
+                    label = f"{cs.entry_name}.{cs.field_name}.{cs.bit_def.name}"
+                elif cs.element_index is not None:
                     label = f"{cs.entry_name}.{cs.field_name}[{cs.element_index}]"
                 else:
                     label = f"{cs.entry_name}.{cs.field_name}"
                 dpg.add_menu_item(
                     label=f"Remove {label}",
                     callback=self._remove_series_cb,
-                    user_data=(cs.entry_name, cs.field_name, cs.element_index),
+                    user_data=(cs.entry_name, cs.field_name, cs.element_index, cs.bit_def),
                 )
             if self._series:
                 dpg.add_separator()
@@ -347,7 +361,15 @@ class SubPlot:
                           user_data: tuple) -> None:
         entry_name, field_name = user_data[0], user_data[1]
         element_index = user_data[2] if len(user_data) > 2 else None
-        self.remove_series(entry_name, field_name, element_index)
+        bit_def = user_data[3] if len(user_data) > 3 else None
+        if bit_def is not None:
+            key = self._series_key(entry_name, field_name, bit_def=bit_def)
+            cs = self._series.pop(key, None)
+            if cs is not None:
+                self._delete_dpg_series(cs)
+                self._rebuild_popup()
+        else:
+            self.remove_series(entry_name, field_name, element_index)
 
     def _clear_via_menu(self) -> None:
         self.clear_series()
@@ -938,6 +960,10 @@ class PlotPanel:
                     vals = data.values.astype(np.float64)
                     if cs.element_index is not None and vals.ndim == 2:
                         vals = vals[:, cs.element_index]
+                    if cs.bit_def is not None:
+                        mask = (1 << cs.bit_def.width) - 1
+                        vals = np.floor(vals / (1 << cs.bit_def.start)).astype(np.uint64) & mask
+                        vals = vals.astype(np.float64)
                     cs.values = vals
                 cs.dirty = False
 

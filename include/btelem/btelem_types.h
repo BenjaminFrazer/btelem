@@ -50,6 +50,7 @@ enum btelem_type {
     BTELEM_BOOL,
     BTELEM_BYTES,
     BTELEM_ENUM = 12,  /* uint8 storage, labels in schema metadata */
+    BTELEM_BITFIELD = 13, /* uint8/16/32 storage, bit sub-fields in schema metadata */
 };
 
 /* --------------------------------------------------------------------------
@@ -80,6 +81,23 @@ struct btelem_enum_def {
 };
 
 /* --------------------------------------------------------------------------
+ * Bitfield definitions (for BTELEM_BITFIELD fields)
+ * ----------------------------------------------------------------------- */
+
+#define BTELEM_BITFIELD_MAX_BITS 16
+
+struct btelem_bit_def {
+    const char *name;
+    uint8_t     start;   /* 0-based, LSB */
+    uint8_t     width;   /* 1 for flag, >1 for group */
+};
+
+struct btelem_bitfield_def {
+    const struct btelem_bit_def *bits;
+    uint8_t                      bit_count;
+};
+
+/* --------------------------------------------------------------------------
  * Schema: field definitions and entry descriptors
  * ----------------------------------------------------------------------- */
 
@@ -89,7 +107,8 @@ struct btelem_field_def {
     uint16_t    size;
     uint8_t     type;       /* enum btelem_type */
     uint8_t     count;      /* 1 for scalar, >1 for array */
-    const struct btelem_enum_def *enum_def;  /* NULL for non-enum */
+    const struct btelem_enum_def     *enum_def;      /* NULL for non-enum */
+    const struct btelem_bitfield_def *bitfield_def;   /* NULL for non-bitfield */
 };
 
 struct btelem_schema_entry {
@@ -111,7 +130,7 @@ struct btelem_schema_entry {
       (uint16_t)offsetof(stype, member), \
       (uint16_t)sizeof(((stype *)0)->member), \
       (uint8_t)(btype), \
-      1, NULL }
+      1, NULL, NULL }
 
 /* Define an array field */
 #define BTELEM_ARRAY_FIELD(stype, member, btype, cnt) \
@@ -119,7 +138,7 @@ struct btelem_schema_entry {
       (uint16_t)offsetof(stype, member), \
       (uint16_t)sizeof(((stype *)0)->member), \
       (uint8_t)(btype), \
-      (uint8_t)(cnt), NULL }
+      (uint8_t)(cnt), NULL, NULL }
 
 /* Define an enum label set */
 #define BTELEM_ENUM_DEF(name, labels_arr) \
@@ -133,7 +152,25 @@ struct btelem_schema_entry {
     { #member, \
       (uint16_t)offsetof(stype, member), \
       (uint16_t)sizeof(((stype *)0)->member), \
-      BTELEM_ENUM, 1, &btelem_enumdef_##enum_name }
+      BTELEM_ENUM, 1, &btelem_enumdef_##enum_name, NULL }
+
+/* Define a bitfield layout (array of bit_def + count) */
+#define BTELEM_BITFIELD_DEF(name, bits_arr) \
+    static const struct btelem_bitfield_def btelem_bfdef_##name = { \
+        .bits = (bits_arr), \
+        .bit_count = (uint8_t)(sizeof(bits_arr) / sizeof((bits_arr)[0])), \
+    }
+
+/* Define a single bit sub-field entry */
+#define BTELEM_BIT(name_str, _start, _width) \
+    { (name_str), (_start), (_width) }
+
+/* Define a bitfield field (uint8/16/32 storage with named bits) */
+#define BTELEM_FIELD_BITFIELD(stype, member, bf_name) \
+    { #member, \
+      (uint16_t)offsetof(stype, member), \
+      (uint16_t)sizeof(((stype *)0)->member), \
+      BTELEM_BITFIELD, 1, NULL, &btelem_bfdef_##bf_name }
 
 /* Declare a complete schema entry (creates the schema_entry const) */
 #define BTELEM_SCHEMA_ENTRY(tag, _id, _name, _desc, stype, _fields) \
@@ -200,12 +237,31 @@ struct __attribute__((packed)) btelem_enum_wire {
 
 _Static_assert(sizeof(struct btelem_enum_wire) == 2053, "btelem_enum_wire packing");
 
+/* --------------------------------------------------------------------------
+ * Bitfield metadata wire format (appended after enum section)
+ * ----------------------------------------------------------------------- */
+
+#define BTELEM_BIT_NAME_MAX 32
+
+struct __attribute__((packed)) btelem_bitfield_wire {
+    uint16_t schema_id;                                              /*   2 */
+    uint16_t field_index;                                            /*   2 */
+    uint8_t  bit_count;                                              /*   1 */
+    char     names[BTELEM_BITFIELD_MAX_BITS][BTELEM_BIT_NAME_MAX];   /* 512 */
+    uint8_t  starts[BTELEM_BITFIELD_MAX_BITS];                       /*  16 */
+    uint8_t  widths[BTELEM_BITFIELD_MAX_BITS];                       /*  16 */
+};
+
+_Static_assert(sizeof(struct btelem_bitfield_wire) == 549, "btelem_bitfield_wire packing");
+
 /** Worst-case serialized schema size (suitable for static allocation). */
 #define BTELEM_SCHEMA_BUF_SIZE \
     (sizeof(struct btelem_schema_header) \
    + BTELEM_MAX_SCHEMA_ENTRIES * sizeof(struct btelem_schema_wire) \
    + sizeof(uint16_t) \
-   + BTELEM_MAX_SCHEMA_ENTRIES * BTELEM_MAX_FIELDS * sizeof(struct btelem_enum_wire))
+   + BTELEM_MAX_SCHEMA_ENTRIES * BTELEM_MAX_FIELDS * sizeof(struct btelem_enum_wire) \
+   + sizeof(uint16_t) \
+   + BTELEM_MAX_SCHEMA_ENTRIES * BTELEM_MAX_FIELDS * sizeof(struct btelem_bitfield_wire))
 
 /* --------------------------------------------------------------------------
  * Entry wire format (packed, for batch transport)
