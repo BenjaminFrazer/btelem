@@ -6,6 +6,7 @@ through Provider subclasses so the UI can work with arbitrary backends.
 
 from __future__ import annotations
 
+import logging
 import struct
 from abc import ABC, abstractmethod
 from collections import deque
@@ -15,6 +16,8 @@ from typing import Any
 import numpy as np
 
 from btelem.decoder import DecodedEntry, decode_packet
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -70,6 +73,11 @@ class Provider(ABC):
     @property
     def dropped_count(self) -> int:
         """Total entries dropped by the producer (overwritten before read)."""
+        return 0
+
+    @property
+    def truncated_count(self) -> int:
+        """Total entries dropped due to rolling window truncation."""
         return 0
 
     def poll(self) -> bool:
@@ -163,16 +171,20 @@ class BtelemLiveProvider(Provider):
     and feeds them to LiveCapture for accumulation and numpy extraction.
     """
 
+    DEFAULT_MAX_PACKETS = 100_000
+
     def __init__(self, transport: Any, schema_bytes: bytes,
-                 schema: Any) -> None:
+                 schema: Any, *,
+                 max_packets: int = DEFAULT_MAX_PACKETS) -> None:
         from btelem.capture import LiveCapture
 
         self._transport = transport
         self._schema = schema
-        self._live = LiveCapture(schema_bytes)
+        self._live = LiveCapture(schema_bytes, max_packets=max_packets)
         self._channels = _channels_from_schema(schema)
         self._has_data = False
         self._dropped: int = 0
+        self._truncation_warned = False
 
         # Event buffering for event log
         self._event_buf: deque[DecodedEntry] = deque(maxlen=10000)
@@ -210,6 +222,10 @@ class BtelemLiveProvider(Provider):
     def dropped_count(self) -> int:
         return self._dropped
 
+    @property
+    def truncated_count(self) -> int:
+        return self._live.truncated_entries
+
     def poll(self) -> bool:
         """Read from transport, extract packets, feed to LiveCapture.
 
@@ -242,6 +258,13 @@ class BtelemLiveProvider(Provider):
 
         if got_packet:
             self._has_data = True
+            if not self._truncation_warned and self._live.truncated_entries > 0:
+                self._truncation_warned = True
+                logger.warning(
+                    "Rolling window active: oldest samples are being "
+                    "discarded to keep viewer responsive (max_packets=%d)",
+                    self.DEFAULT_MAX_PACKETS,
+                )
         return got_packet
 
     def recent_events(self) -> list[DecodedEntry]:

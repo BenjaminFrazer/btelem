@@ -189,16 +189,16 @@ _Static_assert(sizeof(struct btelem_schema_header) == 3,    "btelem_schema_heade
  * ----------------------------------------------------------------------- */
 
 #define BTELEM_ENUM_LABEL_MAX  32   /* max chars per label (incl. null) */
-#define BTELEM_ENUM_MAX_VALUES 32   /* max values per enum field */
+#define BTELEM_ENUM_MAX_VALUES 64   /* max values per enum field */
 
 struct __attribute__((packed)) btelem_enum_wire {
     uint16_t schema_id;                                            /*    2 */
     uint16_t field_index;                                          /*    2 */
     uint8_t  label_count;                                          /*    1 */
-    char     labels[BTELEM_ENUM_MAX_VALUES][BTELEM_ENUM_LABEL_MAX]; /* 1024 */
+    char     labels[BTELEM_ENUM_MAX_VALUES][BTELEM_ENUM_LABEL_MAX]; /* 2048 */
 };
 
-_Static_assert(sizeof(struct btelem_enum_wire) == 1029, "btelem_enum_wire packing");
+_Static_assert(sizeof(struct btelem_enum_wire) == 2053, "btelem_enum_wire packing");
 
 /** Worst-case serialized schema size (suitable for static allocation). */
 #define BTELEM_SCHEMA_BUF_SIZE \

@@ -333,8 +333,11 @@ static void serialize_one_enum(const struct btelem_schema_entry *e,
     uint8_t lc = ed->label_count < BTELEM_ENUM_MAX_VALUES
                ? ed->label_count : BTELEM_ENUM_MAX_VALUES;
     ew->label_count = lc;
-    for (uint8_t li = 0; li < lc; li++)
-        strncpy(ew->labels[li], ed->labels[li], BTELEM_ENUM_LABEL_MAX - 1);
+    for (uint8_t li = 0; li < lc; li++) {
+        if (ed->labels[li])
+            strncpy(ew->labels[li], ed->labels[li], BTELEM_ENUM_LABEL_MAX - 1);
+        /* NULL labels left as empty string (memset above) */
+    }
 }
 
 int btelem_schema_stream(const struct btelem_ctx *ctx,

@@ -36,6 +36,11 @@ struct motor_state {
     float current;
 };
 
+struct imu_data {
+    float accel[3];  /* x, y, z  (m/s²) */
+    float gyro[3];   /* x, y, z  (rad/s) */
+};
+
 struct system_status {
     uint8_t state;   /* enum: IDLE, STARTING, RUNNING, STOPPING, FAULT */
 };
@@ -58,6 +63,13 @@ static const struct btelem_field_def motor_fields[] = {
 };
 BTELEM_SCHEMA_ENTRY(MOTOR, 1, "motor_state", "Motor controller",
                     struct motor_state, motor_fields);
+
+static const struct btelem_field_def imu_fields[] = {
+    BTELEM_ARRAY_FIELD(struct imu_data, accel, BTELEM_F32, 3),
+    BTELEM_ARRAY_FIELD(struct imu_data, gyro,  BTELEM_F32, 3),
+};
+BTELEM_SCHEMA_ENTRY(IMU, 3, "imu_data", "Inertial measurement unit",
+                    struct imu_data, imu_fields);
 
 static const char *system_state_labels[] = {
     "IDLE", "STARTING", "RUNNING", "STOPPING", "FAULT"
@@ -120,6 +132,21 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
     };
     BTELEM_LOG(ctx, MOTOR, m);
 
+    /* imu_data: accelerometer + gyroscope with gravity + vibration */
+    struct imu_data imu = {
+        .accel = {
+            0.5f * sinf(2.0f * (float)M_PI * (float)t / 6.0f) + gauss(0.05f),
+            0.3f * cosf(2.0f * (float)M_PI * (float)t / 8.0f) + gauss(0.05f),
+            9.81f + 0.2f * sinf(2.0f * (float)M_PI * (float)t / 4.0f) + gauss(0.05f),
+        },
+        .gyro = {
+            0.1f * sinf(2.0f * (float)M_PI * (float)t / 5.0f) + gauss(0.01f),
+            0.15f * cosf(2.0f * (float)M_PI * (float)t / 7.0f) + gauss(0.01f),
+            0.05f * sinf(2.0f * (float)M_PI * (float)t / 3.0f) + gauss(0.01f),
+        },
+    };
+    BTELEM_LOG(ctx, IMU, imu);
+
     /* system_status: cycle through states every 2 seconds.
      * Values 0-4 map to named labels; 5-7 are intentionally unnamed
      * to exercise unknown-enum-value display in the viewer. */
@@ -154,6 +181,7 @@ int main(void)
     btelem_init(&ctx, ring_mem, ring_entries);
     btelem_register(&ctx, &btelem_schema_SENSOR);
     btelem_register(&ctx, &btelem_schema_MOTOR);
+    btelem_register(&ctx, &btelem_schema_IMU);
     btelem_register(&ctx, &btelem_schema_STATUS);
 
     static struct btelem_server srv;

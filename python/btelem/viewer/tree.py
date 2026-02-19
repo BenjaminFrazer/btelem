@@ -109,29 +109,70 @@ class TreeExplorer:
                 )
                 with dpg.drag_payload(
                     parent=entry_btn,
-                    drag_data=(entry_name, None),
+                    drag_data=(entry_name, None, None),
                     payload_type="btelem_field",
                 ):
                     dpg.add_text(entry_name)
                 for ch in visible_fields:
-                    with dpg.group(horizontal=True):
-                        btn = dpg.add_button(
-                            label=f"{ch.field_name} ({ch.field_type})",
-                            small=True,
-                        )
-                        with dpg.drag_payload(
-                            parent=btn,
-                            drag_data=(ch.entry_name, ch.field_name),
-                            payload_type="btelem_field",
-                        ):
-                            dpg.add_text(f"{ch.entry_name}.{ch.field_name}")
-                        s = FieldStats(0, None, None)
-                        if self._stats:
-                            s = self._stats.get(
-                                (ch.entry_name, ch.field_name), s)
-                        tag = _stats_tag(ch.entry_name, ch.field_name)
-                        dpg.add_text(_fmt_stats(s), tag=tag,
-                                     color=(150, 150, 150))
+                    if ch.field_count > 1:
+                        self._build_array_field(ch)
+                    else:
+                        self._build_scalar_field(ch)
+
+    def _build_scalar_field(self, ch: ChannelInfo) -> None:
+        """Build a single draggable row for a scalar field."""
+        with dpg.group(horizontal=True):
+            btn = dpg.add_button(
+                label=f"{ch.field_name} ({ch.field_type})",
+                small=True,
+            )
+            with dpg.drag_payload(
+                parent=btn,
+                drag_data=(ch.entry_name, ch.field_name, None),
+                payload_type="btelem_field",
+            ):
+                dpg.add_text(f"{ch.entry_name}.{ch.field_name}")
+            s = FieldStats(0, None, None)
+            if self._stats:
+                s = self._stats.get(
+                    (ch.entry_name, ch.field_name), s)
+            tag = _stats_tag(ch.entry_name, ch.field_name)
+            dpg.add_text(_fmt_stats(s), tag=tag,
+                         color=(150, 150, 150))
+
+    def _build_array_field(self, ch: ChannelInfo) -> None:
+        """Build a tree node for an array field with per-element children."""
+        s = FieldStats(0, None, None)
+        if self._stats:
+            s = self._stats.get((ch.entry_name, ch.field_name), s)
+
+        with dpg.tree_node(
+            label=f"{ch.field_name}[{ch.field_count}] ({ch.field_type})"
+                  f"  {_fmt_stats(s)}",
+            default_open=False,
+        ):
+            # Drag the whole array field (all elements)
+            all_btn = dpg.add_button(
+                label=f"+ drag all [{ch.field_count}]", small=True,
+            )
+            with dpg.drag_payload(
+                parent=all_btn,
+                drag_data=(ch.entry_name, ch.field_name, None),
+                payload_type="btelem_field",
+            ):
+                dpg.add_text(f"{ch.entry_name}.{ch.field_name}[*]")
+            # Individual elements
+            for i in range(ch.field_count):
+                btn = dpg.add_button(
+                    label=f"[{i}]", small=True,
+                )
+                with dpg.drag_payload(
+                    parent=btn,
+                    drag_data=(ch.entry_name, ch.field_name, i),
+                    payload_type="btelem_field",
+                ):
+                    dpg.add_text(
+                        f"{ch.entry_name}.{ch.field_name}[{i}]")
 
     def _entry_sample_count(self, entry_name: str,
                             fields: list[ChannelInfo]) -> int:

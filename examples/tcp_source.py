@@ -24,6 +24,7 @@ from btelem.storage import LogWriter, build_packet
 
 SENSOR_ID = 1
 MOTOR_ID = 2
+IMU_ID = 3
 
 schema = Schema([
     SchemaEntry(
@@ -45,6 +46,16 @@ schema = Schema([
         fields=[
             FieldDef("rpm",     offset=0, size=4, type=BtelemType.F32),
             FieldDef("current", offset=4, size=4, type=BtelemType.F32),
+        ],
+    ),
+    SchemaEntry(
+        id=IMU_ID,
+        name="imu_data",
+        description="Inertial measurement unit",
+        payload_size=24,
+        fields=[
+            FieldDef("accel", offset=0,  size=12, type=BtelemType.F32, count=3),
+            FieldDef("gyro",  offset=12, size=12, type=BtelemType.F32, count=3),
         ],
     ),
 ])
@@ -74,9 +85,19 @@ def make_payloads(t: float) -> list[tuple[int, int, bytes]]:
     current = 2.0 + 1.0 * abs(math.fmod(t, 4.0) - 2.0) + random.gauss(0, 0.1)
     motor_payload = struct.pack("<ff", rpm, current)
 
+    # imu_data: accelerometer (gravity + vibration) + gyroscope
+    ax = 0.5 * math.sin(2 * math.pi * t / 6.0) + random.gauss(0, 0.05)
+    ay = 0.3 * math.cos(2 * math.pi * t / 8.0) + random.gauss(0, 0.05)
+    az = 9.81 + 0.2 * math.sin(2 * math.pi * t / 4.0) + random.gauss(0, 0.05)
+    gx = 0.1 * math.sin(2 * math.pi * t / 5.0) + random.gauss(0, 0.01)
+    gy = 0.15 * math.cos(2 * math.pi * t / 7.0) + random.gauss(0, 0.01)
+    gz = 0.05 * math.sin(2 * math.pi * t / 3.0) + random.gauss(0, 0.01)
+    imu_payload = struct.pack("<ffffff", ax, ay, az, gx, gy, gz)
+
     return [
         (SENSOR_ID, ts_ns, sensor_payload),
         (MOTOR_ID,  ts_ns, motor_payload),
+        (IMU_ID,    ts_ns, imu_payload),
     ]
 
 

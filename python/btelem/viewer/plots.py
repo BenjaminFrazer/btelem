@@ -44,6 +44,7 @@ class _CachedSeries:
     entry_name: str
     field_name: str
     color_index: int = 0
+    element_index: int | None = None  # index into array fields (None = scalar)
     timestamps: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
     values: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
     dirty: bool = True
@@ -80,19 +81,26 @@ class SubPlot:
         self._popup_tag: int | str | None = None
         self._last_fit_y: tuple[float, float, float] | None = None  # (y_min, y_max, pad)
 
-    def _series_key(self, entry_name: str, field_name: str) -> str:
+    @staticmethod
+    def _series_key(entry_name: str, field_name: str,
+                    element_index: int | None = None) -> str:
+        if element_index is not None:
+            return f"{entry_name}.{field_name}[{element_index}]"
         return f"{entry_name}.{field_name}"
 
-    def has_series(self, entry_name: str, field_name: str) -> bool:
-        return self._series_key(entry_name, field_name) in self._series
+    def has_series(self, entry_name: str, field_name: str,
+                   element_index: int | None = None) -> bool:
+        return self._series_key(entry_name, field_name, element_index) in self._series
 
     def add_series(self, entry_name: str, field_name: str,
-                   enum_labels: list[str] | None = None) -> None:
-        key = self._series_key(entry_name, field_name)
+                   enum_labels: list[str] | None = None,
+                   element_index: int | None = None) -> None:
+        key = self._series_key(entry_name, field_name, element_index)
         if key in self._series:
             return
         cs = _CachedSeries(entry_name=entry_name, field_name=field_name,
                            color_index=self._color_index,
+                           element_index=element_index,
                            enum_labels=enum_labels)
         self._color_index += 1
         self._series[key] = cs
@@ -100,8 +108,9 @@ class SubPlot:
             self._create_dpg_series(cs)
             self._rebuild_popup()
 
-    def remove_series(self, entry_name: str, field_name: str) -> None:
-        key = self._series_key(entry_name, field_name)
+    def remove_series(self, entry_name: str, field_name: str,
+                      element_index: int | None = None) -> None:
+        key = self._series_key(entry_name, field_name, element_index)
         cs = self._series.pop(key, None)
         if cs is not None:
             self._delete_dpg_series(cs)
@@ -140,7 +149,10 @@ class SubPlot:
         if self.y_axis_tag is None:
             return
         color = _PALETTE[cs.color_index % len(_PALETTE)]
-        label = f"{cs.entry_name}.{cs.field_name}"
+        if cs.element_index is not None:
+            label = f"{cs.entry_name}.{cs.field_name}[{cs.element_index}]"
+        else:
+            label = f"{cs.entry_name}.{cs.field_name}"
 
         if cs.enum_labels:
             cs.line_tag = dpg.add_stair_series([], [], label=label,
@@ -309,11 +321,14 @@ class SubPlot:
         with dpg.window(popup=True, show=False, no_title_bar=True) as popup:
             self._popup_tag = popup
             for cs in self._series.values():
-                label = f"{cs.entry_name}.{cs.field_name}"
+                if cs.element_index is not None:
+                    label = f"{cs.entry_name}.{cs.field_name}[{cs.element_index}]"
+                else:
+                    label = f"{cs.entry_name}.{cs.field_name}"
                 dpg.add_menu_item(
                     label=f"Remove {label}",
                     callback=self._remove_series_cb,
-                    user_data=(cs.entry_name, cs.field_name),
+                    user_data=(cs.entry_name, cs.field_name, cs.element_index),
                 )
             if self._series:
                 dpg.add_separator()
@@ -329,8 +344,10 @@ class SubPlot:
                                pos=dpg.get_mouse_pos(local=False))
 
     def _remove_series_cb(self, sender: int, app_data: object,
-                          user_data: tuple[str, str]) -> None:
-        self.remove_series(user_data[0], user_data[1])
+                          user_data: tuple) -> None:
+        entry_name, field_name = user_data[0], user_data[1]
+        element_index = user_data[2] if len(user_data) > 2 else None
+        self.remove_series(entry_name, field_name, element_index)
 
     def _clear_via_menu(self) -> None:
         self.clear_series()
@@ -341,8 +358,8 @@ class SubPlot:
 
     def _drop_callback(self, sender: int, app_data: object) -> None:
         if self._on_drop is not None and app_data is not None:
-            entry_name, field_name = app_data
-            self._on_drop(self.id, entry_name, field_name)
+            entry_name, field_name, element_index = app_data
+            self._on_drop(self.id, entry_name, field_name, element_index)
 
 
 @dataclass
@@ -386,7 +403,8 @@ class TimingSubPlot:
         return f"{entry_name}.{field_name}" in self._rows
 
     def add_series(self, entry_name: str, field_name: str,
-                   enum_labels: list[str] | None = None) -> None:
+                   enum_labels: list[str] | None = None,
+                   element_index: int | None = None) -> None:
         key = f"{entry_name}.{field_name}"
         if key in self._rows:
             return
@@ -578,8 +596,8 @@ class TimingSubPlot:
 
     def _drop_callback(self, sender: int, app_data: object) -> None:
         if self._on_drop is not None and app_data is not None:
-            entry_name, field_name = app_data
-            self._on_drop(self.id, entry_name, field_name)
+            entry_name, field_name, element_index = app_data
+            self._on_drop(self.id, entry_name, field_name, element_index)
 
 
 class PlotPanel:
@@ -917,7 +935,10 @@ class PlotPanel:
                     if self._t0_ns is None:
                         self._t0_ns = int(data.timestamps[0])
                     cs.timestamps = (data.timestamps.astype(np.float64) - self._t0_ns) / 1e9
-                    cs.values = data.values.astype(np.float64)
+                    vals = data.values.astype(np.float64)
+                    if cs.element_index is not None and vals.ndim == 2:
+                        vals = vals[:, cs.element_index]
+                    cs.values = vals
                 cs.dirty = False
 
     def push_data(self) -> None:

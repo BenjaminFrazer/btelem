@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import dearpygui.dearpygui as dpg
 
-from .provider import Provider, BtelemFileProvider, BtelemLiveProvider
+from .provider import Provider, BtelemFileProvider, BtelemLiveProvider, ChannelInfo
 from .tree import TreeExplorer, FieldStats
 from .plots import PlotPanel, TimingSubPlot
 from .event_log import EventLogManager
@@ -372,12 +372,14 @@ class ViewerApp:
     # ------------------------------------------------------------------
 
     def _on_field_drop(self, subplot_id: int, entry_name: str,
-                       field_name: str | None) -> None:
+                       field_name: str | None,
+                       element_index: int | None = None) -> None:
         """Called when a field or entry is dragged onto a specific subplot.
 
         When *field_name* is ``None`` the entire entry was dragged.  For
         value plots all fields are added; for timing plots a single row
-        is added for the entry.
+        is added for the entry.  When *element_index* is set, only that
+        single array element is added.
         """
         assert self._plot_panel is not None
         if self._provider is None:
@@ -397,22 +399,45 @@ class ViewerApp:
                 # Entry-level drop on value plot → all fields
                 for ch in self._provider.channels():
                     if ch.entry_name == entry_name:
-                        sp.add_series(ch.entry_name, ch.field_name,
-                                      enum_labels=ch.enum_labels)
-            else:
-                # Single field drop
+                        self._add_channel_series(sp, ch)
+            elif element_index is not None:
+                # Single array element drop
                 enum_labels = None
                 for ch in self._provider.channels():
                     if ch.entry_name == entry_name and ch.field_name == field_name:
                         enum_labels = ch.enum_labels
                         break
-                sp.add_series(entry_name, field_name, enum_labels=enum_labels)
+                sp.add_series(entry_name, field_name,
+                              enum_labels=enum_labels,
+                              element_index=element_index)
+            else:
+                # Whole field drop (expands arrays)
+                ch_info = None
+                for ch in self._provider.channels():
+                    if ch.entry_name == entry_name and ch.field_name == field_name:
+                        ch_info = ch
+                        break
+                if ch_info is not None:
+                    self._add_channel_series(sp, ch_info)
+                else:
+                    sp.add_series(entry_name, field_name)
 
             self._plot_panel.mark_dirty()
             self._plot_panel.update_cache()
             self._plot_panel.push_data()
             self._plot_panel.request_fit()
             break
+
+    @staticmethod
+    def _add_channel_series(sp, ch: ChannelInfo) -> None:
+        """Add series for a channel, expanding array fields into per-element series."""
+        if ch.field_count > 1:
+            for i in range(ch.field_count):
+                sp.add_series(ch.entry_name, ch.field_name,
+                              enum_labels=ch.enum_labels, element_index=i)
+        else:
+            sp.add_series(ch.entry_name, ch.field_name,
+                          enum_labels=ch.enum_labels)
 
     def _on_add_event_log(self) -> None:
         if self._event_log_mgr is not None:
@@ -460,6 +485,9 @@ class ViewerApp:
         dur_str = f"{(tr[1] - tr[0]) / 1e9:.1f}s" if tr else "(no data)"
         parts = [f"Live  |  {len(channels)} channels  |  {dur_str}"]
         parts.append(f"Dropped: {self._provider.dropped_count}")
+        truncated = self._provider.truncated_count
+        if truncated > 0:
+            parts.append(f"Truncated: {truncated} (rolling window)")
         self._set_status("  |  ".join(parts))
 
     def _set_status(self, text: str) -> None:

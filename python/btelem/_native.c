@@ -21,6 +21,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+/* Viewer needs room for any schema the server sends; override the
+   conservative embedded default (64) before btelem_types.h sees it. */
+#ifndef BTELEM_MAX_SCHEMA_ENTRIES
+#define BTELEM_MAX_SCHEMA_ENTRIES 256
+#endif
 #include "btelem/btelem_types.h"
 
 /* =========================================================================
@@ -676,6 +681,9 @@ typedef struct {
     struct btelem_index_entry *index;
     uint32_t                   index_count;
     uint32_t                   index_cap;
+    uint32_t                   max_packets;       /* 0 = unlimited */
+    uint64_t                   truncated_packets;
+    uint64_t                   truncated_entries;
 } LiveCaptureObject;
 
 static void
@@ -690,7 +698,11 @@ static int
 LiveCapture_init(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
 {
     Py_buffer schema_buf;
-    if (!PyArg_ParseTuple(args, "y*", &schema_buf))
+    unsigned int max_packets = 0;
+    static char *kwlist[] = {"schema_bytes", "max_packets", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "y*|I", kwlist,
+                                     &schema_buf, &max_packets))
         return -1;
 
     if (parse_schema(schema_buf.buf, schema_buf.len, &self->schema) < 0) {
@@ -707,6 +719,10 @@ LiveCapture_init(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
     self->index_cap = 64;
     self->index = malloc(self->index_cap * sizeof(*self->index));
     self->index_count = 0;
+
+    self->max_packets = max_packets;
+    self->truncated_packets = 0;
+    self->truncated_entries = 0;
 
     if (!self->buf || !self->index) {
         free(self->buf); self->buf = NULL;
@@ -773,6 +789,32 @@ LiveCapture_add_packet(LiveCaptureObject *self, PyObject *args)
     ie->ts_min      = ts_min;
     ie->ts_max      = ts_max;
     ie->entry_count = ph->entry_count;
+
+    /* Rolling window: compact when we exceed max_packets.
+     * Drop the oldest half to amortise the memmove cost. */
+    if (self->max_packets > 0 && self->index_count > self->max_packets) {
+        uint32_t drop = self->index_count / 2;
+        /* Count entries being dropped */
+        uint64_t dropped_entries = 0;
+        for (uint32_t i = 0; i < drop; i++)
+            dropped_entries += self->index[i].entry_count;
+        self->truncated_packets += drop;
+        self->truncated_entries += dropped_entries;
+
+        /* Compact the data buffer */
+        size_t drop_bytes = self->index[drop].offset;
+        memmove(self->buf, self->buf + drop_bytes,
+                self->buf_len - drop_bytes);
+        self->buf_len -= drop_bytes;
+
+        /* Compact the index and fix offsets */
+        uint32_t kept = self->index_count - drop;
+        for (uint32_t i = 0; i < kept; i++) {
+            self->index[i] = self->index[i + drop];
+            self->index[i].offset -= drop_bytes;
+        }
+        self->index_count = kept;
+    }
 
     Py_RETURN_NONE;
 }
@@ -927,6 +969,26 @@ LiveCapture_table(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
     return dict;
 }
 
+static PyObject *
+LiveCapture_get_truncated_packets(LiveCaptureObject *self, void *Py_UNUSED(closure))
+{
+    return PyLong_FromUnsignedLongLong(self->truncated_packets);
+}
+
+static PyObject *
+LiveCapture_get_truncated_entries(LiveCaptureObject *self, void *Py_UNUSED(closure))
+{
+    return PyLong_FromUnsignedLongLong(self->truncated_entries);
+}
+
+static PyGetSetDef LiveCapture_getset[] = {
+    {"truncated_packets", (getter)LiveCapture_get_truncated_packets, NULL,
+     "Total packets dropped due to rolling window.", NULL},
+    {"truncated_entries", (getter)LiveCapture_get_truncated_entries, NULL,
+     "Total entries dropped due to rolling window.", NULL},
+    {NULL}
+};
+
 static PyMethodDef LiveCapture_methods[] = {
     {"add_packet", (PyCFunction)LiveCapture_add_packet, METH_VARARGS,
      "add_packet(packet_bytes) — append a packet to the buffer."},
@@ -947,6 +1009,7 @@ static PyTypeObject LiveCaptureType = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_doc = "Transport-agnostic live telemetry accumulator with numpy extraction.",
     .tp_methods = LiveCapture_methods,
+    .tp_getset = LiveCapture_getset,
     .tp_init = (initproc)LiveCapture_init,
     .tp_new = PyType_GenericNew,
 };
