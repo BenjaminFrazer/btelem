@@ -120,8 +120,10 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
     };
     BTELEM_LOG(ctx, MOTOR, m);
 
-    /* system_status: cycle through states every 2 seconds */
-    int phase = (int)(t / 2.0) % 5;
+    /* system_status: cycle through states every 2 seconds.
+     * Values 0-4 map to named labels; 5-7 are intentionally unnamed
+     * to exercise unknown-enum-value display in the viewer. */
+    int phase = (int)(t / 2.0) % 8;
     struct system_status st = { .state = (uint8_t)phase };
     BTELEM_LOG(ctx, STATUS, st);
 }

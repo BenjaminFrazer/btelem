@@ -48,6 +48,7 @@ class _CachedSeries:
     values: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
     dirty: bool = True
     enum_labels: list[str] | None = None
+    _enum_tick_max: int = -1  # highest enum value reflected in axis ticks
     # DPG widget tags — recreated on subplot rebuild
     line_tag: int | str | None = None
     scatter_tag: int | str | None = None
@@ -146,9 +147,10 @@ class SubPlot:
                                                 parent=self.y_axis_tag)
             cs.scatter_tag = None
             # Set custom Y-axis ticks for enum labels
+            n = len(cs.enum_labels)
+            cs._enum_tick_max = n - 1
             ticks = tuple((lbl, float(i)) for i, lbl in enumerate(cs.enum_labels))
             dpg.set_axis_ticks(self.y_axis_tag, ticks)
-            n = len(cs.enum_labels)
             dpg.set_axis_limits(self.y_axis_tag, -0.5, n - 0.5)
 
             with dpg.theme() as lt:
@@ -216,6 +218,17 @@ class SubPlot:
                 dpg.configure_item(cs.line_tag, x=x, y=y)
                 if cs.scatter_tag is not None:
                     dpg.configure_item(cs.scatter_tag, x=x, y=y)
+                # Expand enum axis ticks/limits for unknown values
+                if cs.enum_labels and self.y_axis_tag is not None:
+                    data_max = int(np.nanmax(cs.values))
+                    if data_max > cs._enum_tick_max:
+                        n_labels = len(cs.enum_labels)
+                        ticks = [(lbl, float(i)) for i, lbl in enumerate(cs.enum_labels)]
+                        for v in range(n_labels, data_max + 1):
+                            ticks.append((str(v), float(v)))
+                        dpg.set_axis_ticks(self.y_axis_tag, tuple(ticks))
+                        dpg.set_axis_limits(self.y_axis_tag, -0.5, data_max + 0.5)
+                        cs._enum_tick_max = data_max
 
     def _has_enum_series(self) -> bool:
         return any(cs.enum_labels for cs in self._series.values())
@@ -226,8 +239,8 @@ class SubPlot:
         if self._has_enum_series():
             for cs in self._series.values():
                 if cs.enum_labels:
-                    n = len(cs.enum_labels)
-                    dpg.set_axis_limits(self.y_axis_tag, -0.5, n - 0.5)
+                    upper = max(len(cs.enum_labels) - 1, cs._enum_tick_max)
+                    dpg.set_axis_limits(self.y_axis_tag, -0.5, upper + 0.5)
                     break
         else:
             # Fit Y to samples visible in the current X viewport
