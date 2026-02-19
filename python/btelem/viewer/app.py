@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import zlib
 from pathlib import Path
 
@@ -34,11 +35,14 @@ def _imgui_hash(s: str, seed: int = 0) -> int:
 class ViewerApp:
     """Top-level viewer application."""
 
+    _UPDATE_INTERVAL: float = 1.0 / 15  # cap live updates at ~15 Hz
+
     def __init__(self) -> None:
         self._provider: Provider | None = None
         self._tree: TreeExplorer | None = None
         self._plot_panel: PlotPanel | None = None
         self._event_log_mgr: EventLogManager | None = None
+        self._last_update_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Setup
@@ -471,6 +475,7 @@ class ViewerApp:
 
     @staticmethod
     def _compute_stats(provider: Provider) -> dict[tuple[str, str], FieldStats]:
+        """Compute stats by querying the provider (used for initial load)."""
         stats: dict[tuple[str, str], FieldStats] = {}
         for ch in provider.channels():
             try:
@@ -484,6 +489,24 @@ class ViewerApp:
                     stats[(ch.entry_name, ch.field_name)] = FieldStats(0, None, None)
             except Exception:
                 stats[(ch.entry_name, ch.field_name)] = FieldStats(0, None, None)
+        return stats
+
+    @staticmethod
+    def _stats_from_cache(plot_panel: PlotPanel) -> dict[tuple[str, str], FieldStats]:
+        """Compute stats from already-cached series data (no provider queries)."""
+        stats: dict[tuple[str, str], FieldStats] = {}
+        for sp in plot_panel.subplots:
+            for cs in sp.get_all_series():
+                key = (cs.entry_name, cs.field_name)
+                if key in stats:
+                    continue
+                n = len(cs.values)
+                if n > 0:
+                    stats[key] = FieldStats(
+                        n, float(np.min(cs.values)),
+                        float(np.max(cs.values)))
+                else:
+                    stats[key] = FieldStats(0, None, None)
         return stats
 
     # ------------------------------------------------------------------
@@ -513,20 +536,27 @@ class ViewerApp:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        pending_data = False
         while dpg.is_dearpygui_running():
-            # 1. Poll provider for new data (live mode)
-            new_data = False
+            # 1. Poll provider every frame so no data is lost
             if self._provider is not None:
-                new_data = self._provider.poll()
+                if self._provider.poll():
+                    pending_data = True
 
-            # 2. If new data, re-query active series and push
-            if new_data and self._plot_panel is not None:
+            # 2. Throttle expensive updates to ~15 Hz
+            now = time.monotonic()
+            if pending_data and self._plot_panel is not None \
+                    and (now - self._last_update_time) >= self._UPDATE_INTERVAL:
+                self._last_update_time = now
+                pending_data = False
+
                 self._plot_panel.mark_dirty()
                 self._plot_panel.update_cache()
                 self._plot_panel.push_data()
-                # Update stats in tree
-                if self._tree is not None and self._provider is not None:
-                    self._tree.update_stats(self._compute_stats(self._provider))
+                # Update stats in tree (from cached series, no re-query)
+                if self._tree is not None:
+                    self._tree.update_stats(
+                        self._stats_from_cache(self._plot_panel))
                 # Append new events to event log
                 if self._event_log_mgr is not None and self._provider is not None:
                     events = self._provider.recent_events()

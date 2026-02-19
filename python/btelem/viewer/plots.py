@@ -237,11 +237,9 @@ class SubPlot:
             if cs.line_tag is None:
                 continue
             if len(cs.timestamps) > 0 and len(cs.values) > 0:
-                x = cs.timestamps.tolist()
-                y = cs.values.tolist()
-                dpg.configure_item(cs.line_tag, x=x, y=y)
+                dpg.configure_item(cs.line_tag, x=cs.timestamps, y=cs.values)
                 if cs.scatter_tag is not None:
-                    dpg.configure_item(cs.scatter_tag, x=x, y=y)
+                    dpg.configure_item(cs.scatter_tag, x=cs.timestamps, y=cs.values)
                 # Expand enum axis ticks/limits for unknown values
                 if cs.enum_labels and self.y_axis_tag is not None:
                     data_max = int(np.nanmax(cs.values))
@@ -550,17 +548,18 @@ class TimingSubPlot:
             if row.line_tag is None or len(row.timestamps) == 0:
                 continue
             # NaN-separated vertical segments: (t, r-0.4) → (t, r+0.4) → NaN
-            n = len(row.timestamps)
+            ts = row.timestamps
+            n = len(ts)
             x = np.empty(n * 3, dtype=np.float64)
             y = np.empty(n * 3, dtype=np.float64)
             r = float(row.row_index)
-            x[0::3] = row.timestamps
-            x[1::3] = row.timestamps
+            x[0::3] = ts
+            x[1::3] = ts
             x[2::3] = np.nan
             y[0::3] = r - 0.4
             y[1::3] = r + 0.4
             y[2::3] = np.nan
-            dpg.configure_item(row.line_tag, x=x.tolist(), y=y.tolist())
+            dpg.configure_item(row.line_tag, x=x, y=y)
 
     def fit_y(self) -> None:
         if self.y_axis_tag is None:
@@ -625,6 +624,8 @@ class TimingSubPlot:
 class PlotPanel:
     """Manages N subplots in a vertical stack with linked X-axes."""
 
+    _TICK_INTERVAL: float = 1.0 / 15  # throttle expensive per-frame work
+
     def __init__(self, parent: int | str, on_drop: callable | None = None) -> None:
         self._parent = parent
         self._on_drop = on_drop
@@ -634,6 +635,7 @@ class PlotPanel:
         self._auto_y = True
         self._live_window_sec: float = 10.0
         self._fit_frames: int = 0
+        self._last_tick_time: float = 0.0
         self._unlock_x_frames: int = 0
 
         self.subplots: list[SubPlot | TimingSubPlot] = []
@@ -959,7 +961,7 @@ class PlotPanel:
                     cs.timestamps = (data.timestamps.astype(np.float64) - self._t0_ns) / 1e9
                     vals = data.values.astype(np.float64)
                     if cs.element_index is not None and vals.ndim == 2:
-                        vals = vals[:, cs.element_index]
+                        vals = np.ascontiguousarray(vals[:, cs.element_index])
                     if cs.bit_def is not None:
                         mask = (1 << cs.bit_def.width) - 1
                         vals = np.floor(vals / (1 << cs.bit_def.start)).astype(np.uint64) & mask
@@ -1028,12 +1030,10 @@ class PlotPanel:
                             dpg.set_axis_limits_auto(sp.x_axis_tag)
             for sp in self.subplots:
                 sp.fit_y()
+            self._cursor_mgr.tick()
             return
 
-        if self._auto_y:
-            for sp in self.subplots:
-                sp.fit_y()
-
+        # Follow mode: update X viewport every frame (cheap — reads first/last ts)
         if self._mode == XAxisMode.FOLLOW and self._provider is not None and self._provider.is_live:
             xr = self._get_x_range()
             if xr is not None:
@@ -1046,14 +1046,22 @@ class PlotPanel:
                             t_max + self._live_window_sec * 0.05,
                         )
 
-        # Update scatter visibility based on visible sample count
-        for sp in self.subplots:
-            if sp.x_axis_tag is not None:
-                try:
-                    x_min, x_max = dpg.get_axis_limits(sp.x_axis_tag)
-                    sp.update_scatter_visibility(x_min, x_max)
-                except Exception:
-                    pass
+        # Throttle expensive per-frame work (fit_y, scatter visibility)
+        now = time.monotonic()
+        if (now - self._last_tick_time) >= self._TICK_INTERVAL:
+            self._last_tick_time = now
+
+            if self._auto_y:
+                for sp in self.subplots:
+                    sp.fit_y()
+
+            for sp in self.subplots:
+                if sp.x_axis_tag is not None:
+                    try:
+                        x_min, x_max = dpg.get_axis_limits(sp.x_axis_tag)
+                        sp.update_scatter_visibility(x_min, x_max)
+                    except Exception:
+                        pass
 
         self._cursor_mgr.tick()
 

@@ -186,7 +186,7 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
  * 5. Main
  * ---------------------------------------------------------------------- */
 
-#define RATE_HZ 50
+#define RATE_HZ 1000
 #define PORT    4040
 
 int main(void)
@@ -196,7 +196,7 @@ int main(void)
     srand((unsigned)time(NULL));
 
     /* Allocate ring buffer */
-    uint32_t ring_entries = 1024;
+    uint32_t ring_entries = 16384;
     size_t ring_sz = btelem_ring_size(ring_entries);
     void *ring_mem = malloc(ring_sz);
     if (!ring_mem) {
