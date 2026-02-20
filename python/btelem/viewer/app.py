@@ -18,6 +18,66 @@ from .event_log import EventLogManager
 
 logger = logging.getLogger(__name__)
 
+perf_logger = logging.getLogger(__name__ + ".perf")
+
+
+class _PerfStats:
+    """Accumulates per-phase main-loop timing and reports periodically."""
+
+    _REPORT_INTERVAL = 5.0  # seconds between log lines
+
+    def __init__(self) -> None:
+        self._accum: dict[str, list[float]] = {}
+        self._last_report = time.monotonic()
+        self._frame_count = 0
+        self._extra: dict[str, int | float] = {}
+
+    def record(self, phase: str, dt: float) -> None:
+        self._accum.setdefault(phase, []).append(dt)
+
+    def set_metric(self, key: str, value: int | float) -> None:
+        """Snapshot a growth metric (total samples, buffer bytes, etc.)."""
+        self._extra[key] = value
+
+    def report_if_due(self) -> None:
+        self._frame_count += 1
+        now = time.monotonic()
+        elapsed = now - self._last_report
+        if elapsed < self._REPORT_INTERVAL:
+            return
+
+        fps = self._frame_count / elapsed
+        parts = [f"fps={fps:.0f}"]
+
+        # Report phases in execution order
+        for phase in ("poll", "cache", "push", "events",
+                       "stats", "tick", "render"):
+            times = self._accum.get(phase)
+            if not times:
+                continue
+            avg_us = sum(times) / len(times) * 1e6
+            peak_us = max(times) * 1e6
+            count = len(times)
+            if avg_us >= 1000:
+                parts.append(
+                    f"{phase}: {avg_us / 1000:.1f}/{peak_us / 1000:.1f}ms"
+                    f" (x{count})")
+            else:
+                parts.append(
+                    f"{phase}: {avg_us:.0f}/{peak_us:.0f}us (x{count})")
+
+        for key, val in sorted(self._extra.items()):
+            if isinstance(val, float):
+                parts.append(f"{key}={val:.0f}")
+            else:
+                parts.append(f"{key}={val}")
+
+        perf_logger.info("  |  ".join(parts))
+
+        self._accum.clear()
+        self._frame_count = 0
+        self._last_report = now
+
 
 def _imgui_hash(s: str, seed: int = 0) -> int:
     """Replicate ImGui's ImHashStr for null-terminated strings.
@@ -520,44 +580,78 @@ class ViewerApp:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        perf = _PerfStats()
         pending_data = False
         while dpg.is_dearpygui_running():
-            # 1. Poll provider every frame so no data is lost
-            if self._provider is not None:
-                if self._provider.poll():
-                    pending_data = True
-
-            # 2. Throttle plot updates to ~30 Hz
-            now = time.monotonic()
-            if pending_data and self._plot_panel is not None \
-                    and (now - self._last_update_time) >= self._UPDATE_INTERVAL:
-                self._last_update_time = now
-                pending_data = False
-
-                self._plot_panel.mark_dirty()
-                self._plot_panel.update_cache()
-                self._plot_panel.push_data()
-                # Append new events to event log
-                if self._event_log_mgr is not None and self._provider is not None:
-                    events = self._provider.recent_events()
-                    self._event_log_mgr.append_events(events)
-                # Update live status bar
+            try:
+                # 1. Poll provider every frame so no data is lost
+                t0 = time.perf_counter()
                 if self._provider is not None:
-                    self._update_live_status()
+                    if self._provider.poll():
+                        pending_data = True
+                perf.record("poll", time.perf_counter() - t0)
 
-            # 3. Slow-cadence full stats refresh (all channels, every 2 s)
-            if self._provider is not None and self._tree is not None \
-                    and (now - self._last_stats_time) >= self._STATS_INTERVAL:
-                self._last_stats_time = now
-                self._tree.update_stats(self._compute_stats(self._provider))
+                # 2. Throttle plot updates to ~30 Hz
+                now = time.monotonic()
+                if pending_data and self._plot_panel is not None \
+                        and (now - self._last_update_time) >= self._UPDATE_INTERVAL:
+                    self._last_update_time = now
+                    pending_data = False
 
-            # 4. Per-frame tick (deferred fit, live scrolling)
-            if self._plot_panel is not None:
-                self._plot_panel.tick()
-            if self._event_log_mgr is not None:
-                self._event_log_mgr.tick()
+                    self._plot_panel.mark_dirty()
 
+                    t0 = time.perf_counter()
+                    self._plot_panel.update_cache()
+                    perf.record("cache", time.perf_counter() - t0)
+
+                    t0 = time.perf_counter()
+                    self._plot_panel.push_data()
+                    perf.record("push", time.perf_counter() - t0)
+
+                    # Append new events to event log
+                    t0 = time.perf_counter()
+                    if self._event_log_mgr is not None and self._provider is not None:
+                        events = self._provider.recent_events()
+                        self._event_log_mgr.append_events(events)
+                    perf.record("events", time.perf_counter() - t0)
+
+                    # Update live status bar
+                    if self._provider is not None:
+                        self._update_live_status()
+
+                    # Snapshot growth metrics on each cache update
+                    total_samples = 0
+                    for sp in self._plot_panel.subplots:
+                        for cs in sp.get_all_series():
+                            total_samples += len(cs.timestamps)
+                    perf.set_metric("samples", total_samples)
+                    perf.set_metric("series", sum(
+                        len(sp.get_all_series())
+                        for sp in self._plot_panel.subplots))
+
+                # 3. Slow-cadence full stats refresh (all channels, every 2 s)
+                t0 = time.perf_counter()
+                if self._provider is not None and self._tree is not None \
+                        and (now - self._last_stats_time) >= self._STATS_INTERVAL:
+                    self._last_stats_time = now
+                    self._tree.update_stats(self._compute_stats(self._provider))
+                perf.record("stats", time.perf_counter() - t0)
+
+                # 4. Per-frame tick (deferred fit, live scrolling)
+                t0 = time.perf_counter()
+                if self._plot_panel is not None:
+                    self._plot_panel.tick()
+                if self._event_log_mgr is not None:
+                    self._event_log_mgr.tick()
+                perf.record("tick", time.perf_counter() - t0)
+            except Exception:
+                logger.exception("error in main loop")
+
+            t0 = time.perf_counter()
             dpg.render_dearpygui_frame()
+            perf.record("render", time.perf_counter() - t0)
+
+            perf.report_if_due()
 
         self._cleanup()
 

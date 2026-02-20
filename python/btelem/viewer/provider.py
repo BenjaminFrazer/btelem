@@ -172,7 +172,7 @@ class BtelemLiveProvider(Provider):
     and feeds them to LiveCapture for accumulation and numpy extraction.
     """
 
-    DEFAULT_MAX_PACKETS = 100_000
+    DEFAULT_MAX_PACKETS = 10_000
 
     def __init__(self, transport: Any, schema_bytes: bytes,
                  schema: Any, *,
@@ -235,6 +235,7 @@ class BtelemLiveProvider(Provider):
         try:
             data = self._transport.read(65536)
         except Exception:
+            logger.exception("transport read failed")
             return False
 
         if not data:
@@ -251,10 +252,10 @@ class BtelemLiveProvider(Provider):
             pkt_bytes = bytes(self._buf[4:total])
             del self._buf[:total]
             self._live.add_packet(pkt_bytes)
-            result = decode_packet(self._schema, pkt_bytes)
-            self._dropped += result.dropped
-            self._event_buf.extend(result.entries)
-            self._pending_events.extend(result.entries)
+            # result = decode_packet(self._schema, pkt_bytes)
+            # self._dropped += result.dropped
+            # self._event_buf.extend(result.entries)
+            # self._pending_events.extend(result.entries)
             got_packet = True
 
         if got_packet:
