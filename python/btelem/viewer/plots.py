@@ -127,7 +127,7 @@ class SubPlot:
             self._rebuild_popup()
 
     def clear_series(self) -> None:
-        for cs in self._series.values():
+        for cs in list(self._series.values()):
             self._delete_dpg_series(cs)
         self._series.clear()
         self._color_index = 0
@@ -150,7 +150,7 @@ class SubPlot:
         self.y_axis_tag = dpg.add_plot_axis(dpg.mvYAxis, label="Value",
                                              parent=self.plot_tag)
 
-        for cs in self._series.values():
+        for cs in list(self._series.values()):
             self._create_dpg_series(cs)
 
         self._rebuild_popup()
@@ -220,7 +220,7 @@ class SubPlot:
 
     def destroy_widgets(self) -> None:
         """Clear DPG tags (widgets owned by the subplots container, deleted by parent)."""
-        for cs in self._series.values():
+        for cs in list(self._series.values()):
             for tag in (cs.line_theme_tag, cs.scatter_theme_tag):
                 if tag is not None and dpg.does_item_exist(tag):
                     dpg.delete_item(tag)
@@ -233,7 +233,7 @@ class SubPlot:
         self._popup_tag = None
 
     def push_data(self) -> None:
-        for cs in self._series.values():
+        for cs in list(self._series.values()):
             if cs.line_tag is None:
                 continue
             if len(cs.timestamps) > 0 and len(cs.values) > 0:
@@ -253,13 +253,13 @@ class SubPlot:
                         cs._enum_tick_max = data_max
 
     def _has_enum_series(self) -> bool:
-        return any(cs.enum_labels for cs in self._series.values())
+        return any(cs.enum_labels for cs in list(self._series.values()))
 
     def fit_y(self) -> None:
         if self.y_axis_tag is None:
             return
         if self._has_enum_series():
-            for cs in self._series.values():
+            for cs in list(self._series.values()):
                 if cs.enum_labels:
                     upper = max(len(cs.enum_labels) - 1, cs._enum_tick_max)
                     dpg.set_axis_limits(self.y_axis_tag, -0.5, upper + 0.5)
@@ -273,7 +273,7 @@ class SubPlot:
             except Exception:
                 return
             y_min = y_max = None
-            for cs in self._series.values():
+            for cs in list(self._series.values()):
                 if len(cs.timestamps) == 0:
                     continue
                 lo = int(np.searchsorted(cs.timestamps, x_min))
@@ -306,7 +306,7 @@ class SubPlot:
 
     def update_scatter_visibility(self, x_min: float, x_max: float) -> None:
         """Show scatter markers only when fewer than threshold samples are visible."""
-        for cs in self._series.values():
+        for cs in list(self._series.values()):
             if cs.scatter_tag is None:
                 continue
             if len(cs.timestamps) == 0:
@@ -330,7 +330,7 @@ class SubPlot:
 
         with dpg.window(popup=True, show=False, no_title_bar=True) as popup:
             self._popup_tag = popup
-            for cs in self._series.values():
+            for cs in list(self._series.values()):
                 if cs.bit_def is not None:
                     label = f"{cs.entry_name}.{cs.field_name}.{cs.bit_def.name}"
                 elif cs.element_index is not None:
