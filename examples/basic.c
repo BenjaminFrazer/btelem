@@ -46,7 +46,7 @@ struct system_status {
 };
 
 struct gpio_state {
-    uint16_t flags;  /* bitfield: enabled(1), error(1), mode(2), channel(4) */
+    uint32_t flags;  /* bitfield: enabled(1), error(1), mode(2), channel(4), priority(3), seq(8), active(1) */
 };
 
 /* -------------------------------------------------------------------------
@@ -87,10 +87,13 @@ BTELEM_SCHEMA_ENTRY(STATUS, 2, "system_status", "System state machine",
                     struct system_status, status_fields);
 
 static const struct btelem_bit_def gpio_bits[] = {
-    BTELEM_BIT("enabled", 0, 1),
-    BTELEM_BIT("error",   1, 1),
-    BTELEM_BIT("mode",    2, 2),
-    BTELEM_BIT("channel", 4, 4),
+    BTELEM_BIT("enabled",  0, 1),
+    BTELEM_BIT("error",    1, 1),
+    BTELEM_BIT("mode",     2, 2),
+    BTELEM_BIT("channel",  4, 4),
+    BTELEM_BIT("priority", 16, 3),
+    BTELEM_BIT("seq",      19, 8),
+    BTELEM_BIT("active",   27, 1),
 };
 BTELEM_BITFIELD_DEF(gpio_flags, gpio_bits);
 
@@ -173,11 +176,14 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
     BTELEM_LOG(ctx, STATUS, st);
 
     /* gpio_state: bitfield with rotating flags */
-    uint16_t gf = 0;
+    uint32_t gf = 0;
     gf |= ((int)(t * 2.0) & 1);              /* enabled: toggles at 2 Hz */
     gf |= (((int)(t / 5.0) & 1) << 1);       /* error: toggles every 5s */
     gf |= (((int)(t / 3.0) % 4) << 2);       /* mode: cycles 0-3 */
     gf |= (((int)(t) % 16) << 4);             /* channel: cycles 0-15 */
+    gf |= (((uint32_t)((int)(t) % 8)) << 16);       /* priority: cycles 0-7 */
+    gf |= (((uint32_t)((int)(t * 10.0) % 256)) << 19); /* seq: cycles 0-255 */
+    gf |= (((uint32_t)((int)(t / 4.0) & 1)) << 27);    /* active: toggles every 4s */
     struct gpio_state gs = { .flags = gf };
     BTELEM_LOG(ctx, GPIO, gs);
 }
