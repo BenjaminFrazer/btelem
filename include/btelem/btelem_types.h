@@ -84,7 +84,7 @@ struct btelem_enum_def {
  * Bitfield definitions (for BTELEM_BITFIELD fields)
  * ----------------------------------------------------------------------- */
 
-#define BTELEM_BITFIELD_MAX_BITS 16
+#define BTELEM_BITFIELD_MAX_BITS 32
 
 struct btelem_bit_def {
     const char *name;
@@ -247,12 +247,12 @@ struct __attribute__((packed)) btelem_bitfield_wire {
     uint16_t schema_id;                                              /*   2 */
     uint16_t field_index;                                            /*   2 */
     uint8_t  bit_count;                                              /*   1 */
-    char     names[BTELEM_BITFIELD_MAX_BITS][BTELEM_BIT_NAME_MAX];   /* 512 */
-    uint8_t  starts[BTELEM_BITFIELD_MAX_BITS];                       /*  16 */
-    uint8_t  widths[BTELEM_BITFIELD_MAX_BITS];                       /*  16 */
+    char     names[BTELEM_BITFIELD_MAX_BITS][BTELEM_BIT_NAME_MAX];   /* 1024 */
+    uint8_t  starts[BTELEM_BITFIELD_MAX_BITS];                       /*   32 */
+    uint8_t  widths[BTELEM_BITFIELD_MAX_BITS];                       /*   32 */
 };
 
-_Static_assert(sizeof(struct btelem_bitfield_wire) == 549, "btelem_bitfield_wire packing");
+_Static_assert(sizeof(struct btelem_bitfield_wire) == 1093, "btelem_bitfield_wire packing");
 
 /** Worst-case serialized schema size (suitable for static allocation). */
 #define BTELEM_SCHEMA_BUF_SIZE \
