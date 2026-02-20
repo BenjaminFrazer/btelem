@@ -182,7 +182,7 @@ class EventLogTable:
     def _on_drop(self, sender: int, app_data: object) -> None:
         if app_data is None:
             return
-        entry_name, _field_name = app_data
+        entry_name, _field_name, *_ = app_data
         if entry_name in self._accepted_entries:
             return
         self._accepted_entries.add(entry_name)
