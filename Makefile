@@ -3,7 +3,7 @@ CMAKE_FLAGS ?=
 
 BENCH_DIR := build-bench
 
-.PHONY: all configure build examples tests stress-test e2e-test tests-all bench compile-commands clean
+.PHONY: all configure build examples viewer tests stress-test e2e-test tests-all bench compile-commands clean
 
 all: build
 
@@ -15,6 +15,9 @@ build: configure
 
 examples: build
 	./$(BUILD_DIR)/btelem_basic
+
+viewer:
+	btelem-viewer --live tcp:localhost:4040
 
 tests: build
 	./$(BUILD_DIR)/btelem_test_ring
