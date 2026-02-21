@@ -33,6 +33,55 @@ _PALETTE = [
 ]
 
 _SCATTER_THRESHOLD = 40
+_DECIMATE_MAX_POINTS = 4000  # max points per series sent to DPG
+
+
+def _decimate_minmax(timestamps: np.ndarray, values: np.ndarray,
+                     max_points: int = _DECIMATE_MAX_POINTS,
+                     ) -> tuple[np.ndarray, np.ndarray]:
+    """Downsample to at most *max_points* using min/max bucketing.
+
+    For each bucket, emits the min and max values ordered by time,
+    preserving the visual envelope (spikes and troughs are never hidden).
+    """
+    n = len(timestamps)
+    if n <= max_points:
+        return timestamps, values
+
+    n_buckets = max_points // 2
+    bucket_size = n // n_buckets
+    usable = n_buckets * bucket_size
+
+    v_2d = values[:usable].reshape(n_buckets, bucket_size)
+    t_2d = timestamps[:usable].reshape(n_buckets, bucket_size)
+
+    imin = np.argmin(v_2d, axis=1)
+    imax = np.argmax(v_2d, axis=1)
+
+    rows = np.arange(n_buckets)
+    t_lo, v_lo = t_2d[rows, imin], v_2d[rows, imin]
+    t_hi, v_hi = t_2d[rows, imax], v_2d[rows, imax]
+
+    # Within each bucket, emit the earlier index first.
+    swap = imin > imax
+    t_first = np.where(swap, t_hi, t_lo)
+    v_first = np.where(swap, v_hi, v_lo)
+    t_second = np.where(swap, t_lo, t_hi)
+    v_second = np.where(swap, v_lo, v_hi)
+
+    out_t = np.empty(n_buckets * 2, dtype=timestamps.dtype)
+    out_v = np.empty(n_buckets * 2, dtype=values.dtype)
+    out_t[0::2] = t_first
+    out_t[1::2] = t_second
+    out_v[0::2] = v_first
+    out_v[1::2] = v_second
+
+    # Append the very last sample if truncated.
+    if usable < n:
+        out_t = np.append(out_t, timestamps[-1])
+        out_v = np.append(out_v, values[-1])
+
+    return out_t, out_v
 
 
 def _next_id() -> int:
@@ -637,6 +686,7 @@ class PlotPanel:
         self._fit_frames: int = 0
         self._last_tick_time: float = 0.0
         self._unlock_x_frames: int = 0
+        self._last_query_range: tuple[int, int] | None = None
 
         self.subplots: list[SubPlot | TimingSubPlot] = []
         self._subplots_container: int | str | None = None
@@ -939,34 +989,113 @@ class PlotPanel:
             for cs in sp.get_all_series():
                 cs.dirty = True
 
+    def _viewport_query_range(self) -> tuple[int, int] | None:
+        """Return (t0_ns, t1_ns) for the visible viewport with margin.
+
+        Returns None when t0_ns hasn't been established yet (first data),
+        which causes update_cache to fall back to a full query.
+        """
+        if self._t0_ns is None:
+            return None
+        for sp in self.subplots:
+            if sp.x_axis_tag is not None:
+                try:
+                    x_min, x_max = dpg.get_axis_limits(sp.x_axis_tag)
+                except Exception:
+                    continue
+                span = x_max - x_min
+                margin = span * 0.5
+                t0_ns = int((x_min - margin) * 1e9) + self._t0_ns
+                t1_ns = int((x_max + margin) * 1e9) + self._t0_ns
+                return (max(t0_ns, 0), t1_ns)
+        return None
+
+    def viewport_changed(self) -> bool:
+        """Return True (and mark dirty) if the viewport moved since last cache update."""
+        qr = self._viewport_query_range()
+        if qr is None or qr == self._last_query_range:
+            return False
+        # Check if the new viewport extends past the cached margin.
+        if self._last_query_range is not None:
+            old_t0, old_t1 = self._last_query_range
+            if qr[0] >= old_t0 and qr[1] <= old_t1:
+                return False
+            # Log why we're triggering a re-scan
+            delta_t0 = (old_t0 - qr[0]) / 1e9 if qr[0] < old_t0 else 0
+            delta_t1 = (qr[1] - old_t1) / 1e9 if qr[1] > old_t1 else 0
+            logger.info("viewport_changed: extended by t0-%.3fs t1+%.3fs "
+                        "(range %.1fs → %.1fs)",
+                        delta_t0, delta_t1,
+                        (old_t1 - old_t0) / 1e9, (qr[1] - qr[0]) / 1e9)
+        self.mark_dirty()
+        return True
+
     def update_cache(self) -> None:
         if self._provider is None:
             return
+
+        qr = self._viewport_query_range()
+        self._last_query_range = qr
+        q_t0 = qr[0] if qr else None
+        q_t1 = qr[1] if qr else None
+
+        # Collect dirty series grouped by entry_name for batch table queries
+        dirty_by_entry: dict[str, list] = {}
         for sp in self.subplots:
             for cs in sp.get_all_series():
-                if not cs.dirty:
-                    continue
+                if cs.dirty:
+                    dirty_by_entry.setdefault(cs.entry_name, []).append(cs)
+
+        if not dirty_by_entry:
+            return
+
+        qr_sec = ((q_t0 / 1e9) if q_t0 else None, (q_t1 / 1e9) if q_t1 else None)
+
+        # One query_table() call per entry type (instead of per-field series())
+        table_cache: dict[str, dict[str, np.ndarray]] = {}
+        for entry_name, series_list in dirty_by_entry.items():
+            if entry_name not in table_cache:
+                t_q0 = time.monotonic()
                 try:
-                    data = self._provider.query(cs.entry_name, cs.field_name)
+                    table_cache[entry_name] = self._provider.query_table(
+                        entry_name, t0=q_t0, t1=q_t1)
                 except Exception as e:
-                    logger.warning("query failed for %s.%s: %s",
-                                   cs.entry_name, cs.field_name, e)
-                    continue
-                if len(data.timestamps) == 0:
+                    logger.warning("query_table failed for %s: %s", entry_name, e)
+                    table_cache[entry_name] = {}
+                dt_ms = (time.monotonic() - t_q0) * 1000
+                tbl = table_cache[entry_name]
+                n_rows = len(tbl.get("_timestamp", []))
+                if dt_ms > 5:
+                    logger.info("query_table(%s, t0=%s, t1=%s) → %d rows in %.1fms",
+                                entry_name, qr_sec[0], qr_sec[1], n_rows, dt_ms)
+
+            tbl = table_cache[entry_name]
+            ts_raw = tbl.get("_timestamp")
+
+            for cs in series_list:
+                if ts_raw is None or len(ts_raw) == 0:
                     cs.timestamps = np.array([], dtype=np.float64)
                     cs.values = np.array([], dtype=np.float64)
                 else:
                     if self._t0_ns is None:
-                        self._t0_ns = int(data.timestamps[0])
-                    cs.timestamps = (data.timestamps.astype(np.float64) - self._t0_ns) / 1e9
-                    vals = data.values.astype(np.float64)
+                        self._t0_ns = int(ts_raw[0])
+                    ts = (ts_raw.astype(np.float64) - self._t0_ns) / 1e9
+
+                    vals_raw = tbl.get(cs.field_name)
+                    if vals_raw is None:
+                        cs.timestamps = np.array([], dtype=np.float64)
+                        cs.values = np.array([], dtype=np.float64)
+                        cs.dirty = False
+                        continue
+
+                    vals = vals_raw.astype(np.float64)
                     if cs.element_index is not None and vals.ndim == 2:
                         vals = np.ascontiguousarray(vals[:, cs.element_index])
                     if cs.bit_def is not None:
                         mask = (1 << cs.bit_def.width) - 1
                         vals = np.floor(vals / (1 << cs.bit_def.start)).astype(np.uint64) & mask
                         vals = vals.astype(np.float64)
-                    cs.values = vals
+                    cs.timestamps, cs.values = _decimate_minmax(ts, vals)
                 cs.dirty = False
 
     def push_data(self) -> None:
@@ -1066,19 +1195,15 @@ class PlotPanel:
         self._cursor_mgr.tick()
 
     def _get_x_range(self) -> tuple[float, float] | None:
-        """Return (t_min, t_max) across all series in all subplots."""
-        t_min = t_max = None
-        for sp in self.subplots:
-            for cs in sp.get_all_series():
-                if len(cs.timestamps) > 0:
-                    lo, hi = cs.timestamps[0], cs.timestamps[-1]
-                    if t_min is None or lo < t_min:
-                        t_min = lo
-                    if t_max is None or hi > t_max:
-                        t_max = hi
-        if t_min is not None:
-            return (t_min, t_max)
-        return None
+        """Return (t_min, t_max) in seconds-since-t0 from the provider index."""
+        if self._provider is None or self._t0_ns is None:
+            return None
+        tr = self._provider.time_range()
+        if tr is None:
+            return None
+        t_min = (tr[0] - self._t0_ns) / 1e9
+        t_max = (tr[1] - self._t0_ns) / 1e9
+        return (t_min, t_max)
 
     def clear(self) -> None:
         self._cursor_mgr.clear()

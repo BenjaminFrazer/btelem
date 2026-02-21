@@ -176,19 +176,39 @@ find_field_by_name(const bt_entry_info *entry, const char *name)
 }
 
 /*
- * Count matching entries in a data region, filtered by schema id and [t0, t1].
+ * Binary-search the time-sorted index for the first packet whose ts_max >= t0.
+ * Returns idx_count if no packet qualifies.
+ */
+static uint32_t
+index_lower_bound(const struct btelem_index_entry *index, uint32_t idx_count,
+                  uint64_t t0)
+{
+    uint32_t lo = 0, hi = idx_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (index[mid].ts_max < t0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/*
+ * Exact entry count: scans entry headers matching target_id and t0/t1.
+ * Only reads the 16-byte entry header table per packet (no payload access).
  */
 static npy_intp
-count_entries(const uint8_t *data,
-              const struct btelem_index_entry *index, uint32_t idx_count,
-              uint16_t target_id,
-              uint64_t t0, int use_t0, uint64_t t1, int use_t1)
+count_entries_exact(const uint8_t *data,
+                    const struct btelem_index_entry *index, uint32_t idx_count,
+                    uint16_t target_id,
+                    uint64_t t0, int use_t0, uint64_t t1, int use_t1)
 {
+    uint32_t start = use_t0 ? index_lower_bound(index, idx_count, t0) : 0;
     npy_intp count = 0;
-    for (uint32_t pi = 0; pi < idx_count; pi++) {
+    for (uint32_t pi = start; pi < idx_count; pi++) {
         const struct btelem_index_entry *ie = &index[pi];
-        if (use_t1 && ie->ts_min > t1) continue;
-        if (use_t0 && ie->ts_max < t0) continue;
+        if (use_t1 && ie->ts_min > t1) break;
 
         const struct btelem_packet_header *ph =
             (const struct btelem_packet_header *)(data + ie->offset);
@@ -196,10 +216,9 @@ count_entries(const uint8_t *data,
             (const struct btelem_entry_header *)((const uint8_t *)ph + sizeof(*ph));
 
         for (uint16_t ei = 0; ei < ph->entry_count; ei++) {
-            const struct btelem_entry_header *eh = &table[ei];
-            if (eh->id != target_id) continue;
-            if (use_t0 && eh->timestamp < t0) continue;
-            if (use_t1 && eh->timestamp > t1) continue;
+            if (table[ei].id != target_id) continue;
+            if (use_t0 && table[ei].timestamp < t0) continue;
+            if (use_t1 && table[ei].timestamp > t1) continue;
             count++;
         }
     }
@@ -207,9 +226,49 @@ count_entries(const uint8_t *data,
 }
 
 /*
+ * Count entries per schema ID in a single pass over the index.
+ * Returns a Python dict {entry_name: count}.
+ */
+static PyObject *
+entry_counts_from_index(const uint8_t *data,
+                        const struct btelem_index_entry *index,
+                        uint32_t idx_count,
+                        const bt_schema *schema)
+{
+    /* Use a flat array indexed by entry ID (max 64 entries). */
+    uint64_t counts[BTELEM_MAX_SCHEMA_ENTRIES] = {0};
+
+    for (uint32_t pi = 0; pi < idx_count; pi++) {
+        const struct btelem_index_entry *ie = &index[pi];
+        const struct btelem_packet_header *ph =
+            (const struct btelem_packet_header *)(data + ie->offset);
+        const struct btelem_entry_header *table =
+            (const struct btelem_entry_header *)((const uint8_t *)ph + sizeof(*ph));
+
+        for (uint16_t ei = 0; ei < ph->entry_count; ei++) {
+            uint16_t id = table[ei].id;
+            if (id < BTELEM_MAX_SCHEMA_ENTRIES)
+                counts[id]++;
+        }
+    }
+
+    PyObject *dict = PyDict_New();
+    if (!dict) return NULL;
+    for (uint16_t i = 0; i < schema->entry_count; i++) {
+        uint16_t id = schema->entries[i].id;
+        PyObject *val = PyLong_FromUnsignedLongLong(
+            id < BTELEM_MAX_SCHEMA_ENTRIES ? counts[id] : 0);
+        if (!val) { Py_DECREF(dict); return NULL; }
+        PyDict_SetItemString(dict, schema->entries[i].name, val);
+        Py_DECREF(val);
+    }
+    return dict;
+}
+
+/*
  * Extract series: fill timestamp and value arrays.
  */
-static void
+static npy_intp
 fill_series(const uint8_t *data,
             const struct btelem_index_entry *index, uint32_t idx_count,
             uint16_t target_id, const struct btelem_field_wire *field,
@@ -217,11 +276,12 @@ fill_series(const uint8_t *data,
             uint8_t *ts_out, uint8_t *val_out, npy_intp max_count,
             int field_bytes)
 {
+    uint32_t start = use_t0 ? index_lower_bound(index, idx_count, t0) : 0;
+
     npy_intp pos = 0;
-    for (uint32_t pi = 0; pi < idx_count && pos < max_count; pi++) {
+    for (uint32_t pi = start; pi < idx_count && pos < max_count; pi++) {
         const struct btelem_index_entry *ie = &index[pi];
-        if (use_t1 && ie->ts_min > t1) continue;
-        if (use_t0 && ie->ts_max < t0) continue;
+        if (use_t1 && ie->ts_min > t1) break;
 
         const struct btelem_packet_header *ph =
             (const struct btelem_packet_header *)(data + ie->offset);
@@ -247,12 +307,13 @@ fill_series(const uint8_t *data,
             pos++;
         }
     }
+    return pos;
 }
 
 /*
  * Extract table: fill timestamp array + one array per field in a single scan.
  */
-static void
+static npy_intp
 fill_table(const uint8_t *data,
            const struct btelem_index_entry *index, uint32_t idx_count,
            uint16_t target_id, const bt_entry_info *entry,
@@ -260,11 +321,12 @@ fill_table(const uint8_t *data,
            uint8_t *ts_out, uint8_t **field_arrays, int *field_sizes,
            npy_intp max_count)
 {
+    uint32_t start = use_t0 ? index_lower_bound(index, idx_count, t0) : 0;
+
     npy_intp pos = 0;
-    for (uint32_t pi = 0; pi < idx_count && pos < max_count; pi++) {
+    for (uint32_t pi = start; pi < idx_count && pos < max_count; pi++) {
         const struct btelem_index_entry *ie = &index[pi];
-        if (use_t1 && ie->ts_min > t1) continue;
-        if (use_t0 && ie->ts_max < t0) continue;
+        if (use_t1 && ie->ts_min > t1) break;
 
         const struct btelem_packet_header *ph =
             (const struct btelem_packet_header *)(data + ie->offset);
@@ -294,6 +356,7 @@ fill_table(const uint8_t *data,
             pos++;
         }
     }
+    return pos;
 }
 
 /* =========================================================================
@@ -512,30 +575,30 @@ Capture_series(CaptureObject *self, PyObject *args, PyObject *kwds)
     int elem_sz = type_element_size(field->type);
     int field_bytes = (elem_sz > 0) ? elem_sz * field->count : field->size;
 
-    npy_intp N = count_entries(self->map, self->index, self->index_count,
-                               entry->id, t0, use_t0, t1, use_t1);
+    /* Exact count pass (reads entry headers only), then allocate + fill. */
+    npy_intp count = count_entries_exact(self->map, self->index, self->index_count,
+                                         entry->id, t0, use_t0, t1, use_t1);
 
-    npy_intp ts_dims[1] = {N};
+    npy_intp ts_dims[1] = {count};
     PyObject *ts_arr = PyArray_SimpleNew(1, ts_dims, NPY_UINT64);
     if (!ts_arr) return NULL;
 
     PyObject *val_arr;
     if (field->count > 1) {
-        npy_intp dims[2] = {N, field->count};
+        npy_intp dims[2] = {count, field->count};
         val_arr = PyArray_SimpleNew(2, dims, npy_type);
     } else {
-        npy_intp dims[1] = {N};
+        npy_intp dims[1] = {count};
         val_arr = PyArray_SimpleNew(1, dims, npy_type);
     }
     if (!val_arr) { Py_DECREF(ts_arr); return NULL; }
 
-    if (N > 0) {
+    if (count > 0)
         fill_series(self->map, self->index, self->index_count,
                     entry->id, field, t0, use_t0, t1, use_t1,
                     PyArray_DATA((PyArrayObject *)ts_arr),
                     PyArray_DATA((PyArrayObject *)val_arr),
-                    N, field_bytes);
-    }
+                    count, field_bytes);
 
     PyObject *result = PyTuple_Pack(2, ts_arr, val_arr);
     Py_DECREF(ts_arr);
@@ -563,10 +626,10 @@ Capture_table(CaptureObject *self, PyObject *args, PyObject *kwds)
     const bt_entry_info *entry = find_entry_by_name(&self->schema, entry_name);
     if (!entry) { PyErr_Format(PyExc_KeyError, "Unknown entry: '%s'", entry_name); return NULL; }
 
-    npy_intp N = count_entries(self->map, self->index, self->index_count,
-                               entry->id, t0, use_t0, t1, use_t1);
+    npy_intp count = count_entries_exact(self->map, self->index, self->index_count,
+                                         entry->id, t0, use_t0, t1, use_t1);
 
-    npy_intp ts_dims[1] = {N};
+    npy_intp ts_dims[1] = {count};
     PyObject *ts_arr = PyArray_SimpleNew(1, ts_dims, NPY_UINT64);
     if (!ts_arr) return NULL;
 
@@ -594,10 +657,10 @@ Capture_table(CaptureObject *self, PyObject *args, PyObject *kwds)
         field_sizes[fi] = (elem_sz > 0) ? elem_sz * f->count : f->size;
 
         if (f->count > 1) {
-            npy_intp dims[2] = {N, f->count};
+            npy_intp dims[2] = {count, f->count};
             field_pyarrs[fi] = PyArray_SimpleNew(2, dims, npy_type);
         } else {
-            npy_intp dims[1] = {N};
+            npy_intp dims[1] = {count};
             field_pyarrs[fi] = PyArray_SimpleNew(1, dims, npy_type);
         }
         if (!field_pyarrs[fi]) {
@@ -609,12 +672,11 @@ Capture_table(CaptureObject *self, PyObject *args, PyObject *kwds)
         field_ptrs[fi] = PyArray_DATA((PyArrayObject *)field_pyarrs[fi]);
     }
 
-    if (N > 0) {
+    if (count > 0)
         fill_table(self->map, self->index, self->index_count,
                    entry->id, entry, t0, use_t0, t1, use_t1,
                    PyArray_DATA((PyArrayObject *)ts_arr),
-                   field_ptrs, field_sizes, N);
-    }
+                   field_ptrs, field_sizes, count);
 
     PyObject *dict = PyDict_New();
     if (!dict) {
@@ -669,11 +731,36 @@ Capture_exit(CaptureObject *self, PyObject *args)
     return Capture_close(self, NULL);
 }
 
+static PyObject *
+Capture_entry_counts(CaptureObject *self, PyObject *Py_UNUSED(ignored))
+{
+    return entry_counts_from_index(self->map, self->index, self->index_count,
+                                   &self->schema);
+}
+
+static PyObject *
+Capture_get_time_range(CaptureObject *self, void *Py_UNUSED(closure))
+{
+    if (self->index_count == 0)
+        Py_RETURN_NONE;
+    uint64_t ts_min = self->index[0].ts_min;
+    uint64_t ts_max = self->index[self->index_count - 1].ts_max;
+    return Py_BuildValue("(KK)", ts_min, ts_max);
+}
+
+static PyGetSetDef Capture_getset[] = {
+    {"time_range", (getter)Capture_get_time_range, NULL,
+     "Global (ts_min, ts_max) in nanoseconds, or None if empty.", NULL},
+    {NULL}
+};
+
 static PyMethodDef Capture_methods[] = {
     {"series", (PyCFunction)Capture_series, METH_VARARGS | METH_KEYWORDS,
      "series(entry_name, field_name, t0=None, t1=None) -> (timestamps, values)"},
     {"table", (PyCFunction)Capture_table, METH_VARARGS | METH_KEYWORDS,
      "table(entry_name, t0=None, t1=None) -> dict of numpy arrays"},
+    {"entry_counts", (PyCFunction)Capture_entry_counts, METH_NOARGS,
+     "entry_counts() -> {entry_name: count} from index (no data extraction)."},
     {"close", (PyCFunction)Capture_close, METH_NOARGS, "Close the file."},
     {"__enter__", (PyCFunction)Capture_enter, METH_NOARGS, NULL},
     {"__exit__", (PyCFunction)Capture_exit, METH_VARARGS, NULL},
@@ -688,6 +775,7 @@ static PyTypeObject CaptureType = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_doc = "File-backed telemetry capture with mmap and numpy extraction.",
     .tp_methods = Capture_methods,
+    .tp_getset = Capture_getset,
     .tp_init = (initproc)Capture_init,
     .tp_new = PyType_GenericNew,
 };
@@ -758,33 +846,30 @@ LiveCapture_init(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
     return 0;
 }
 
-static PyObject *
-LiveCapture_add_packet(LiveCaptureObject *self, PyObject *args)
+/*
+ * Internal: ingest a single raw packet (no Python objects).
+ * Returns 0 on success, -1 on error (sets Python exception).
+ */
+static int
+LiveCapture_ingest_one(LiveCaptureObject *self, const uint8_t *data, size_t pkt_len)
 {
-    Py_buffer pkt_buf;
-    if (!PyArg_ParseTuple(args, "y*", &pkt_buf))
-        return NULL;
-
-    size_t pkt_len = pkt_buf.len;
     if (pkt_len < sizeof(struct btelem_packet_header)) {
-        PyBuffer_Release(&pkt_buf);
         PyErr_SetString(PyExc_ValueError, "Packet too small");
-        return NULL;
+        return -1;
     }
 
     /* Ensure buffer capacity */
     while (self->buf_len + pkt_len > self->buf_cap) {
         size_t new_cap = self->buf_cap * 2;
         uint8_t *tmp = realloc(self->buf, new_cap);
-        if (!tmp) { PyBuffer_Release(&pkt_buf); return PyErr_NoMemory(); }
+        if (!tmp) { PyErr_NoMemory(); return -1; }
         self->buf = tmp;
         self->buf_cap = new_cap;
     }
 
     size_t offset = self->buf_len;
-    memcpy(self->buf + offset, pkt_buf.buf, pkt_len);
+    memcpy(self->buf + offset, data, pkt_len);
     self->buf_len += pkt_len;
-    PyBuffer_Release(&pkt_buf);
 
     /* Scan entry headers for ts_min/ts_max */
     const struct btelem_packet_header *ph =
@@ -803,7 +888,7 @@ LiveCapture_add_packet(LiveCaptureObject *self, PyObject *args)
     if (self->index_count >= self->index_cap) {
         uint32_t new_cap = self->index_cap * 2;
         struct btelem_index_entry *tmp = realloc(self->index, new_cap * sizeof(*tmp));
-        if (!tmp) return PyErr_NoMemory();
+        if (!tmp) { PyErr_NoMemory(); return -1; }
         self->index = tmp;
         self->index_cap = new_cap;
     }
@@ -818,20 +903,17 @@ LiveCapture_add_packet(LiveCaptureObject *self, PyObject *args)
      * Drop the oldest half to amortise the memmove cost. */
     if (self->max_packets > 0 && self->index_count > self->max_packets) {
         uint32_t drop = self->index_count / 2;
-        /* Count entries being dropped */
         uint64_t dropped_entries = 0;
         for (uint32_t i = 0; i < drop; i++)
             dropped_entries += self->index[i].entry_count;
         self->truncated_packets += drop;
         self->truncated_entries += dropped_entries;
 
-        /* Compact the data buffer */
         size_t drop_bytes = self->index[drop].offset;
         memmove(self->buf, self->buf + drop_bytes,
                 self->buf_len - drop_bytes);
         self->buf_len -= drop_bytes;
 
-        /* Compact the index and fix offsets */
         uint32_t kept = self->index_count - drop;
         for (uint32_t i = 0; i < kept; i++) {
             self->index[i] = self->index[i + drop];
@@ -840,7 +922,81 @@ LiveCapture_add_packet(LiveCaptureObject *self, PyObject *args)
         self->index_count = kept;
     }
 
+    return 0;
+}
+
+static PyObject *
+LiveCapture_add_packet(LiveCaptureObject *self, PyObject *args)
+{
+    Py_buffer pkt_buf;
+    if (!PyArg_ParseTuple(args, "y*", &pkt_buf))
+        return NULL;
+
+    int rc = LiveCapture_ingest_one(self, pkt_buf.buf, pkt_buf.len);
+    PyBuffer_Release(&pkt_buf);
+    if (rc < 0)
+        return NULL;
     Py_RETURN_NONE;
+}
+
+/*
+ * add_stream(data, max_pending=0)
+ *
+ * Parse length-prefixed packets (4-byte LE length + payload) from *data*.
+ * If max_pending > 0 and more complete packets exist, skip the oldest.
+ * Returns the number of bytes consumed (callers should trim their buffer).
+ */
+static PyObject *
+LiveCapture_add_stream(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
+{
+    Py_buffer stream;
+    unsigned int max_pending = 0;
+    static char *kwlist[] = {"data", "max_pending", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "y*|I", kwlist,
+                                     &stream, &max_pending))
+        return NULL;
+
+    const uint8_t *p = stream.buf;
+    size_t len = stream.len;
+
+    /* Pass 1: count complete packets and find total consumed bytes. */
+    size_t pos = 0;
+    uint32_t n_complete = 0;
+    while (pos + 4 <= len) {
+        uint32_t pkt_len;
+        memcpy(&pkt_len, p + pos, 4);
+        if (pos + 4 + pkt_len > len)
+            break;
+        n_complete++;
+        pos += 4 + pkt_len;
+    }
+    size_t consumed = pos;
+
+    /* How many to skip */
+    uint32_t skip = 0;
+    if (max_pending > 0 && n_complete > max_pending)
+        skip = n_complete - max_pending;
+
+    /* Pass 2: walk again, skip oldest, ingest the rest. */
+    pos = 0;
+    uint32_t idx = 0;
+    while (pos + 4 <= consumed) {
+        uint32_t pkt_len;
+        memcpy(&pkt_len, p + pos, 4);
+
+        if (idx >= skip) {
+            if (LiveCapture_ingest_one(self, p + pos + 4, pkt_len) < 0) {
+                PyBuffer_Release(&stream);
+                return NULL;
+            }
+        }
+        pos += 4 + pkt_len;
+        idx++;
+    }
+
+    PyBuffer_Release(&stream);
+    return PyLong_FromSize_t(consumed);
 }
 
 static PyObject *
@@ -885,30 +1041,30 @@ LiveCapture_series(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
     int elem_sz = type_element_size(field->type);
     int field_bytes = (elem_sz > 0) ? elem_sz * field->count : field->size;
 
-    npy_intp N = count_entries(self->buf, self->index, self->index_count,
-                               entry->id, t0, use_t0, t1, use_t1);
+    /* Exact count pass (reads entry headers only), then allocate + fill. */
+    npy_intp count = count_entries_exact(self->buf, self->index, self->index_count,
+                                         entry->id, t0, use_t0, t1, use_t1);
 
-    npy_intp ts_dims[1] = {N};
+    npy_intp ts_dims[1] = {count};
     PyObject *ts_arr = PyArray_SimpleNew(1, ts_dims, NPY_UINT64);
     if (!ts_arr) return NULL;
 
     PyObject *val_arr;
     if (field->count > 1) {
-        npy_intp dims[2] = {N, field->count};
+        npy_intp dims[2] = {count, field->count};
         val_arr = PyArray_SimpleNew(2, dims, npy_type);
     } else {
-        npy_intp dims[1] = {N};
+        npy_intp dims[1] = {count};
         val_arr = PyArray_SimpleNew(1, dims, npy_type);
     }
     if (!val_arr) { Py_DECREF(ts_arr); return NULL; }
 
-    if (N > 0) {
+    if (count > 0)
         fill_series(self->buf, self->index, self->index_count,
                     entry->id, field, t0, use_t0, t1, use_t1,
                     PyArray_DATA((PyArrayObject *)ts_arr),
                     PyArray_DATA((PyArrayObject *)val_arr),
-                    N, field_bytes);
-    }
+                    count, field_bytes);
 
     PyObject *result = PyTuple_Pack(2, ts_arr, val_arr);
     Py_DECREF(ts_arr);
@@ -936,10 +1092,10 @@ LiveCapture_table(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
     const bt_entry_info *entry = find_entry_by_name(&self->schema, entry_name);
     if (!entry) { PyErr_Format(PyExc_KeyError, "Unknown entry: '%s'", entry_name); return NULL; }
 
-    npy_intp N = count_entries(self->buf, self->index, self->index_count,
-                               entry->id, t0, use_t0, t1, use_t1);
+    npy_intp count = count_entries_exact(self->buf, self->index, self->index_count,
+                                         entry->id, t0, use_t0, t1, use_t1);
 
-    npy_intp ts_dims[1] = {N};
+    npy_intp ts_dims[1] = {count};
     PyObject *ts_arr = PyArray_SimpleNew(1, ts_dims, NPY_UINT64);
     if (!ts_arr) return NULL;
 
@@ -967,10 +1123,10 @@ LiveCapture_table(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
         field_sizes[fi] = (elem_sz > 0) ? elem_sz * f->count : f->size;
 
         if (f->count > 1) {
-            npy_intp dims[2] = {N, f->count};
+            npy_intp dims[2] = {count, f->count};
             field_pyarrs[fi] = PyArray_SimpleNew(2, dims, npy_type);
         } else {
-            npy_intp dims[1] = {N};
+            npy_intp dims[1] = {count};
             field_pyarrs[fi] = PyArray_SimpleNew(1, dims, npy_type);
         }
         if (!field_pyarrs[fi]) {
@@ -982,12 +1138,11 @@ LiveCapture_table(LiveCaptureObject *self, PyObject *args, PyObject *kwds)
         field_ptrs[fi] = PyArray_DATA((PyArrayObject *)field_pyarrs[fi]);
     }
 
-    if (N > 0) {
+    if (count > 0)
         fill_table(self->buf, self->index, self->index_count,
                    entry->id, entry, t0, use_t0, t1, use_t1,
                    PyArray_DATA((PyArrayObject *)ts_arr),
-                   field_ptrs, field_sizes, N);
-    }
+                   field_ptrs, field_sizes, count);
 
     PyObject *dict = PyDict_New();
     if (!dict) {
@@ -1023,21 +1178,46 @@ LiveCapture_get_truncated_entries(LiveCaptureObject *self, void *Py_UNUSED(closu
     return PyLong_FromUnsignedLongLong(self->truncated_entries);
 }
 
+static PyObject *
+LiveCapture_get_time_range(LiveCaptureObject *self, void *Py_UNUSED(closure))
+{
+    if (self->index_count == 0)
+        Py_RETURN_NONE;
+    uint64_t ts_min = self->index[0].ts_min;
+    uint64_t ts_max = self->index[self->index_count - 1].ts_max;
+    return Py_BuildValue("(KK)", ts_min, ts_max);
+}
+
 static PyGetSetDef LiveCapture_getset[] = {
     {"truncated_packets", (getter)LiveCapture_get_truncated_packets, NULL,
      "Total packets dropped due to rolling window.", NULL},
     {"truncated_entries", (getter)LiveCapture_get_truncated_entries, NULL,
      "Total entries dropped due to rolling window.", NULL},
+    {"time_range", (getter)LiveCapture_get_time_range, NULL,
+     "Global (ts_min, ts_max) in nanoseconds, or None if empty.", NULL},
     {NULL}
 };
+
+static PyObject *
+LiveCapture_entry_counts(LiveCaptureObject *self, PyObject *Py_UNUSED(ignored))
+{
+    return entry_counts_from_index(self->buf, self->index, self->index_count,
+                                   &self->schema);
+}
 
 static PyMethodDef LiveCapture_methods[] = {
     {"add_packet", (PyCFunction)LiveCapture_add_packet, METH_VARARGS,
      "add_packet(packet_bytes) — append a packet to the buffer."},
+    {"add_stream", (PyCFunction)LiveCapture_add_stream, METH_VARARGS | METH_KEYWORDS,
+     "add_stream(data, max_pending=0) — parse length-prefixed packets from a\n"
+     "raw byte stream, optionally skipping oldest if backlogged.\n"
+     "Returns number of bytes consumed."},
     {"series", (PyCFunction)LiveCapture_series, METH_VARARGS | METH_KEYWORDS,
      "series(entry_name, field_name, t0=None, t1=None) -> (timestamps, values)"},
     {"table", (PyCFunction)LiveCapture_table, METH_VARARGS | METH_KEYWORDS,
      "table(entry_name, t0=None, t1=None) -> dict of numpy arrays"},
+    {"entry_counts", (PyCFunction)LiveCapture_entry_counts, METH_NOARGS,
+     "entry_counts() -> {entry_name: count} from index (no data extraction)."},
     {"clear", (PyCFunction)LiveCapture_clear, METH_NOARGS,
      "Reset the internal buffer."},
     {NULL}

@@ -192,7 +192,7 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
  * 5. Main
  * ---------------------------------------------------------------------- */
 
-#define RATE_HZ 10000
+#define RATE_HZ 50000
 #define PORT    4040
 
 int main(void)

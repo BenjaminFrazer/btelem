@@ -7,7 +7,7 @@ through Provider subclasses so the UI can work with arbitrary backends.
 from __future__ import annotations
 
 import logging
-import struct
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
@@ -56,6 +56,25 @@ class Provider(ABC):
     def query(self, entry_name: str, field_name: str,
               t0: int | None = None, t1: int | None = None) -> ChannelData:
         """Return time-series data for a single field."""
+
+    def query_table(self, entry_name: str,
+                    t0: int | None = None,
+                    t1: int | None = None) -> dict[str, np.ndarray]:
+        """Return all fields for an entry type as {name: ndarray, '_timestamp': ndarray}.
+
+        Default implementation falls back to per-field queries.
+        Subclasses should override for efficient single-scan extraction.
+        """
+        channels = [ch for ch in self.channels() if ch.entry_name == entry_name]
+        if not channels:
+            return {"_timestamp": np.array([], dtype=np.uint64)}
+        first = self.query(entry_name, channels[0].field_name, t0=t0, t1=t1)
+        result: dict[str, np.ndarray] = {"_timestamp": first.timestamps,
+                                          channels[0].field_name: first.values}
+        for ch in channels[1:]:
+            data = self.query(entry_name, ch.field_name, t0=t0, t1=t1)
+            result[ch.field_name] = data.values
+        return result
 
     @property
     @abstractmethod
@@ -137,19 +156,17 @@ class BtelemFileProvider(Provider):
         return self._channels
 
     def time_range(self) -> tuple[int, int] | None:
-        if not self._channels:
-            return None
-        # Sample the first channel to get the time extent
-        ch = self._channels[0]
-        data = self.query(ch.entry_name, ch.field_name)
-        if len(data.timestamps) == 0:
-            return None
-        return int(data.timestamps[0]), int(data.timestamps[-1])
+        return self._capture.time_range
 
     def query(self, entry_name: str, field_name: str,
               t0: int | None = None, t1: int | None = None) -> ChannelData:
         ts, vals = self._capture.series(entry_name, field_name, t0=t0, t1=t1)
         return ChannelData(ts, vals)
+
+    def query_table(self, entry_name: str,
+                    t0: int | None = None,
+                    t1: int | None = None) -> dict[str, np.ndarray]:
+        return self._capture.table(entry_name, t0=t0, t1=t1)
 
     @property
     def is_live(self) -> bool:
@@ -160,6 +177,11 @@ class BtelemFileProvider(Provider):
             self._events_delivered = True
             return self._event_buf
         return []
+
+    def sample_counts(self) -> dict[tuple[str, str], int]:
+        entry_cts = self._capture.entry_counts()
+        return {(ch.entry_name, ch.field_name): entry_cts.get(ch.entry_name, 0)
+                for ch in self._channels}
 
     def close(self) -> None:
         self._capture.close()
@@ -172,7 +194,7 @@ class BtelemLiveProvider(Provider):
     and feeds them to LiveCapture for accumulation and numpy extraction.
     """
 
-    DEFAULT_MAX_PACKETS = 10_000
+    DEFAULT_MAX_PACKETS = 1_000_000
 
     def __init__(self, transport: Any, schema_bytes: bytes,
                  schema: Any, *,
@@ -191,7 +213,8 @@ class BtelemLiveProvider(Provider):
         self._event_buf: deque[DecodedEntry] = deque(maxlen=10000)
         self._pending_events: list[DecodedEntry] = []
 
-        # Stream framing buffer (4-byte length prefix)
+        # Stream framing buffer — raw TCP bytes awaiting parsing.
+        # Framing + ingestion is done in C via LiveCapture.add_stream().
         self._buf = bytearray()
 
     @property
@@ -202,18 +225,17 @@ class BtelemLiveProvider(Provider):
         return self._channels
 
     def time_range(self) -> tuple[int, int] | None:
-        if not self._has_data or not self._channels:
-            return None
-        ch = self._channels[0]
-        data = self.query(ch.entry_name, ch.field_name)
-        if len(data.timestamps) == 0:
-            return None
-        return int(data.timestamps[0]), int(data.timestamps[-1])
+        return self._live.time_range
 
     def query(self, entry_name: str, field_name: str,
               t0: int | None = None, t1: int | None = None) -> ChannelData:
         ts, vals = self._live.series(entry_name, field_name, t0=t0, t1=t1)
         return ChannelData(ts, vals)
+
+    def query_table(self, entry_name: str,
+                    t0: int | None = None,
+                    t1: int | None = None) -> dict[str, np.ndarray]:
+        return self._live.table(entry_name, t0=t0, t1=t1)
 
     @property
     def is_live(self) -> bool:
@@ -227,8 +249,10 @@ class BtelemLiveProvider(Provider):
     def truncated_count(self) -> int:
         return self._live.truncated_entries
 
+    _MAX_PENDING_PACKETS = 5000
+
     def poll(self) -> bool:
-        """Read from transport, extract packets, feed to LiveCapture.
+        """Read from transport, feed to LiveCapture via C add_stream().
 
         Returns True if at least one new packet was ingested.
         """
@@ -242,21 +266,14 @@ class BtelemLiveProvider(Provider):
             return False
 
         self._buf.extend(data)
-        got_packet = False
 
-        while len(self._buf) >= 4:
-            pkt_len = struct.unpack_from("<I", self._buf, 0)[0]
-            total = 4 + pkt_len
-            if len(self._buf) < total:
-                break
-            pkt_bytes = bytes(self._buf[4:total])
-            del self._buf[:total]
-            self._live.add_packet(pkt_bytes)
-            # result = decode_packet(self._schema, pkt_bytes)
-            # self._dropped += result.dropped
-            # self._event_buf.extend(result.entries)
-            # self._pending_events.extend(result.entries)
-            got_packet = True
+        consumed = self._live.add_stream(
+            self._buf, max_pending=self._MAX_PENDING_PACKETS)
+
+        if consumed > 0:
+            del self._buf[:consumed]
+
+        got_packet = consumed > 0
 
         if got_packet:
             self._has_data = True
@@ -275,6 +292,11 @@ class BtelemLiveProvider(Provider):
         events = self._pending_events
         self._pending_events = []
         return events
+
+    def sample_counts(self) -> dict[tuple[str, str], int]:
+        entry_cts = self._live.entry_counts()
+        return {(ch.entry_name, ch.field_name): entry_cts.get(ch.entry_name, 0)
+                for ch in self._channels}
 
     def close(self) -> None:
         self._transport.close()

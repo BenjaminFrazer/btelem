@@ -1,11 +1,14 @@
 #include "btelem/btelem_serve.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #define BTELEM_SERVE_PKT_BUF    65536
 
@@ -18,8 +21,17 @@ static int send_all(int fd, const void *data, size_t len)
     const uint8_t *p = (const uint8_t *)data;
     while (len > 0) {
         ssize_t n = write(fd, p, len);
-        if (n <= 0)
+        if (n <= 0) {
+            int e = errno;
+            if (e == EAGAIN || e == EWOULDBLOCK) {
+                fprintf(stderr, "btelem_serve: write() timed out (fd=%d, remaining=%zu), retrying...\n",
+                        fd, len);
+                continue;
+            }
+            fprintf(stderr, "btelem_serve: write() failed: %s (errno=%d, fd=%d, len=%zu)\n",
+                    strerror(e), e, fd, len);
             return -1;
+        }
         p += (size_t)n;
         len -= (size_t)n;
     }
@@ -68,18 +80,76 @@ static void *client_thread(void *arg)
 
     /* Drain loop: send length-prefixed packed batches */
 
+    /* Set send timeout so write() can't block forever when the receiver
+     * stalls (e.g. viewer backgrounded).  If we can't push data within
+     * this window we disconnect the slow client instead of wedging the
+     * drain thread.  The viewer will need to reconnect. */
+    {
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(conn->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
+    fprintf(stderr, "btelem_serve: client %d connected (fd=%d)\n",
+            conn->btelem_client_id, conn->fd);
+
+    uint64_t total_bytes = 0;
+    uint64_t total_pkts = 0;
+    uint64_t total_dropped = 0;
+    uint64_t empty_drains = 0;
+    uint64_t last_report_pkts = 0;
+    uint64_t last_report_dropped = 0;
+    struct timespec last_report;
+    clock_gettime(CLOCK_MONOTONIC, &last_report);
+
     while (srv->running) {
         int n = btelem_drain_packed(ctx, conn->btelem_client_id,
                                     pkt_buf, sizeof(pkt_buf));
         if (n > 0) {
             uint32_t plen = (uint32_t)n;
             if (send_all(conn->fd, &plen, 4) < 0 ||
-                send_all(conn->fd, pkt_buf, plen) < 0)
+                send_all(conn->fd, pkt_buf, plen) < 0) {
+                fprintf(stderr, "btelem_serve: client %d send failed after "
+                        "%lu pkts / %lu bytes — disconnecting\n",
+                        conn->btelem_client_id,
+                        (unsigned long)total_pkts, (unsigned long)total_bytes);
                 break;
+            }
+            total_bytes += 4 + plen;
+            total_pkts++;
+            const struct btelem_packet_header *ph =
+                (const struct btelem_packet_header *)pkt_buf;
+            total_dropped += ph->dropped;
+            empty_drains = 0;
         } else {
+            empty_drains++;
             usleep(1000);
         }
+
+        /* Periodic status every 2 seconds */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double dt = (double)(now.tv_sec - last_report.tv_sec)
+                  + (double)(now.tv_nsec - last_report.tv_nsec) / 1e9;
+        if (dt >= 2.0) {
+            uint64_t delta_pkts = total_pkts - last_report_pkts;
+            uint64_t delta_dropped = total_dropped - last_report_dropped;
+            fprintf(stderr, "btelem_serve: client %d status: %lu pkts (+%lu) "
+                    "%lu bytes, dropped=%lu (+%lu), empty_drains=%lu\n",
+                    conn->btelem_client_id,
+                    (unsigned long)total_pkts, (unsigned long)delta_pkts,
+                    (unsigned long)total_bytes,
+                    (unsigned long)total_dropped, (unsigned long)delta_dropped,
+                    (unsigned long)empty_drains);
+            last_report = now;
+            last_report_pkts = total_pkts;
+            last_report_dropped = total_dropped;
+            empty_drains = 0;
+        }
     }
+
+    if (!srv->running)
+        fprintf(stderr, "btelem_serve: client %d exiting (server stopping)\n",
+                conn->btelem_client_id);
 
 done:
     close(conn->fd);

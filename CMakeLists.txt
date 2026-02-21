@@ -30,6 +30,12 @@ if(BTELEM_BUILD_TESTS)
     add_executable(btelem_test_stress tests/test_stress.c)
     target_link_libraries(btelem_test_stress btelem_serve Threads::Threads)
 
+    add_executable(btelem_test_tcp_backpressure tests/test_tcp_backpressure.c)
+    target_link_libraries(btelem_test_tcp_backpressure btelem_serve Threads::Threads)
+
+    add_executable(btelem_test_counter_server tests/test_counter_server.c)
+    target_link_libraries(btelem_test_counter_server btelem_serve Threads::Threads)
+
     add_executable(btelem_bench_log tests/bench_log.c)
     target_link_libraries(btelem_bench_log btelem Threads::Threads)
 endif()

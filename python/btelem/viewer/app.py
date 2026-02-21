@@ -105,6 +105,9 @@ class ViewerApp:
         self._event_log_mgr: EventLogManager | None = None
         self._last_update_time: float = 0.0
         self._last_stats_time: float = 0.0
+        self._empty_polls: int = 0
+        self._had_live_data: bool = False
+        self._last_data_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Setup
@@ -537,20 +540,11 @@ class ViewerApp:
 
     @staticmethod
     def _compute_stats(provider: Provider) -> dict[tuple[str, str], FieldStats]:
-        """Compute stats by querying the provider (used for initial load)."""
+        """Compute stats from sample counts (O(1) per channel via index)."""
+        counts = provider.sample_counts()
         stats: dict[tuple[str, str], FieldStats] = {}
-        for ch in provider.channels():
-            try:
-                data = provider.query(ch.entry_name, ch.field_name)
-                n = len(data.timestamps)
-                if n > 0:
-                    vals = data.values.astype(np.float64)
-                    stats[(ch.entry_name, ch.field_name)] = FieldStats(
-                        n, float(np.min(vals)), float(np.max(vals)))
-                else:
-                    stats[(ch.entry_name, ch.field_name)] = FieldStats(0, None, None)
-            except Exception:
-                stats[(ch.entry_name, ch.field_name)] = FieldStats(0, None, None)
+        for key, n in counts.items():
+            stats[key] = FieldStats(n, None, None)
         return stats
 
     # ------------------------------------------------------------------
@@ -582,23 +576,37 @@ class ViewerApp:
     def run(self) -> None:
         perf = _PerfStats()
         pending_data = False
+        frame_start = time.perf_counter()
         while dpg.is_dearpygui_running():
+            frame_dt = time.perf_counter() - frame_start
+            if frame_dt > 0.5:
+                logger.warning("SLOW FRAME: %.0fms", frame_dt * 1000)
+            frame_start = time.perf_counter()
             try:
                 # 1. Poll provider every frame so no data is lost
                 t0 = time.perf_counter()
                 if self._provider is not None:
                     if self._provider.poll():
                         pending_data = True
+                        self._empty_polls = 0
+                        self._had_live_data = True
+                        self._last_data_time = time.monotonic()
+                    else:
+                        self._empty_polls += 1
                 perf.record("poll", time.perf_counter() - t0)
 
                 # 2. Throttle plot updates to ~30 Hz
                 now = time.monotonic()
-                if pending_data and self._plot_panel is not None \
+                need_update = pending_data
+                if not need_update and self._plot_panel is not None:
+                    need_update = self._plot_panel.viewport_changed()
+                if need_update and self._plot_panel is not None \
                         and (now - self._last_update_time) >= self._UPDATE_INTERVAL:
                     self._last_update_time = now
-                    pending_data = False
 
-                    self._plot_panel.mark_dirty()
+                    if pending_data:
+                        self._plot_panel.mark_dirty()
+                    pending_data = False
 
                     t0 = time.perf_counter()
                     self._plot_panel.update_cache()
@@ -629,6 +637,20 @@ class ViewerApp:
                         len(sp.get_all_series())
                         for sp in self._plot_panel.subplots))
 
+                # 2b. Stall detection: if live data was flowing but stopped,
+                #     force one final cache update so the viewer isn't frozen.
+                if self._provider is not None and self._provider.is_live \
+                        and self._had_live_data and self._empty_polls == 50:
+                    stale_sec = time.monotonic() - self._last_data_time
+                    logger.warning(
+                        "data stall detected: %d empty polls, last data %.1fs ago, "
+                        "dropped=%d truncated=%d",
+                        self._empty_polls, stale_sec,
+                        self._provider.dropped_count, self._provider.truncated_count)
+                    self._plot_panel.mark_dirty()
+                    self._plot_panel.update_cache()
+                    self._plot_panel.push_data()
+
                 # 3. Slow-cadence full stats refresh (all channels, every 2 s)
                 t0 = time.perf_counter()
                 if self._provider is not None and self._tree is not None \
@@ -648,8 +670,19 @@ class ViewerApp:
                 logger.exception("error in main loop")
 
             t0 = time.perf_counter()
+            if frame_dt > 0.5:
+                import sys
+                sys.stderr.flush()
+                logger.warning("PRE-RENDER frame_dt=%.0fms", frame_dt * 1000)
+                for h in logging.getLogger().handlers:
+                    h.flush()
             dpg.render_dearpygui_frame()
-            perf.record("render", time.perf_counter() - t0)
+            render_dt = time.perf_counter() - t0
+            perf.record("render", render_dt)
+            if render_dt > 0.5:
+                logger.warning("SLOW RENDER: %.0fms", render_dt * 1000)
+                for h in logging.getLogger().handlers:
+                    h.flush()
 
             perf.report_if_due()
 

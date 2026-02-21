@@ -542,7 +542,10 @@ int btelem_drain_packed(struct btelem_ctx *ctx, int client_id,
         available = r->capacity;
 
     size_t space_after_hdr = buf_size - sizeof(struct btelem_packet_header);
-    size_t max_entries = space_after_hdr / sizeof(struct btelem_entry_header);
+    /* Each entry needs a header AND payload space.  Use worst-case payload
+     * so the entry table never consumes the entire buffer. */
+    size_t per_entry = sizeof(struct btelem_entry_header) + BTELEM_MAX_PAYLOAD;
+    size_t max_entries = space_after_hdr / per_entry;
     if (max_entries > available)
         max_entries = (size_t)available;
 
