@@ -14,6 +14,7 @@ class FieldStats(NamedTuple):
     count: int
     min_val: float | None
     max_val: float | None
+    avg_val: float | None
 
 
 def _stats_tag(entry_name: str, field_name: str) -> str:
@@ -23,7 +24,7 @@ def _stats_tag(entry_name: str, field_name: str) -> str:
 def _fmt_stats(s: FieldStats) -> str:
     if s.count == 0 or s.min_val is None:
         return f"n={s.count}"
-    return f"n={s.count}  [{s.min_val:.4g}, {s.max_val:.4g}]"
+    return f"n={s.count}  [{s.min_val:.4g}, {s.max_val:.4g}]  avg={s.avg_val:.4g}"
 
 
 def _entry_label(entry_name: str, count: int) -> str:
@@ -46,6 +47,7 @@ class TreeExplorer:
         self._stats: dict[tuple[str, str], FieldStats] | None = None
         self._filter_text: str = ""
         self._entry_nodes: dict[str, int | str] = {}
+        self._field_nodes: dict[tuple[str, str], tuple[int | str, ChannelInfo]] = {}
 
     def build(self, channels: list[ChannelInfo],
               stats: dict[tuple[str, str], FieldStats] | None = None) -> None:
@@ -75,6 +77,7 @@ class TreeExplorer:
 
         self._tree_group = dpg.add_group(parent=self._group)
         self._entry_nodes.clear()
+        self._field_nodes.clear()
 
         grouped: dict[str, list[ChannelInfo]] = defaultdict(list)
         for ch in self._channels:
@@ -135,7 +138,7 @@ class TreeExplorer:
                 payload_type="btelem_field",
             ):
                 dpg.add_text(f"{ch.entry_name}.{ch.field_name}")
-            s = FieldStats(0, None, None)
+            s = FieldStats(0, None, None, None)
             if self._stats:
                 s = self._stats.get(
                     (ch.entry_name, ch.field_name), s)
@@ -145,14 +148,15 @@ class TreeExplorer:
 
     def _build_bitfield(self, ch: ChannelInfo) -> None:
         """Build a tree node for a bitfield with per-bit draggable children."""
-        s = FieldStats(0, None, None)
+        s = FieldStats(0, None, None, None)
         if self._stats:
             s = self._stats.get((ch.entry_name, ch.field_name), s)
 
         with dpg.tree_node(
             label=f"{ch.field_name} (BITFIELD)  {_fmt_stats(s)}",
             default_open=False,
-        ):
+        ) as node_id:
+            self._field_nodes[(ch.entry_name, ch.field_name)] = (node_id, ch)
             # Drag the whole bitfield (raw integer)
             all_btn = dpg.add_button(
                 label=f"+ drag raw", small=True,
@@ -167,20 +171,29 @@ class TreeExplorer:
             for i, bit in enumerate(ch.bitfield_bits):
                 width_str = f"[{bit.start}]" if bit.width == 1 \
                     else f"[{bit.start}:{bit.start + bit.width - 1}]"
-                btn = dpg.add_button(
-                    label=f".{bit.name} {width_str}", small=True,
-                )
-                with dpg.drag_payload(
-                    parent=btn,
-                    drag_data=(ch.entry_name, ch.field_name, ("bit", i)),
-                    payload_type="btelem_field",
-                ):
-                    dpg.add_text(
-                        f"{ch.entry_name}.{ch.field_name}.{bit.name}")
+                with dpg.group(horizontal=True):
+                    btn = dpg.add_button(
+                        label=f".{bit.name} {width_str}", small=True,
+                    )
+                    with dpg.drag_payload(
+                        parent=btn,
+                        drag_data=(ch.entry_name, ch.field_name, ("bit", i)),
+                        payload_type="btelem_field",
+                    ):
+                        dpg.add_text(
+                            f"{ch.entry_name}.{ch.field_name}.{bit.name}")
+                    bit_key = f"{ch.field_name}.{bit.name}"
+                    bit_s = FieldStats(0, None, None, None)
+                    if self._stats:
+                        bit_s = self._stats.get(
+                            (ch.entry_name, bit_key), bit_s)
+                    tag = _stats_tag(ch.entry_name, bit_key)
+                    dpg.add_text(_fmt_stats(bit_s), tag=tag,
+                                 color=(150, 150, 150))
 
     def _build_array_field(self, ch: ChannelInfo) -> None:
         """Build a tree node for an array field with per-element children."""
-        s = FieldStats(0, None, None)
+        s = FieldStats(0, None, None, None)
         if self._stats:
             s = self._stats.get((ch.entry_name, ch.field_name), s)
 
@@ -188,7 +201,8 @@ class TreeExplorer:
             label=f"{ch.field_name}[{ch.field_count}] ({ch.field_type})"
                   f"  {_fmt_stats(s)}",
             default_open=False,
-        ):
+        ) as node_id:
+            self._field_nodes[(ch.entry_name, ch.field_name)] = (node_id, ch)
             # Drag the whole array field (all elements)
             all_btn = dpg.add_button(
                 label=f"+ drag all [{ch.field_count}]", small=True,
@@ -232,11 +246,24 @@ class TreeExplorer:
         """Update stats labels in-place."""
         self._stats = stats
 
-        # Update field-level stats
+        # Update field-level stats (scalar fields and bitfield sub-fields)
         for (entry_name, field_name), s in stats.items():
             tag = _stats_tag(entry_name, field_name)
             if dpg.does_item_exist(tag):
                 dpg.set_value(tag, _fmt_stats(s))
+
+        # Update bitfield/array parent tree node labels
+        for (entry_name, field_name), (node_id, ch) in self._field_nodes.items():
+            if not dpg.does_item_exist(node_id):
+                continue
+            s = stats.get((entry_name, field_name),
+                          FieldStats(0, None, None, None))
+            if ch.bitfield_bits:
+                label = f"{ch.field_name} (BITFIELD)  {_fmt_stats(s)}"
+            else:
+                label = (f"{ch.field_name}[{ch.field_count}] ({ch.field_type})"
+                         f"  {_fmt_stats(s)}")
+            dpg.configure_item(node_id, label=label)
 
         # Update entry-level sample counts in tree node labels
         grouped: dict[str, list[ChannelInfo]] = defaultdict(list)
@@ -256,6 +283,7 @@ class TreeExplorer:
             self._group = None
         self._tree_group = None
         self._entry_nodes.clear()
+        self._field_nodes.clear()
         self._channels = []
         self._stats = None
         self._filter_text = ""

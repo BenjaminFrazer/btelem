@@ -540,11 +540,59 @@ class ViewerApp:
 
     @staticmethod
     def _compute_stats(provider: Provider) -> dict[tuple[str, str], FieldStats]:
-        """Compute stats from sample counts (O(1) per channel via index)."""
-        counts = provider.sample_counts()
+        """Compute min/max/avg stats for all fields via query_table."""
+        channels = provider.channels()
+        grouped: dict[str, list[ChannelInfo]] = {}
+        for ch in channels:
+            grouped.setdefault(ch.entry_name, []).append(ch)
+
         stats: dict[tuple[str, str], FieldStats] = {}
-        for key, n in counts.items():
-            stats[key] = FieldStats(n, None, None)
+        empty = FieldStats(0, None, None, None)
+
+        for entry_name, chs in grouped.items():
+            try:
+                table = provider.query_table(entry_name)
+            except Exception:
+                for ch in chs:
+                    stats[(ch.entry_name, ch.field_name)] = empty
+                continue
+
+            ts = table.get("_timestamp")
+            n = len(ts) if ts is not None else 0
+
+            for ch in chs:
+                vals = table.get(ch.field_name)
+                if vals is None or n == 0:
+                    stats[(ch.entry_name, ch.field_name)] = FieldStats(
+                        n, None, None, None)
+                    continue
+
+                flat = vals.ravel() if vals.ndim > 1 else vals
+                with np.errstate(all="ignore"):
+                    min_v = float(np.nanmin(flat))
+                    max_v = float(np.nanmax(flat))
+                    avg_v = float(np.nanmean(flat))
+                if np.isnan(min_v):
+                    stats[(ch.entry_name, ch.field_name)] = FieldStats(
+                        n, None, None, None)
+                else:
+                    stats[(ch.entry_name, ch.field_name)] = FieldStats(
+                        n, min_v, max_v, avg_v)
+
+                # Bitfield sub-field stats
+                if ch.bitfield_bits:
+                    raw = flat.astype(np.uint64)
+                    for bit in ch.bitfield_bits:
+                        mask = (1 << bit.width) - 1
+                        bit_vals = (raw >> bit.start) & mask
+                        bit_key = f"{ch.field_name}.{bit.name}"
+                        stats[(ch.entry_name, bit_key)] = FieldStats(
+                            n,
+                            float(np.min(bit_vals)),
+                            float(np.max(bit_vals)),
+                            float(np.mean(bit_vals)),
+                        )
+
         return stats
 
     # ------------------------------------------------------------------
