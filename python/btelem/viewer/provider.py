@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from btelem.decoder import DecodedEntry, decode_packet
+from btelem.decoder import DecodedEntry, PacketDecoder, decode_packet
 
 logger = logging.getLogger(__name__)
 
@@ -209,8 +209,9 @@ class BtelemLiveProvider(Provider):
         self._dropped: int = 0
         self._truncation_warned = False
 
-        # Event buffering for event log
-        self._event_buf: deque[DecodedEntry] = deque(maxlen=10000)
+        # Event buffering for event log — Python-side PacketDecoder runs
+        # alongside the C add_stream() path to produce DecodedEntry objects.
+        self._pkt_decoder = PacketDecoder(schema)
         self._pending_events: list[DecodedEntry] = []
 
         # Stream framing buffer — raw TCP bytes awaiting parsing.
@@ -272,6 +273,11 @@ class BtelemLiveProvider(Provider):
 
         if consumed > 0:
             del self._buf[:consumed]
+
+        # Decode the same bytes on the Python side for the event log
+        decoded = self._pkt_decoder.feed(data)
+        if decoded:
+            self._pending_events.extend(decoded)
 
         got_packet = consumed > 0
 

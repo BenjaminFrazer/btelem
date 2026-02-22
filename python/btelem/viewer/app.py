@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import zlib
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -96,7 +97,7 @@ class ViewerApp:
     """Top-level viewer application."""
 
     _UPDATE_INTERVAL: float = 1.0 / 30  # cap live updates at ~30 Hz
-    _STATS_INTERVAL: float = 2.0       # full tree stats refresh every 2 s
+    _STATS_INTERVAL: float = 2.0       # count-only tree refresh every 2 s
 
     def __init__(self) -> None:
         self._provider: Provider | None = None
@@ -108,6 +109,12 @@ class ViewerApp:
         self._empty_polls: int = 0
         self._had_live_data: bool = False
         self._last_data_time: float = 0.0
+        # Background thread for full stats computation.  The GIL serializes
+        # C extension calls (query_table) while numpy releases the GIL for
+        # the aggregation, so the heavy work runs in parallel.
+        self._stats_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="btelem-stats")
+        self._stats_future: Future | None = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -255,7 +262,7 @@ class ViewerApp:
         self._plot_panel = PlotPanel("plot_window", on_drop=self._on_field_drop)
 
         # Event log manager — default first table with stable tag for ini
-        self._event_log_mgr = EventLogManager()
+        self._event_log_mgr = EventLogManager(on_row_click=self._on_event_click)
         self._event_log_mgr.add_table(window_tag="event_log_window_1")
 
     def _build_file_dialog(self) -> None:
@@ -420,6 +427,13 @@ class ViewerApp:
             self._set_status(f"Loaded  |  {len(channels)} channels  |  (no data)")
 
     def _close_source(self) -> None:
+        # Wait for background stats before closing the provider it references
+        if self._stats_future is not None:
+            try:
+                self._stats_future.result(timeout=2.0)
+            except Exception:
+                pass
+            self._stats_future = None
         if self._provider is not None:
             self._provider.close()
             self._provider = None
@@ -439,6 +453,11 @@ class ViewerApp:
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
+
+    def _on_event_click(self, t_ns: int) -> None:
+        """Called when a row in the event log is clicked."""
+        if self._plot_panel is not None:
+            self._plot_panel.jump_to_time_ns(t_ns)
 
     def _on_field_drop(self, subplot_id: int, entry_name: str,
                        field_name: str | None,
@@ -699,12 +718,33 @@ class ViewerApp:
                     self._plot_panel.update_cache()
                     self._plot_panel.push_data()
 
-                # 3. Slow-cadence full stats refresh (all channels, every 2 s)
+                # 3. Stats refresh — background thread for full stats
                 t0 = time.perf_counter()
-                if self._provider is not None and self._tree is not None \
-                        and (now - self._last_stats_time) >= self._STATS_INTERVAL:
-                    self._last_stats_time = now
-                    self._tree.update_stats(self._compute_stats(self._provider))
+                if self._provider is not None and self._tree is not None:
+                    # Pick up completed background stats
+                    if self._stats_future is not None \
+                            and self._stats_future.done():
+                        try:
+                            stats = self._stats_future.result()
+                            self._tree.update_stats(stats)
+                        except Exception:
+                            logger.exception("background stats failed")
+                        self._stats_future = None
+
+                    # Count-only refresh every 2s (cheap index scan, no
+                    # payload extraction)
+                    if (now - self._last_stats_time) >= self._STATS_INTERVAL:
+                        self._last_stats_time = now
+                        counts = self._provider.sample_counts()
+                        self._tree.update_counts(counts)
+                        # Submit full stats recompute (live only — file
+                        # data is static so initial computation suffices)
+                        if self._provider.is_live \
+                                and self._stats_future is None:
+                            self._stats_future = \
+                                self._stats_executor.submit(
+                                    self._compute_stats,
+                                    self._provider)
                 perf.record("stats", time.perf_counter() - t0)
 
                 # 4. Per-frame tick (deferred fit, live scrolling)
@@ -737,6 +777,13 @@ class ViewerApp:
         self._cleanup()
 
     def _cleanup(self) -> None:
+        if self._stats_future is not None:
+            try:
+                self._stats_future.result(timeout=2.0)
+            except Exception:
+                pass
+            self._stats_future = None
+        self._stats_executor.shutdown(wait=False)
         if self._provider is not None:
             self._provider.close()
             self._provider = None

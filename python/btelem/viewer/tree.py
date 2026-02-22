@@ -242,6 +242,19 @@ class TreeExplorer:
         self._filter_text = app_data
         self._rebuild_tree()
 
+    def update_counts(self, counts: dict[tuple[str, str], int]) -> None:
+        """Lightweight update — only refresh entry-level n= labels."""
+        entry_counts: dict[str, int] = {}
+        for (entry_name, _field_name), count in counts.items():
+            entry_counts[entry_name] = max(
+                entry_counts.get(entry_name, 0), count)
+
+        for entry_name, node_id in self._entry_nodes.items():
+            if dpg.does_item_exist(node_id):
+                count = entry_counts.get(entry_name, 0)
+                dpg.configure_item(
+                    node_id, label=_entry_label(entry_name, count))
+
     def update_stats(self, stats: dict[tuple[str, str], FieldStats]) -> None:
         """Update stats labels in-place."""
         self._stats = stats

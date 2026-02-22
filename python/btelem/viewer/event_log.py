@@ -42,17 +42,19 @@ def _format_summary(fields: dict[str, Any], max_len: int = 120) -> str:
 class EventLogTable:
     """Single event log table inside a dockable window.
 
-    Supports drag-and-drop filtering: drop a field from the tree to filter
-    the table to that entry type. When ``_accepted_entries`` is empty, all
-    events are shown.
+    Supports drag-and-drop filtering: drop a field from the tree to add
+    that entry type.  When ``_accepted_entries`` is empty, no events are shown.
 
-    Has Head/Tail modes: Tail auto-scrolls to the latest events,
-    Head stays at the top.
+    Has Pause/Follow toggle: Follow auto-scrolls to the latest events,
+    Pause freezes the view for inspection.  Clicking a row pauses and
+    invokes ``on_row_click(timestamp_ns)`` to jump the plot X-axis.
     """
 
-    def __init__(self, table_id: int, window_tag: str) -> None:
+    def __init__(self, table_id: int, window_tag: str,
+                 on_row_click: callable | None = None) -> None:
         self.id = table_id
         self._window_tag = window_tag
+        self._on_row_click = on_row_click
         self._provider: Provider | None = None
         self._buf: deque[DecodedEntry] = deque(maxlen=10_000)
         self._t0_ns: int | None = None
@@ -65,8 +67,7 @@ class EventLogTable:
         self._row_ids: deque[int] = deque()  # DPG row item IDs
         self._follow: bool = True  # Tail mode by default
         self._needs_scroll: bool = False
-        self._head_btn: int | str | None = None
-        self._tail_btn: int | str | None = None
+        self._toggle_btn: int | str | None = None
 
         self._build_ui()
 
@@ -79,21 +80,18 @@ class EventLogTable:
             payload_type="btelem_field",
         )
 
-        # Toolbar: Head/Tail buttons
+        # Toolbar: Pause/Follow toggle
         self._toolbar = dpg.add_group(
             parent=self._drop_target, horizontal=True)
-        self._head_btn = dpg.add_button(
-            label="Head", parent=self._toolbar,
-            callback=lambda: self._set_follow(False))
-        self._tail_btn = dpg.add_button(
-            label="Tail", parent=self._toolbar,
-            callback=lambda: self._set_follow(True))
-        self._update_follow_buttons()
+        self._toggle_btn = dpg.add_button(
+            label="Pause", parent=self._toolbar,
+            callback=lambda: self._set_follow(not self._follow))
+        self._update_toggle_button()
 
         # Filter display row
         self._filter_group = dpg.add_group(
             parent=self._drop_target, horizontal=True)
-        dpg.add_text("Drop fields here to filter", parent=self._filter_group,
+        dpg.add_text("Drop entries here to show logs", parent=self._filter_group,
                       color=(150, 150, 150))
 
         # Scrollable area for the table (this is what Head/Tail scroll)
@@ -105,19 +103,15 @@ class EventLogTable:
 
     def _set_follow(self, follow: bool) -> None:
         self._follow = follow
-        self._update_follow_buttons()
+        self._update_toggle_button()
         if follow:
-            self._needs_scroll = True
-        elif not follow and self._table_parent is not None:
-            dpg.set_y_scroll(self._table_parent, 0.0)
+            # Catch up on rows buffered while paused
+            self._rebuild_table()
 
-    def _update_follow_buttons(self) -> None:
-        if self._head_btn is not None:
-            dpg.configure_item(self._head_btn,
-                               enabled=self._follow)
-        if self._tail_btn is not None:
-            dpg.configure_item(self._tail_btn,
-                               enabled=not self._follow)
+    def _update_toggle_button(self) -> None:
+        if self._toggle_btn is not None:
+            label = "Pause" if self._follow else "Follow"
+            dpg.configure_item(self._toggle_btn, label=label)
 
     def _create_table(self) -> None:
         if self._table is not None and dpg.does_item_exist(self._table):
@@ -152,9 +146,13 @@ class EventLogTable:
         if self._table is None:
             return
 
+        # When paused, buffer only — don't add rows (table is frozen)
+        if not self._follow:
+            return
+
         for ev in events:
             name = ev.name or f"id={ev.id}"
-            if self._accepted_entries and name not in self._accepted_entries:
+            if name not in self._accepted_entries:
                 continue
             self._add_row(ev, name)
 
@@ -165,8 +163,7 @@ class EventLogTable:
                 dpg.delete_item(old_row)
 
         # Defer auto-scroll to next frame (content height not yet recalculated)
-        if self._follow:
-            self._needs_scroll = True
+        self._needs_scroll = True
 
     def _add_row(self, ev: DecodedEntry, name: str) -> None:
         t0 = self._t0_ns or 0
@@ -174,10 +171,20 @@ class EventLogTable:
         summary = _format_summary(ev.fields)
 
         row = dpg.add_table_row(parent=self._table)
-        dpg.add_text(f"{t_sec:.4f}", parent=row)
-        dpg.add_text(name, parent=row)
-        dpg.add_text(summary, parent=row)
+        dpg.add_selectable(label=f"{t_sec:.4f}", parent=row, span_columns=False,
+                           callback=self._on_row_clicked, user_data=ev.timestamp)
+        dpg.add_selectable(label=name, parent=row, span_columns=False,
+                           callback=self._on_row_clicked, user_data=ev.timestamp)
+        dpg.add_selectable(label=summary, parent=row, span_columns=False,
+                           callback=self._on_row_clicked, user_data=ev.timestamp)
         self._row_ids.append(row)
+
+    def _on_row_clicked(self, sender: int, app_data: object,
+                        user_data: int) -> None:
+        """Handle click on a table row cell — pause and notify."""
+        self._set_follow(False)
+        if self._on_row_click is not None:
+            self._on_row_click(user_data)
 
     def _on_drop(self, sender: int, app_data: object) -> None:
         if app_data is None:
@@ -208,7 +215,7 @@ class EventLogTable:
             before=self._table_parent)
 
         if not self._accepted_entries:
-            dpg.add_text("Drop fields here to filter",
+            dpg.add_text("Drop entries here to show logs",
                           parent=self._filter_group,
                           color=(150, 150, 150))
         else:
@@ -235,8 +242,7 @@ class EventLogTable:
         # Only materialise the most recent _MAX_DISPLAY_ROWS matching events
         filtered = [
             ev for ev in self._buf
-            if not self._accepted_entries
-            or (ev.name or f"id={ev.id}") in self._accepted_entries
+            if (ev.name or f"id={ev.id}") in self._accepted_entries
         ]
         for ev in filtered[-_MAX_DISPLAY_ROWS:]:
             name = ev.name or f"id={ev.id}"
@@ -271,10 +277,11 @@ class EventLogTable:
 class EventLogManager:
     """Manages multiple EventLogTable instances in dockable windows."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_row_click: callable | None = None) -> None:
         self._tables: dict[int, EventLogTable] = {}
         self._global_buf: deque[DecodedEntry] = deque(maxlen=10_000)
         self._provider: Provider | None = None
+        self._on_row_click = on_row_click
 
     def add_table(self, window_tag: str | None = None) -> EventLogTable:
         """Create a new event log table in a dockable window.
@@ -297,7 +304,7 @@ class EventLogManager:
                            no_saved_settings=True,
                            on_close=lambda s=tag: self._on_window_close(s))
 
-        table = EventLogTable(table_id, tag)
+        table = EventLogTable(table_id, tag, on_row_click=self._on_row_click)
         self._tables[table_id] = table
 
         if self._provider is not None:

@@ -1120,6 +1120,26 @@ class PlotPanel:
                 cs.dirty = True
         self.push_data()
 
+    def jump_to_time_ns(self, t_ns: int) -> None:
+        """Center the X-axis on the given absolute timestamp (nanoseconds)."""
+        if self._t0_ns is None:
+            return
+        t_sec = (t_ns - self._t0_ns) / 1e9
+
+        # Read current span to preserve zoom level
+        half_span = self._live_window_sec / 2
+        for sp in self.subplots:
+            if sp.x_axis_tag is not None:
+                try:
+                    x_min, x_max = dpg.get_axis_limits(sp.x_axis_tag)
+                    half_span = (x_max - x_min) / 2
+                except Exception:
+                    pass
+                break
+
+        self.set_mode(XAxisMode.MANUAL)
+        self._set_x_limits_manual(t_sec - half_span, t_sec + half_span)
+
     def auto_range(self) -> None:
         xr = self._get_x_range()
         if xr is not None:
