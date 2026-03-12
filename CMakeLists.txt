@@ -14,13 +14,17 @@ find_package(Threads REQUIRED)
 add_library(btelem_serve src/btelem_serve.c)
 target_link_libraries(btelem_serve btelem Threads::Threads)
 
+# UDP JSON serve library (PlotJuggler-compatible)
+add_library(btelem_serve_udp src/btelem_serve_udp.c)
+target_link_libraries(btelem_serve_udp btelem Threads::Threads)
+
 # Options
 option(BTELEM_BUILD_EXAMPLES "Build examples" ON)
 option(BTELEM_BUILD_TESTS "Build tests" ON)
 
 if(BTELEM_BUILD_EXAMPLES)
     add_executable(btelem_basic examples/basic.c)
-    target_link_libraries(btelem_basic btelem_serve m)
+    target_link_libraries(btelem_basic btelem_serve btelem_serve_udp m)
 endif()
 
 if(BTELEM_BUILD_TESTS)

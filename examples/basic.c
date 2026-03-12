@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "btelem/btelem_serve.h"
+#include "btelem/btelem_serve_udp.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -194,6 +195,7 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
 
 #define RATE_HZ 50000
 #define PORT    4040
+#define UDP_PORT 9870
 
 int main(void)
 {
@@ -227,9 +229,18 @@ int main(void)
         return 1;
     }
 
+    static struct btelem_udp_server udp_srv;
+    if (btelem_serve_udp(&udp_srv, &ctx, "127.0.0.1", UDP_PORT) < 0) {
+        fprintf(stderr, "failed to start UDP server on port %d\n", UDP_PORT);
+        btelem_server_stop(&srv);
+        free(ring_mem);
+        return 1;
+    }
+
     printf("Serving telemetry on 0.0.0.0:%d at %d Hz  (Ctrl-C to stop)\n",
            PORT, RATE_HZ);
     printf("  btelem-viewer --live tcp:localhost:%d\n", PORT);
+    printf("  PlotJuggler JSON/UDP on 127.0.0.1:%d\n", UDP_PORT);
 
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -251,6 +262,7 @@ int main(void)
     }
 
     printf("\nShutting down...\n");
+    btelem_udp_server_stop(&udp_srv);
     btelem_server_stop(&srv);
     free(ring_mem);
 
