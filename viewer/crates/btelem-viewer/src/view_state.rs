@@ -170,6 +170,13 @@ impl Camera {
         self.follow = true;
         self.free_bounds_s = None;
     }
+
+    /// Zoom the follow-mode window by `factor` (>1 = zoom out / longer
+    /// window, <1 = zoom in / shorter). Clamped to a sensible range.
+    pub fn zoom_window(&mut self, factor: f64) {
+        let new = (self.window_ns as f64 * factor).clamp(1e6, 3.6e12) as u64;
+        self.window_ns = new.max(1);
+    }
 }
 
 /// Compute the visible time window in nanoseconds.
@@ -274,6 +281,122 @@ pub struct Marker {
     pub t_ns: u64,
     pub label: String,
     pub color: [u8; 3],
+    /// If part of a pair, the partner's id.
+    pub pair: Option<u64>,
+}
+
+/// Owns the marker list, selection state, and pair links. All mutation
+/// goes through this so invariants (every paired marker references its
+/// partner; deletion of one breaks the pair on the other) are enforced
+/// in one place and can be unit-tested headlessly.
+#[derive(Debug, Default)]
+pub struct MarkerSet {
+    pub markers: Vec<Marker>,
+    pub selected: Option<u64>,
+    next_id: u64,
+}
+
+impl MarkerSet {
+    pub fn new() -> Self {
+        Self {
+            markers: Vec::new(),
+            selected: None,
+            next_id: 1,
+        }
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Add a new free (unpaired) marker. Returns the new id.
+    pub fn add(&mut self, t_ns: u64, color: [u8; 3]) -> u64 {
+        let id = self.alloc_id();
+        self.markers.push(Marker {
+            id,
+            t_ns,
+            label: format!("M{id}"),
+            color,
+            pair: None,
+        });
+        id
+    }
+
+    /// Create a marker at `t_ns` paired with `anchor_id`. Returns the new
+    /// id, or `None` if the anchor doesn't exist or is already paired.
+    pub fn add_paired_with(&mut self, anchor_id: u64, t_ns: u64, color: [u8; 3]) -> Option<u64> {
+        let anchor_idx = self.markers.iter().position(|m| m.id == anchor_id)?;
+        if self.markers[anchor_idx].pair.is_some() {
+            return None;
+        }
+        let new_id = self.alloc_id();
+        self.markers[anchor_idx].pair = Some(new_id);
+        self.markers.push(Marker {
+            id: new_id,
+            t_ns,
+            label: format!("M{new_id}"),
+            color,
+            pair: Some(anchor_id),
+        });
+        Some(new_id)
+    }
+
+    pub fn remove(&mut self, id: u64) {
+        if let Some(idx) = self.markers.iter().position(|m| m.id == id) {
+            let partner = self.markers[idx].pair;
+            self.markers.remove(idx);
+            if let Some(pid) = partner {
+                if let Some(p) = self.markers.iter_mut().find(|m| m.id == pid) {
+                    p.pair = None;
+                }
+            }
+            if self.selected == Some(id) {
+                self.selected = None;
+            }
+        }
+    }
+
+    pub fn select(&mut self, id: Option<u64>) {
+        self.selected = id.filter(|i| self.markers.iter().any(|m| m.id == *i));
+    }
+
+    pub fn get(&self, id: u64) -> Option<&Marker> {
+        self.markers.iter().find(|m| m.id == id)
+    }
+
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut Marker> {
+        self.markers.iter_mut().find(|m| m.id == id)
+    }
+
+    /// Return each pair exactly once as `(lo, hi)` ordered by t_ns.
+    pub fn unique_pairs(&self) -> Vec<(&Marker, &Marker)> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for m in &self.markers {
+            let Some(pid) = m.pair else { continue };
+            if seen.contains(&m.id) {
+                continue;
+            }
+            let Some(p) = self.get(pid) else { continue };
+            seen.insert(m.id);
+            seen.insert(p.id);
+            if m.t_ns <= p.t_ns {
+                out.push((m, p));
+            } else {
+                out.push((p, m));
+            }
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.markers.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.markers.len()
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +495,17 @@ mod tests {
         cam.reset();
         assert!(cam.follow);
         assert!(cam.free_bounds_s.is_none());
+    }
+
+    #[test]
+    fn zoom_window_changes_size_and_clamps() {
+        let mut cam = Camera::default(); // 10s
+        cam.zoom_window(2.0);
+        assert_eq!(cam.window_ns, 20_000_000_000);
+        cam.zoom_window(0.0); // would underflow
+        assert!(cam.window_ns >= 1_000_000); // 1ms floor
+        cam.zoom_window(1e30); // would overflow
+        assert!(cam.window_ns <= 3_600_000_000_000); // 1h ceiling
     }
 
     // ---- grouping / search ----
@@ -485,5 +619,72 @@ mod tests {
         acc.feed(1);
         acc.cancel();
         assert!(acc.first.is_none());
+    }
+
+    // ---- MarkerSet ----
+
+    #[test]
+    fn marker_add_assigns_unique_ids() {
+        let mut s = MarkerSet::new();
+        let a = s.add(100, [1, 1, 1]);
+        let b = s.add(200, [2, 2, 2]);
+        assert_ne!(a, b);
+        assert_eq!(s.len(), 2);
+        assert!(s.get(a).unwrap().pair.is_none());
+    }
+
+    #[test]
+    fn marker_pair_links_both_sides() {
+        let mut s = MarkerSet::new();
+        let a = s.add(100, [0; 3]);
+        let b = s.add_paired_with(a, 200, [0; 3]).unwrap();
+        assert_eq!(s.get(a).unwrap().pair, Some(b));
+        assert_eq!(s.get(b).unwrap().pair, Some(a));
+    }
+
+    #[test]
+    fn marker_pair_refuses_already_paired_anchor() {
+        let mut s = MarkerSet::new();
+        let a = s.add(0, [0; 3]);
+        s.add_paired_with(a, 1, [0; 3]).unwrap();
+        // Trying to pair `a` again should fail.
+        assert!(s.add_paired_with(a, 2, [0; 3]).is_none());
+    }
+
+    #[test]
+    fn marker_remove_breaks_partner_link() {
+        let mut s = MarkerSet::new();
+        let a = s.add(0, [0; 3]);
+        let b = s.add_paired_with(a, 10, [0; 3]).unwrap();
+        s.remove(a);
+        assert!(s.get(a).is_none());
+        assert_eq!(s.get(b).unwrap().pair, None);
+    }
+
+    #[test]
+    fn marker_remove_clears_selection_if_selected() {
+        let mut s = MarkerSet::new();
+        let a = s.add(0, [0; 3]);
+        s.select(Some(a));
+        s.remove(a);
+        assert_eq!(s.selected, None);
+    }
+
+    #[test]
+    fn marker_select_ignores_unknown_id() {
+        let mut s = MarkerSet::new();
+        s.select(Some(999));
+        assert_eq!(s.selected, None);
+    }
+
+    #[test]
+    fn marker_unique_pairs_orders_by_time_and_dedups() {
+        let mut s = MarkerSet::new();
+        let a = s.add(500, [0; 3]);
+        let _ = s.add_paired_with(a, 100, [0; 3]).unwrap();
+        let pairs = s.unique_pairs();
+        assert_eq!(pairs.len(), 1);
+        let (lo, hi) = pairs[0];
+        assert!(lo.t_ns < hi.t_ns);
     }
 }

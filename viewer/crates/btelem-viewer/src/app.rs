@@ -19,7 +19,7 @@ use egui_plot::{
 };
 
 use crate::view_state::{
-    compute_view, fit_label, group_by_struct, matches_query, Camera, Marker, PlotId, PlotKind,
+    compute_view, fit_label, group_by_struct, matches_query, Camera, MarkerSet, PlotId, PlotKind,
     PlotRegistry, TimeSeriesPlot, XYDragAccumulator, XYPlot,
 };
 use crate::Args;
@@ -58,8 +58,8 @@ pub struct ViewerApp {
     cursor_last_set: Option<Instant>,
 
     // Markers.
-    markers: Vec<Marker>,
-    next_marker_id: u64,
+    markers: MarkerSet,
+    dragging_marker: Option<u64>,
 
     // Throughput readout.
     last_revision: u64,
@@ -97,8 +97,8 @@ impl ViewerApp {
             cam: Camera::default(),
             cursor_t: None,
             cursor_last_set: None,
-            markers: Vec::new(),
-            next_marker_id: 1,
+            markers: MarkerSet::new(),
+            dragging_marker: None,
             last_revision: 0,
             rate_window: std::collections::VecDeque::with_capacity(64),
         }
@@ -155,9 +155,6 @@ impl ViewerApp {
 
     fn add_marker_at_cursor(&mut self) {
         if let Some(t) = self.cursor_t {
-            let id = self.next_marker_id;
-            self.next_marker_id += 1;
-            // Cycle a small palette by id for visibility.
             let palette: [[u8; 3]; 6] = [
                 [220, 80, 80],
                 [80, 200, 120],
@@ -166,12 +163,9 @@ impl ViewerApp {
                 [180, 100, 200],
                 [60, 200, 200],
             ];
-            self.markers.push(Marker {
-                id,
-                t_ns: t,
-                label: format!("M{id}"),
-                color: palette[(id as usize) % palette.len()],
-            });
+            let n = self.markers.len();
+            let id = self.markers.add(t, palette[n % palette.len()]);
+            self.markers.select(Some(id));
         }
     }
 
@@ -346,12 +340,61 @@ impl ViewerApp {
                 if !self.markers.is_empty() {
                     ui.separator();
                     ui.heading("Markers");
-                    for m in &self.markers {
+                    let sel = self.markers.selected;
+                    for m in &self.markers.markers {
                         let dt = (m.t_ns as f64 - t as f64) / 1e9;
+                        let mut text = format!("{} @ {:+.3}s", m.label, -dt);
+                        if Some(m.id) == sel {
+                            text = format!("► {text}");
+                        }
+                        if let Some(pid) = m.pair {
+                            text = format!("{text} ↔ M{pid}");
+                        }
                         ui.colored_label(
                             Color32::from_rgb(m.color[0], m.color[1], m.color[2]),
-                            format!("{} @ {:+.3}s", m.label, -dt),
+                            text,
                         );
+                    }
+                    let pairs = self.markers.unique_pairs();
+                    if !pairs.is_empty() {
+                        ui.separator();
+                        ui.heading("Pairs");
+                        for (a, b) in pairs {
+                            let dt_s = (b.t_ns as f64 - a.t_ns as f64) / 1e9;
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} ↔ {}: Δt = {:+.6} s",
+                                    a.label, b.label, dt_s
+                                ))
+                                .strong(),
+                            );
+                            // Per-channel Δvalue across all currently visible
+                            // TimeSeries plots.
+                            let mut shown = std::collections::HashSet::new();
+                            for (_, kind) in self.iter_plots() {
+                                if let PlotKind::TimeSeries(p) = kind {
+                                    for ch in p.scalars.iter() {
+                                        if !shown.insert(*ch) {
+                                            continue;
+                                        }
+                                        let va = self.store.sample_at(*ch, a.t_ns);
+                                        let vb = self.store.sample_at(*ch, b.t_ns);
+                                        if let (Some(va), Some(vb)) = (va, vb) {
+                                            let info = self.channels_by_id();
+                                            let path = info
+                                                .get(ch)
+                                                .map(|c| c.path.clone())
+                                                .unwrap_or_default();
+                                            ui.monospace(format!(
+                                                "  {}: Δ = {:+.6}",
+                                                path,
+                                                vb - va
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -432,7 +475,8 @@ impl eframe::App for ViewerApp {
             cam: &mut self.cam,
             cursor_t: &mut self.cursor_t,
             cursor_last_set: &mut self.cursor_last_set,
-            markers: &self.markers,
+            markers: &mut self.markers,
+            dragging_marker: &mut self.dragging_marker,
             xy_drag: &mut self.xy_drag,
             new_plots: Vec::new(),
             removed: Vec::new(),
@@ -478,7 +522,8 @@ struct ViewerTabs<'a> {
     cam: &'a mut Camera,
     cursor_t: &'a mut Option<u64>,
     cursor_last_set: &'a mut Option<Instant>,
-    markers: &'a [Marker],
+    markers: &'a mut MarkerSet,
+    dragging_marker: &'a mut Option<u64>,
     xy_drag: &'a mut XYDragAccumulator,
     new_plots: Vec<PlotKind>,
     removed: Vec<PlotId>,
@@ -659,16 +704,41 @@ impl<'a> ViewerTabs<'a> {
             };
             pui.set_plot_bounds(PlotBounds::from_min_max([xmin, ylo], [xmax, yhi]));
 
-            // Markers + cursor.
-            for m in self.markers {
+            // Markers (draggable, clickable). Selected marker drawn thicker.
+            // Pair connector + Δt label rendered per pair near the top.
+            let sel = self.markers.selected;
+            for m in self.markers.markers.iter() {
+                let col = Color32::from_rgb(m.color[0], m.color[1], m.color[2]);
+                let selected = Some(m.id) == sel;
                 pui.vline(
                     VLine::new((m.t_ns as f64) / 1e9)
-                        .color(Color32::from_rgb(m.color[0], m.color[1], m.color[2]))
+                        .color(col)
+                        .width(if selected { 3.0 } else { 1.5 })
                         .name(&m.label),
                 );
             }
-            if let Some(t) = *self.cursor_t {
-                pui.vline(VLine::new((t as f64) / 1e9).color(Color32::YELLOW));
+            // Pair Δt labels near top of the plot.
+            for (a, b) in self.markers.unique_pairs() {
+                let xa = (a.t_ns as f64) / 1e9;
+                let xb = (b.t_ns as f64) / 1e9;
+                let mid = (xa + xb) * 0.5;
+                let label_y = yhi - (yhi - ylo) * 0.04;
+                pui.text(
+                    Text::new(
+                        PlotPoint::new(mid, label_y),
+                        egui::RichText::new(format!("Δt = {:+.4}s", xb - xa))
+                            .monospace()
+                            .background_color(Color32::from_rgba_unmultiplied(0, 0, 0, 180))
+                            .color(Color32::WHITE),
+                    )
+                    .anchor(egui::Align2::CENTER_CENTER),
+                );
+                // Subtle horizontal connector line.
+                pui.line(
+                    Line::new(PlotPoints::from(vec![[xa, label_y], [xb, label_y]]))
+                        .color(Color32::from_rgba_unmultiplied(255, 255, 255, 90))
+                        .width(1.0),
+                );
             }
             if let Some(p) = pui.pointer_coordinate() {
                 hover_t = Some(p.x);
@@ -677,6 +747,9 @@ impl<'a> ViewerTabs<'a> {
 
         // Custom camera: middle-mouse pan, wheel zoom.
         self.handle_camera(ui, &inner.response, &inner.transform, interactive);
+
+        // Marker drag.
+        self.handle_marker_drag(ui, &inner.response, &inner.transform);
 
         if inner.response.hovered() {
             if let Some(t_s) = hover_t {
@@ -725,10 +798,9 @@ impl<'a> ViewerTabs<'a> {
                             .name(format!("{}: {label}", info.path))
                             .fill(fill),
                     );
-                    // Approx 7 px per char for the default monospace font.
                     let bar_px = w * px_per_sec;
                     let chars = ((bar_px / 7.0).floor() as i64).max(0) as usize;
-                    let fitted = fit_label(&format!("<{label}>"), chars);
+                    let fitted = fit_label(&label, chars);
                     if !fitted.is_empty() {
                         texts.push((mid, fitted, contrast_text_colour(fill)));
                     }
@@ -741,19 +813,43 @@ impl<'a> ViewerTabs<'a> {
                             .anchor(egui::Align2::CENTER_CENTER),
                     );
                 }
-                if let Some(t) = *self.cursor_t {
-                    pui.vline(VLine::new((t as f64) / 1e9).color(Color32::YELLOW));
+                // Channel name pinned to the left edge of the lane, behind
+                // the data. Slight horizontal pad so it doesn't sit flush
+                // against the y-axis line.
+                let pad_s = (xmax - xmin) * 0.005;
+                pui.text(
+                    Text::new(
+                        PlotPoint::new(xmin + pad_s, 0.5),
+                        egui::RichText::new(short_path(&info.path))
+                            .monospace()
+                            .color(Color32::from_rgba_unmultiplied(255, 255, 255, 200))
+                            .background_color(Color32::from_rgba_unmultiplied(0, 0, 0, 160)),
+                    )
+                    .anchor(egui::Align2::LEFT_CENTER),
+                );
+                // Markers continue across the lane.
+                let sel = self.markers.selected;
+                for m in self.markers.markers.iter() {
+                    let selected = Some(m.id) == sel;
+                    pui.vline(
+                        VLine::new((m.t_ns as f64) / 1e9)
+                            .color(Color32::from_rgb(m.color[0], m.color[1], m.color[2]))
+                            .width(if selected { 3.0 } else { 1.5 }),
+                    );
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&info.path).small());
-                if ui.small_button("×").clicked() {
+            // Right-click context menu to remove this signal.
+            let ch_id = *ch;
+            lane_resp.response.context_menu(|ui| {
+                if ui.button("Remove from plot").clicked() {
                     if let Some(PlotKind::TimeSeries(p)) = self.plots.get_mut(pid) {
-                        p.remove(*ch);
+                        p.remove(ch_id);
                     }
+                    ui.close_menu();
                 }
             });
-            let _ = lane_resp;
+            // Marker drag also works on the state lane.
+            self.handle_marker_drag(ui, &lane_resp.response, &lane_resp.transform);
         }
     }
 
@@ -803,8 +899,10 @@ impl<'a> ViewerTabs<'a> {
         });
     }
 
-    /// Custom camera handler: middle-mouse pan, wheel zoom. Only active when
-    /// `interactive` (i.e. follow mode is off).
+    /// Custom camera handler: middle-mouse pan (free mode only) and wheel
+    /// zoom (always — in follow mode it adjusts `window_ns`, in free mode
+    /// it zooms about the cursor). Also consumes the scroll so it doesn't
+    /// leak into outer scroll containers.
     fn handle_camera(
         &mut self,
         ui: &mut egui::Ui,
@@ -812,36 +910,146 @@ impl<'a> ViewerTabs<'a> {
         transform: &egui_plot::PlotTransform,
         interactive: bool,
     ) {
-        if !interactive {
-            return;
-        }
         let bounds = transform.bounds();
         let cur = (bounds.min()[0], bounds.max()[0]);
 
-        // Middle-mouse pan.
-        if response.dragged_by(egui::PointerButton::Middle) {
+        if interactive && response.dragged_by(egui::PointerButton::Middle) {
             let dx_px = response.drag_delta().x as f64;
             let scale = (cur.1 - cur.0) / response.rect.width().max(1.0) as f64;
             self.cam.pan_x(-dx_px * scale, cur);
         }
 
-        // Wheel zoom.
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y) as f64;
             if scroll.abs() > 0.5 {
-                let factor = (-scroll * 0.0015).exp(); // ~ +/- 1 wheel notch = ~+/-0.18
-                let pivot_s = response
-                    .hover_pos()
-                    .map(|p| {
-                        let frac = ((p.x - response.rect.min.x) as f64
-                            / response.rect.width().max(1.0) as f64)
-                            .clamp(0.0, 1.0);
-                        cur.0 + frac * (cur.1 - cur.0)
-                    })
-                    .unwrap_or((cur.0 + cur.1) * 0.5);
-                self.cam.zoom_x(factor, pivot_s, cur);
+                let factor = (-scroll * 0.0015).exp();
+                if self.cam.follow {
+                    self.cam.zoom_window(factor);
+                } else {
+                    let pivot_s = response
+                        .hover_pos()
+                        .map(|p| {
+                            let frac = ((p.x - response.rect.min.x) as f64
+                                / response.rect.width().max(1.0) as f64)
+                                .clamp(0.0, 1.0);
+                            cur.0 + frac * (cur.1 - cur.0)
+                        })
+                        .unwrap_or((cur.0 + cur.1) * 0.5);
+                    self.cam.zoom_x(factor, pivot_s, cur);
+                }
+                // Consume so the panel/scroll-area doesn't also react.
+                ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
             }
         }
+    }
+
+    /// Combined marker interaction handler:
+    /// - hover near a marker + primary press → start drag
+    /// - drag → snap marker.t_ns to pointer.x
+    /// - click on empty (no drag) → clears selection
+    /// - click on a marker → select it
+    /// - shift+click on empty space (with selection) → create new marker at
+    ///   the click and pair it with the selected
+    /// - shift+click on a different marker (with selection) → pair them
+    fn handle_marker_drag(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        transform: &egui_plot::PlotTransform,
+    ) {
+        let primary_down = ui.input(|i| i.pointer.primary_down());
+        let shift = ui.input(|i| i.modifiers.shift);
+
+        // -- start drag on press --
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            if let Some(p) = response.hover_pos() {
+                if let Some(id) = self.hit_marker(transform, p.x) {
+                    *self.dragging_marker = Some(id);
+                }
+            }
+        }
+
+        // -- update drag --
+        if let Some(id) = *self.dragging_marker {
+            if let Some(p) = response
+                .hover_pos()
+                .or_else(|| response.interact_pointer_pos())
+            {
+                let new_t_s = transform.value_from_position(p).x.max(0.0);
+                if let Some(m) = self.markers.get_mut(id) {
+                    m.t_ns = (new_t_s * 1e9) as u64;
+                }
+            }
+        }
+
+        if !primary_down {
+            *self.dragging_marker = None;
+        }
+
+        // -- click (selection / pair) --
+        if response.clicked_by(egui::PointerButton::Primary) {
+            let pos = response.interact_pointer_pos().or_else(|| response.hover_pos());
+            let hit = pos.and_then(|p| self.hit_marker(transform, p.x));
+            match (shift, self.markers.selected, hit, pos) {
+                // Shift+click on empty with a selection: spawn a paired marker.
+                (true, Some(sel), None, Some(p)) => {
+                    let t_s = transform.value_from_position(p).x.max(0.0);
+                    let t_ns = (t_s * 1e9) as u64;
+                    let palette: [[u8; 3]; 6] = [
+                        [220, 80, 80],
+                        [80, 200, 120],
+                        [80, 130, 220],
+                        [220, 180, 60],
+                        [180, 100, 200],
+                        [60, 200, 200],
+                    ];
+                    let n = self.markers.len();
+                    let _ = self
+                        .markers
+                        .add_paired_with(sel, t_ns, palette[n % palette.len()]);
+                }
+                // Shift+click on a different existing marker: pair them.
+                (true, Some(sel), Some(id), _) if id != sel => {
+                    // Only pair if neither is already paired.
+                    let a_free = self.markers.get(sel).is_some_and(|m| m.pair.is_none());
+                    let b_free = self.markers.get(id).is_some_and(|m| m.pair.is_none());
+                    if a_free && b_free {
+                        if let Some(b) = self.markers.get_mut(id) {
+                            b.pair = Some(sel);
+                        }
+                        if let Some(a) = self.markers.get_mut(sel) {
+                            a.pair = Some(id);
+                        }
+                    }
+                }
+                // Plain click on a marker: select it.
+                (false, _, Some(id), _) => {
+                    self.markers.select(Some(id));
+                }
+                // Plain click on empty: clear selection.
+                (false, _, None, _) => {
+                    self.markers.select(None);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Return the id of the closest marker within 6 px of `pointer_x_screen`.
+    fn hit_marker(
+        &self,
+        transform: &egui_plot::PlotTransform,
+        pointer_x_screen: f32,
+    ) -> Option<u64> {
+        let mut best: Option<(u64, f32)> = None;
+        for m in self.markers.markers.iter() {
+            let mx = transform.position_from_point_x((m.t_ns as f64) / 1e9);
+            let dx = (mx - pointer_x_screen).abs();
+            if dx <= 6.0 && best.is_none_or(|(_, d)| dx < d) {
+                best = Some((m.id, dx));
+            }
+        }
+        best.map(|(id, _)| id)
     }
 }
 
