@@ -10,3 +10,8 @@ workspace = true
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
+
+[dependencies]
+btelem-store = { workspace = true }
+btelem-ingest = { workspace = true }
+clap = { version = "4", features = ["derive"] }
