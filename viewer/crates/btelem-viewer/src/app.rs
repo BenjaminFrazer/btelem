@@ -14,11 +14,13 @@ use btelem_store::{Bucket, ChannelId, ChannelInfo, ChannelKind, MockStore, Store
 use eframe::egui;
 use egui::{Color32, DragAndDrop};
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
-use egui_plot::{Bar, BarChart, Line, Plot, PlotBounds, PlotPoints, VLine};
+use egui_plot::{
+    Bar, BarChart, Line, LineStyle, Plot, PlotBounds, PlotPoint, PlotPoints, Text, VLine,
+};
 
 use crate::view_state::{
-    compute_view, group_by_struct, matches_query, Camera, Marker, PlotId, PlotKind, PlotRegistry,
-    TimeSeriesPlot, XYDragAccumulator, XYPlot,
+    compute_view, fit_label, group_by_struct, matches_query, Camera, Marker, PlotId, PlotKind,
+    PlotRegistry, TimeSeriesPlot, XYDragAccumulator, XYPlot,
 };
 use crate::Args;
 
@@ -614,16 +616,37 @@ impl<'a> ViewerTabs<'a> {
                         ymax = b.max;
                     }
                 }
-                let mins: PlotPoints = bs.iter().map(|b| [(b.t as f64) / 1e9, b.min]).collect();
-                let maxs: PlotPoints = bs.iter().map(|b| [(b.t as f64) / 1e9, b.max]).collect();
+                // Mid line (solid). Min/max envelope drawn as dashed lines
+                // in the same hue; they collapse onto the mid when LOD is
+                // not aggregating, so they're invisible at raw zoom.
+                let mids: PlotPoints = bs
+                    .iter()
+                    .map(|b| [(b.t as f64) / 1e9, (b.min + b.max) * 0.5])
+                    .collect();
+                let mins: PlotPoints =
+                    bs.iter().map(|b| [(b.t as f64) / 1e9, b.min]).collect();
+                let maxs: PlotPoints =
+                    bs.iter().map(|b| [(b.t as f64) / 1e9, b.max]).collect();
                 let name = self
                     .by_id
                     .get(ch)
                     .map(|c| c.path.clone())
                     .unwrap_or_default();
                 let colour = palette(idx);
-                pui.line(Line::new(mins).color(colour).name(&name));
-                pui.line(Line::new(maxs).color(colour).name(name));
+                let envelope = colour.linear_multiply(0.6);
+                pui.line(
+                    Line::new(mins)
+                        .color(envelope)
+                        .style(LineStyle::dashed_loose())
+                        .name(format!("{name} (min)")),
+                );
+                pui.line(
+                    Line::new(maxs)
+                        .color(envelope)
+                        .style(LineStyle::dashed_loose())
+                        .name(format!("{name} (max)")),
+                );
+                pui.line(Line::new(mids).color(colour).name(name));
             }
 
             let xmin = (t0 as f64) / 1e9;
@@ -683,7 +706,9 @@ impl<'a> ViewerTabs<'a> {
                 let xmin = (t0 as f64) / 1e9;
                 let xmax = (t1 as f64) / 1e9;
                 pui.set_plot_bounds(PlotBounds::from_min_max([xmin, 0.0], [xmax, 1.0]));
+                let px_per_sec = pui.transform().dpos_dvalue_x();
                 let mut bars: Vec<Bar> = Vec::with_capacity(runs.len());
+                let mut texts: Vec<(f64, String, Color32)> = Vec::with_capacity(runs.len());
                 for r in &runs {
                     let s = (r.t_start.max(t0) as f64) / 1e9;
                     let e = (r.t_end.min(t1) as f64) / 1e9;
@@ -693,14 +718,29 @@ impl<'a> ViewerTabs<'a> {
                         .get(r.value as usize)
                         .cloned()
                         .unwrap_or_else(|| r.value.to_string());
+                    let fill = state_colour(lane_idx, r.value);
                     bars.push(
                         Bar::new(mid, 1.0)
                             .width(w)
                             .name(format!("{}: {label}", info.path))
-                            .fill(state_colour(lane_idx, r.value)),
+                            .fill(fill),
                     );
+                    // Approx 7 px per char for the default monospace font.
+                    let bar_px = w * px_per_sec;
+                    let chars = ((bar_px / 7.0).floor() as i64).max(0) as usize;
+                    let fitted = fit_label(&format!("<{label}>"), chars);
+                    if !fitted.is_empty() {
+                        texts.push((mid, fitted, contrast_text_colour(fill)));
+                    }
                 }
                 pui.bar_chart(BarChart::new(bars));
+                for (mid, t, col) in texts {
+                    pui.text(
+                        Text::new(PlotPoint::new(mid, 0.5), egui::RichText::new(t).monospace())
+                            .color(col)
+                            .anchor(egui::Align2::CENTER_CENTER),
+                    );
+                }
                 if let Some(t) = *self.cursor_t {
                     pui.vline(VLine::new((t as f64) / 1e9).color(Color32::YELLOW));
                 }
@@ -838,6 +878,16 @@ fn state_colour(channel_idx: usize, value: u32) -> Color32 {
         ((g as u16 + 96) / 2) as u8,
         ((b as u16 + 96) / 2) as u8,
     )
+}
+
+/// Pick black or white text based on background luminance.
+fn contrast_text_colour(bg: Color32) -> Color32 {
+    let lum = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
+    if lum > 140.0 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    }
 }
 
 // Suppress dead-code warning for NodeIndex import — kept for future use.

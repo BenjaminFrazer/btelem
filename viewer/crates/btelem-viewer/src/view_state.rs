@@ -245,6 +245,28 @@ impl XYDragAccumulator {
     }
 }
 
+/// Truncate `label` so it fits within `available_chars`. Strategy:
+/// - If it fits, return as-is.
+/// - If `available_chars` < 2, return empty.
+/// - Otherwise drop trailing chars and append `…`. Words are not respected
+///   (state names are typically short identifiers).
+pub fn fit_label(label: &str, available_chars: usize) -> String {
+    let len = label.chars().count();
+    if available_chars == 0 {
+        return String::new();
+    }
+    if len <= available_chars {
+        return label.to_string();
+    }
+    if available_chars < 2 {
+        return String::new();
+    }
+    let take = available_chars - 1;
+    let mut s: String = label.chars().take(take).collect();
+    s.push('…');
+    s
+}
+
 /// A user-placed marker on the global time axis.
 #[derive(Debug, Clone)]
 pub struct Marker {
@@ -437,6 +459,24 @@ mod tests {
         assert!(acc.feed(7).is_none());
         assert_eq!(acc.first, Some(7));
         assert_eq!(acc.feed(8), Some((7, 8)));
+    }
+
+    #[test]
+    fn fit_label_passthrough() {
+        assert_eq!(fit_label("RUN", 10), "RUN");
+        assert_eq!(fit_label("RUN", 3), "RUN");
+    }
+
+    #[test]
+    fn fit_label_truncates_with_ellipsis() {
+        assert_eq!(fit_label("POWER_ON", 5), "POWE…");
+        assert_eq!(fit_label("POWER_ON", 2), "P…");
+    }
+
+    #[test]
+    fn fit_label_too_narrow_yields_empty() {
+        assert_eq!(fit_label("POWER_ON", 1), "");
+        assert_eq!(fit_label("POWER_ON", 0), "");
     }
 
     #[test]
