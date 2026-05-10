@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod view_state;
 
 use clap::Parser;
 
