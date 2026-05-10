@@ -1,6 +1,6 @@
 //! Viewer application: ingest, channel tree, plot, state lanes, cursor.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use btelem_ingest::{SourceHandle, TcpSource};
@@ -26,6 +26,7 @@ pub struct ViewerApp {
     cursor_t: Option<u64>,
 
     last_revision: u64,
+    rate_window: VecDeque<(std::time::Instant, u64)>,
 }
 
 impl ViewerApp {
@@ -46,6 +47,7 @@ impl ViewerApp {
             view_window_ns: 10_000_000_000, // 10 s default
             cursor_t: None,
             last_revision: 0,
+            rate_window: VecDeque::with_capacity(64),
         }
     }
 
@@ -68,6 +70,32 @@ impl ViewerApp {
             Some((t0, t1.max(t0 + 1)))
         } else {
             Some((lo, hi.max(lo + 1)))
+        }
+    }
+
+    /// Rolling samples/sec over a ~2 s window. Uses store revision deltas as
+    /// a proxy for incoming sample count; close enough for an at-a-glance
+    /// readout.
+    fn sample_rate(&mut self) -> f64 {
+        let now = std::time::Instant::now();
+        let rev = self.store.revision();
+        self.rate_window.push_back((now, rev));
+        while let Some(&(t, _)) = self.rate_window.front() {
+            if now.duration_since(t).as_secs_f64() > 2.0 {
+                self.rate_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.rate_window.len() < 2 {
+            return 0.0;
+        }
+        let (t0, r0) = *self.rate_window.front().unwrap();
+        let dt = now.duration_since(t0).as_secs_f64();
+        if dt < 1e-6 {
+            0.0
+        } else {
+            (rev.saturating_sub(r0)) as f64 / dt
         }
     }
 
@@ -275,10 +303,12 @@ impl eframe::App for ViewerApp {
                 }
                 ui.label("s");
                 ui.separator();
+                let rate = self.sample_rate();
                 ui.label(format!(
-                    "{} channels, rev {}",
+                    "{} channels, rev {}, {:.0} samp/s",
                     self.store.channels().len(),
-                    self.store.revision()
+                    self.store.revision(),
+                    rate,
                 ));
             });
         });
