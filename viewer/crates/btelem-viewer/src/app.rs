@@ -1,10 +1,11 @@
-//! Viewer application: ingest, channel tree (grouped + searchable), one or
-//! more plot panels (drag-drop), state lanes, cursor.
+//! Viewer application: ingest, channel tree, dockable plots (TimeSeries +
+//! XY), markers, cursor.
 //!
-//! Pure logic for camera/follow/grouping lives in [`crate::view_state`] and
-//! is fully unit-tested headlessly. This file is the egui glue.
+//! Pure interaction logic (camera, plot model, drag accumulator, grouping,
+//! search) lives in [`crate::view_state`] and is unit-tested headlessly.
+//! This file is the egui glue.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,13 +13,27 @@ use btelem_ingest::{SourceHandle, TcpSource};
 use btelem_store::{Bucket, ChannelId, ChannelInfo, ChannelKind, MockStore, Store};
 use eframe::egui;
 use egui::{Color32, DragAndDrop};
+use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 use egui_plot::{Bar, BarChart, Line, Plot, PlotBounds, PlotPoints, VLine};
 
-use crate::view_state::{compute_view, group_by_struct, matches_query, PlotPanel};
+use crate::view_state::{
+    compute_view, group_by_struct, matches_query, Camera, Marker, PlotId, PlotKind, PlotRegistry,
+    TimeSeriesPlot, XYDragAccumulator, XYPlot,
+};
 use crate::Args;
 
 const MAX_BUCKETS_PER_PIXEL: f64 = 1.0;
 const MIN_PLOT_BUCKETS: usize = 64;
+const XY_MAX_POINTS: usize = 50_000;
+const CURSOR_IDLE_MS: u128 = 500;
+
+/// Drag payload from the tree. Plain `ChannelId` would not let us
+/// distinguish "add to a plot" from "seed an XY plot".
+#[derive(Debug, Clone, Copy)]
+enum DragPayload {
+    Channel(ChannelId),
+    XYSeed(ChannelId),
+}
 
 pub struct ViewerApp {
     store: MockStore,
@@ -26,31 +41,32 @@ pub struct ViewerApp {
     _args: Arc<Args>,
     status: String,
 
-    // Plot panels (one or more, user can add/remove).
-    plots: Vec<PlotPanel>,
-    next_plot_id: usize,
+    // Layout + plot registry.
+    dock: DockState<PlotId>,
+    plots: PlotRegistry,
+    next_plot_num: usize, // for default titles ("plot 1", "plot 2", ...)
 
-    // Tree filter.
+    // Tree.
     tree_query: String,
+    xy_drag: XYDragAccumulator,
 
-    // Camera.
-    follow: bool,
-    view_window_ns: u64,
-    free_bounds_s: Option<(f64, f64)>, // x bounds while paused
-
-    // Cursor in absolute time (ns since epoch). Independent of viewport.
+    // Camera + cursor.
+    cam: Camera,
     cursor_t: Option<u64>,
+    cursor_last_set: Option<Instant>,
+
+    // Markers.
+    markers: Vec<Marker>,
+    next_marker_id: u64,
 
     // Throughput readout.
     last_revision: u64,
-    rate_window: VecDeque<(Instant, u64)>,
+    rate_window: std::collections::VecDeque<(Instant, u64)>,
 }
 
 impl ViewerApp {
     pub fn new(args: Arc<Args>) -> Self {
         let store = MockStore::new();
-        // Retry connect for a few seconds so the viewer can be started before
-        // the server is fully up (e.g. via `make viewer-demo`).
         let deadline = Instant::now() + Duration::from_secs_f64(args.connect_timeout.max(0.0));
         let (handle, status) = loop {
             match TcpSource::connect(&args.addr, store.clone()) {
@@ -61,20 +77,28 @@ impl ViewerApp {
                 Err(_) => std::thread::sleep(Duration::from_millis(100)),
             }
         };
+
+        let mut plots = PlotRegistry::new();
+        let id = plots.insert(PlotKind::TimeSeries(TimeSeriesPlot::new("plot 1")));
+        let dock = DockState::new(vec![id]);
+
         Self {
             store,
             _handle: handle,
             _args: args,
             status,
-            plots: vec![PlotPanel::new("plot 1")],
-            next_plot_id: 2,
+            dock,
+            plots,
+            next_plot_num: 2,
             tree_query: String::new(),
-            follow: true,
-            view_window_ns: 10_000_000_000, // 10 s
-            free_bounds_s: None,
+            xy_drag: XYDragAccumulator::default(),
+            cam: Camera::default(),
             cursor_t: None,
+            cursor_last_set: None,
+            markers: Vec::new(),
+            next_marker_id: 1,
             last_revision: 0,
-            rate_window: VecDeque::with_capacity(64),
+            rate_window: std::collections::VecDeque::with_capacity(64),
         }
     }
 
@@ -85,6 +109,14 @@ impl ViewerApp {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        // Idle-clear the cursor so it doesn't ghost forever after the
+        // mouse leaves the viewer window.
+        if let Some(last) = self.cursor_last_set {
+            if last.elapsed().as_millis() > CURSOR_IDLE_MS {
+                self.cursor_t = None;
+                self.cursor_last_set = None;
+            }
         }
     }
 
@@ -119,19 +151,60 @@ impl ViewerApp {
             .collect()
     }
 
+    fn add_marker_at_cursor(&mut self) {
+        if let Some(t) = self.cursor_t {
+            let id = self.next_marker_id;
+            self.next_marker_id += 1;
+            // Cycle a small palette by id for visibility.
+            let palette: [[u8; 3]; 6] = [
+                [220, 80, 80],
+                [80, 200, 120],
+                [80, 130, 220],
+                [220, 180, 60],
+                [180, 100, 200],
+                [60, 200, 200],
+            ];
+            self.markers.push(Marker {
+                id,
+                t_ns: t,
+                label: format!("M{id}"),
+                color: palette[(id as usize) % palette.len()],
+            });
+        }
+    }
+
+    fn handle_global_keys(&mut self, ctx: &egui::Context) {
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::F) {
+                self.cam.follow = !self.cam.follow;
+                if self.cam.follow {
+                    self.cam.free_bounds_s = None;
+                }
+            }
+            if i.key_pressed(egui::Key::Home) {
+                self.cam.reset();
+            }
+            if i.key_pressed(egui::Key::M) {
+                self.add_marker_at_cursor();
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                self.xy_drag.cancel();
+            }
+        });
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(&self.status);
                 ui.separator();
-                let was_follow = self.follow;
-                ui.checkbox(&mut self.follow, "follow");
-                if !was_follow && self.follow {
-                    // Re-entering follow mode discards the saved free bounds.
-                    self.free_bounds_s = None;
+                let was_follow = self.cam.follow;
+                ui.checkbox(&mut self.cam.follow, "follow (f)");
+                if !was_follow && self.cam.follow {
+                    self.cam.free_bounds_s = None;
                 }
                 ui.label("window:");
-                let mut secs = (self.view_window_ns as f64) / 1e9;
+                let mut secs = (self.cam.window_ns as f64) / 1e9;
                 if ui
                     .add(
                         egui::DragValue::new(&mut secs)
@@ -140,23 +213,39 @@ impl ViewerApp {
                     )
                     .changed()
                 {
-                    self.view_window_ns = (secs * 1e9) as u64;
+                    self.cam.window_ns = (secs * 1e9) as u64;
                 }
                 ui.label("s");
                 ui.separator();
-                if ui.button("+ plot").clicked() {
-                    let title = format!("plot {}", self.next_plot_id);
-                    self.next_plot_id += 1;
-                    self.plots.push(PlotPanel::new(title));
+                if ui.button("+ TimeSeries").clicked() {
+                    let title = format!("plot {}", self.next_plot_num);
+                    self.next_plot_num += 1;
+                    let id = self
+                        .plots
+                        .insert(PlotKind::TimeSeries(TimeSeriesPlot::new(title)));
+                    self.dock.push_to_focused_leaf(id);
+                }
+                if ui.button("⌖ marker (m)").clicked() {
+                    self.add_marker_at_cursor();
+                }
+                if ui.button("Home").on_hover_text("reset camera").clicked() {
+                    self.cam.reset();
                 }
                 ui.separator();
                 let rate = self.sample_rate();
                 ui.label(format!(
-                    "{} channels · rev {} · {:.0} samp/s",
+                    "{} channels · rev {} · {:.0} samp/s · {} markers",
                     self.store.channels().len(),
                     self.store.revision(),
                     rate,
+                    self.markers.len(),
                 ));
+                if let Some(seed) = self.xy_drag.first {
+                    ui.label(
+                        egui::RichText::new(format!("XY seed: {seed} (drop another)"))
+                            .color(Color32::YELLOW),
+                    );
+                }
             });
         });
     }
@@ -172,15 +261,20 @@ impl ViewerApp {
                         .desired_width(f32::INFINITY),
                 );
                 ui.separator();
+                ui.label(
+                    egui::RichText::new("Drag onto a plot. Shift+drag two scalars to spawn XY.")
+                        .small()
+                        .weak(),
+                );
+                ui.separator();
 
                 let chs = self.store.channels();
                 let groups = group_by_struct(chs.iter());
+                let shift = ui.input(|i| i.modifiers.shift);
+
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (head, items) in &groups {
-                        // Skip a group entirely if no child matches the search.
-                        let any = items
-                            .iter()
-                            .any(|c| matches_query(&c.path, &self.tree_query));
+                        let any = items.iter().any(|c| matches_query(&c.path, &self.tree_query));
                         if !any {
                             continue;
                         }
@@ -202,7 +296,14 @@ impl ViewerApp {
                                         ChannelKind::State { .. } => format!("▮ {leaf}"),
                                     };
                                     let id = egui::Id::new(("dragch", c.id));
-                                    ui.dnd_drag_source(id, c.id, |ui| {
+                                    let payload = if shift
+                                        && matches!(c.kind, ChannelKind::Scalar)
+                                    {
+                                        DragPayload::XYSeed(c.id)
+                                    } else {
+                                        DragPayload::Channel(c.id)
+                                    };
+                                    ui.dnd_drag_source(id, payload, |ui| {
                                         ui.label(label);
                                     });
                                 }
@@ -214,143 +315,293 @@ impl ViewerApp {
 
     fn cursor_panel(&self, ctx: &egui::Context) {
         egui::SidePanel::right("cursor")
-            .default_width(260.0)
+            .default_width(280.0)
             .show(ctx, |ui| {
+                ui.heading("Cursor");
                 let Some(t) = self.cursor_t else {
-                    ui.heading("Cursor");
                     ui.label("(hover a plot)");
                     return;
                 };
-                ui.heading(format!("t = {:.6} s", (t as f64) / 1e9));
+                ui.label(format!("t = {:.6} s", (t as f64) / 1e9));
                 ui.separator();
                 let by_id = self.channels_by_id();
-                for plot in &self.plots {
-                    if plot.is_empty() {
-                        continue;
-                    }
-                    ui.label(egui::RichText::new(&plot.title).strong());
-                    for ch in plot.scalars.iter().chain(plot.states.iter()) {
-                        let Some(info) = by_id.get(ch) else { continue };
-                        let v = self.store.sample_at(*ch, t);
-                        let text = match (&info.kind, v) {
-                            (_, None) => format!("  {}: —", info.path),
-                            (ChannelKind::Scalar, Some(v)) => {
-                                format!("  {}: {:.6}", info.path, v)
+                for (pid, kind) in self.iter_plots() {
+                    ui.label(egui::RichText::new(kind.title()).strong());
+                    match kind {
+                        PlotKind::TimeSeries(p) => {
+                            for ch in p.scalars.iter().chain(p.states.iter()) {
+                                self.cursor_row(ui, &by_id, *ch, t);
                             }
-                            (ChannelKind::State { labels }, Some(v)) => {
-                                let label = labels
-                                    .get(v as usize)
-                                    .cloned()
-                                    .unwrap_or_else(|| (v as i64).to_string());
-                                format!("  {}: {label}", info.path)
-                            }
-                        };
-                        ui.monospace(text);
+                        }
+                        PlotKind::XY(p) => {
+                            self.cursor_row(ui, &by_id, p.x, t);
+                            self.cursor_row(ui, &by_id, p.y, t);
+                        }
                     }
+                    let _ = pid;
                     ui.add_space(4.0);
+                }
+                if !self.markers.is_empty() {
+                    ui.separator();
+                    ui.heading("Markers");
+                    for m in &self.markers {
+                        let dt = (m.t_ns as f64 - t as f64) / 1e9;
+                        ui.colored_label(
+                            Color32::from_rgb(m.color[0], m.color[1], m.color[2]),
+                            format!("{} @ {:+.3}s", m.label, -dt),
+                        );
+                    }
                 }
             });
     }
 
-    fn central(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let view = compute_view(
-                self.follow,
-                self.view_window_ns,
-                self.free_bounds_s,
-                self.store.time_bounds(),
-            );
-            let Some(view) = view else {
-                ui.centered_and_justified(|ui| ui.label("waiting for data…"));
-                return;
-            };
-
-            // Lay out plot panels stacked vertically. Each gets an equal share
-            // of the available height.
-            let n = self.plots.len().max(1);
-            let panel_h = (ui.available_height() / n as f32).max(120.0);
-
-            let mut to_remove: Option<usize> = None;
-            // Take the plots out so the borrow checker is happy when we call
-            // &mut self methods inside the closure.
-            let mut plots = std::mem::take(&mut self.plots);
-            let by_id = self.channels_by_id();
-
-            for (idx, plot) in plots.iter_mut().enumerate() {
-                ui.group(|ui| {
-                    ui.set_min_height(panel_h);
-                    // Header with drop zone for new channels and a remove button.
-                    let dropped = ui
-                        .dnd_drop_zone::<ChannelId, _>(egui::Frame::none(), |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(&plot.title).strong());
-                                if ui.small_button("×").clicked() {
-                                    to_remove = Some(idx);
-                                }
-                                ui.label(
-                                    egui::RichText::new("(drag channels here)").weak().small(),
-                                );
-                            });
-                        })
-                        .1;
-                    if let Some(payload) = dropped {
-                        if let Some(info) = by_id.get(&*payload) {
-                            plot.add(info);
-                        }
-                    }
-
-                    self.draw_plot_panel(ui, plot, view, &by_id);
-                });
+    fn cursor_row(
+        &self,
+        ui: &mut egui::Ui,
+        by_id: &HashMap<ChannelId, ChannelInfo>,
+        ch: ChannelId,
+        t: u64,
+    ) {
+        let Some(info) = by_id.get(&ch) else {
+            return;
+        };
+        let v = self.store.sample_at(ch, t);
+        let text = match (&info.kind, v) {
+            (_, None) => format!("  {}: —", info.path),
+            (ChannelKind::Scalar, Some(v)) => format!("  {}: {:.6}", info.path, v),
+            (ChannelKind::State { labels }, Some(v)) => {
+                let label = labels
+                    .get(v as usize)
+                    .cloned()
+                    .unwrap_or_else(|| (v as i64).to_string());
+                format!("  {}: {label}", info.path)
             }
-
-            if let Some(i) = to_remove {
-                plots.remove(i);
-                if plots.is_empty() {
-                    plots.push(PlotPanel::new("plot 1"));
-                    self.next_plot_id = 2;
-                }
-            }
-            self.plots = plots;
-        });
+        };
+        ui.monospace(text);
     }
 
-    fn draw_plot_panel(
-        &mut self,
-        ui: &mut egui::Ui,
-        plot: &mut PlotPanel,
-        view: (u64, u64),
-        by_id: &HashMap<ChannelId, ChannelInfo>,
-    ) {
+    fn iter_plots(&self) -> Vec<(PlotId, &PlotKind)> {
+        // Iterate dock leaves so the cursor panel lists plots in display
+        // order. (DockState doesn't expose an ordered iterator over all
+        // tabs in 0.14, so just use the registry order.)
+        let mut out: Vec<(PlotId, &PlotKind)> = Vec::new();
+        for (id, kind) in self.plots_iter() {
+            out.push((id, kind));
+        }
+        out
+    }
+
+    fn plots_iter(&self) -> Vec<(PlotId, &PlotKind)> {
+        // PlotRegistry doesn't expose a public iter; collect via known ids
+        // from the dock plus any orphans (none expected).
+        let mut ids = Vec::new();
+        for (_, node) in self.dock.iter_all_nodes() {
+            if let egui_dock::Node::Leaf { tabs, .. } = node {
+                ids.extend(tabs.iter().copied());
+            }
+        }
+        ids.iter()
+            .filter_map(|id| self.plots.get(*id).map(|k| (*id, k)))
+            .collect()
+    }
+}
+
+impl eframe::App for ViewerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let _ = DragAndDrop::payload::<DragPayload>(ctx);
+
+        self.poll_redraw(ctx);
+        self.handle_global_keys(ctx);
+        self.top_bar(ctx);
+        self.tree_panel(ctx);
+        self.cursor_panel(ctx);
+
+        // Compute view once per frame; pass into tab viewer.
+        let view = compute_view(&self.cam, self.store.time_bounds());
+        let by_id = self.channels_by_id();
+
+        // Collect closed plots after the dock UI runs (we can't mutate
+        // registry while DockArea has a &mut borrow on dock).
+        let mut tab_viewer = ViewerTabs {
+            store: &self.store,
+            plots: &mut self.plots,
+            view,
+            by_id: &by_id,
+            cam: &mut self.cam,
+            cursor_t: &mut self.cursor_t,
+            cursor_last_set: &mut self.cursor_last_set,
+            markers: &self.markers,
+            xy_drag: &mut self.xy_drag,
+            new_plots: Vec::new(),
+            removed: Vec::new(),
+        };
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            DockArea::new(&mut self.dock)
+                .style(Style::from_egui(ui.ctx().style().as_ref()))
+                .show_inside(ui, &mut tab_viewer);
+        });
+
+        let removed = tab_viewer.removed;
+        let new_plots = tab_viewer.new_plots;
+
+        for id in removed {
+            self.plots.remove(id);
+        }
+        for kind in new_plots {
+            let id = self.plots.insert(kind);
+            self.dock.push_to_focused_leaf(id);
+        }
+
+        // Always keep at least one tab so the user has somewhere to drop.
+        if self.plots.is_empty() {
+            let id = self
+                .plots
+                .insert(PlotKind::TimeSeries(TimeSeriesPlot::new("plot 1")));
+            self.dock = DockState::new(vec![id]);
+            self.next_plot_num = 2;
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Tab viewer: renders one plot pane.
+// --------------------------------------------------------------------------
+
+struct ViewerTabs<'a> {
+    store: &'a MockStore,
+    plots: &'a mut PlotRegistry,
+    view: Option<(u64, u64)>,
+    by_id: &'a HashMap<ChannelId, ChannelInfo>,
+    cam: &'a mut Camera,
+    cursor_t: &'a mut Option<u64>,
+    cursor_last_set: &'a mut Option<Instant>,
+    markers: &'a [Marker],
+    xy_drag: &'a mut XYDragAccumulator,
+    new_plots: Vec<PlotKind>,
+    removed: Vec<PlotId>,
+}
+
+impl<'a> TabViewer for ViewerTabs<'a> {
+    type Tab = PlotId;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        self.plots
+            .get(*tab)
+            .map(|k| k.title().to_string())
+            .unwrap_or_else(|| format!("[{:?}]", tab))
+            .into()
+    }
+
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(("dock_tab", tab.0))
+    }
+
+    fn on_close(&mut self, tab: &mut Self::Tab) -> bool {
+        self.removed.push(*tab);
+        true
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        let pid = *tab;
+        let Some(view) = self.view else {
+            ui.centered_and_justified(|ui| ui.label("waiting for data…"));
+            return;
+        };
+
+        // Drop zone covering the whole tab. egui's dnd_drop_zone returns the
+        // payload on drop frame.
+        let dropped = ui
+            .dnd_drop_zone::<DragPayload, _>(egui::Frame::none(), |ui| {
+                let title = self.plots.get(pid).map(|k| k.title().to_string());
+                if let Some(title) = title {
+                    let kind_clone = self.plots.get(pid).cloned();
+                    if let Some(kind) = kind_clone {
+                        match kind {
+                            PlotKind::TimeSeries(_) => self.draw_timeseries(ui, pid, view, &title),
+                            PlotKind::XY(_) => self.draw_xy(ui, pid, view, &title),
+                        }
+                    }
+                }
+            })
+            .1;
+
+        if let Some(payload) = dropped {
+            match *payload {
+                DragPayload::Channel(ch) => {
+                    if let (Some(info), Some(plot)) = (self.by_id.get(&ch), self.plots.get_mut(pid))
+                    {
+                        if plot.accepts(info) {
+                            if let PlotKind::TimeSeries(p) = plot {
+                                p.add(info);
+                            }
+                        }
+                    }
+                }
+                DragPayload::XYSeed(ch) => {
+                    if let Some((x, y)) = self.xy_drag.feed(ch) {
+                        let title = format!(
+                            "XY {} vs {}",
+                            short_path(self.by_id.get(&x).map(|i| i.path.as_str()).unwrap_or("?")),
+                            short_path(self.by_id.get(&y).map(|i| i.path.as_str()).unwrap_or("?")),
+                        );
+                        self.new_plots.push(PlotKind::XY(XYPlot {
+                            title,
+                            x,
+                            y,
+                            trail_ns: None,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'a> ViewerTabs<'a> {
+    fn draw_timeseries(&mut self, ui: &mut egui::Ui, pid: PlotId, view: (u64, u64), title: &str) {
+        let plot_kind = self.plots.get(pid).cloned();
+        let Some(PlotKind::TimeSeries(panel)) = plot_kind else {
+            return;
+        };
         let (t0, t1) = view;
         let width_px = ui.available_width().max(64.0);
         let max_buckets = ((width_px as f64) * MAX_BUCKETS_PER_PIXEL) as usize;
         let max_buckets = max_buckets.max(MIN_PLOT_BUCKETS);
 
-        // ----- scalar plot -----
-        let lanes = plot.states.len();
+        let lanes = panel.states.len();
         let lane_h = 24.0;
         let scalar_h = (ui.available_height() - lanes as f32 * (lane_h + 6.0) - 8.0).max(80.0);
 
-        let interactive = !self.follow;
-        let mut hover_t: Option<f64> = None;
-        let mut to_remove_scalar: Option<ChannelId> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).strong());
+            ui.label(
+                egui::RichText::new(if self.cam.follow {
+                    "[follow]"
+                } else {
+                    "[free]"
+                })
+                .small()
+                .weak(),
+            );
+        });
 
-        let scalar_plot = Plot::new(egui::Id::new(("scalar", plot.title.clone())))
+        let interactive = !self.cam.follow;
+        let mut hover_t: Option<f64> = None;
+
+        let scalar_plot = Plot::new(egui::Id::new(("scalar", pid.0)))
             .height(scalar_h)
             .legend(egui_plot::Legend::default())
-            .allow_drag(interactive)
-            .allow_zoom(interactive)
-            .allow_scroll(interactive)
+            .allow_drag(false) // we handle pan/zoom ourselves
+            .allow_zoom(false)
+            .allow_scroll(false)
             .allow_boxed_zoom(false)
-            .allow_double_click_reset(true)
-            .auto_bounds(egui::Vec2b::new(false, true));
+            .allow_double_click_reset(false);
 
         let inner = scalar_plot.show(ui, |pui| {
-            // Compute Y range from data within visible window.
             let mut ymin = f64::INFINITY;
             let mut ymax = f64::NEG_INFINITY;
-
-            for (idx, ch) in plot.scalars.iter().enumerate() {
+            for (idx, ch) in panel.scalars.iter().enumerate() {
                 let bs: Vec<Bucket> = self.store.query_scalar(*ch, t0, t1, max_buckets);
                 if bs.is_empty() {
                     continue;
@@ -365,83 +616,73 @@ impl ViewerApp {
                 }
                 let mins: PlotPoints = bs.iter().map(|b| [(b.t as f64) / 1e9, b.min]).collect();
                 let maxs: PlotPoints = bs.iter().map(|b| [(b.t as f64) / 1e9, b.max]).collect();
-                let name = by_id.get(ch).map(|c| c.path.clone()).unwrap_or_default();
+                let name = self
+                    .by_id
+                    .get(ch)
+                    .map(|c| c.path.clone())
+                    .unwrap_or_default();
                 let colour = palette(idx);
                 pui.line(Line::new(mins).color(colour).name(&name));
                 pui.line(Line::new(maxs).color(colour).name(name));
             }
 
-            // Apply X bounds explicitly (locks camera in follow mode).
             let xmin = (t0 as f64) / 1e9;
             let xmax = (t1 as f64) / 1e9;
-            if self.follow {
-                let (ylo, yhi) = if ymin.is_finite() && ymax.is_finite() && ymax > ymin {
-                    let pad = (ymax - ymin) * 0.05;
-                    (ymin - pad, ymax + pad)
-                } else {
-                    (-1.0, 1.0)
-                };
-                pui.set_plot_bounds(PlotBounds::from_min_max([xmin, ylo], [xmax, yhi]));
-            }
+            let (ylo, yhi) = if ymin.is_finite() && ymax.is_finite() && ymax > ymin {
+                let pad = (ymax - ymin) * 0.05;
+                (ymin - pad, ymax + pad)
+            } else {
+                (-1.0, 1.0)
+            };
+            pui.set_plot_bounds(PlotBounds::from_min_max([xmin, ylo], [xmax, yhi]));
 
-            // Cursor lines.
-            if let Some(t) = self.cursor_t {
+            // Markers + cursor.
+            for m in self.markers {
+                pui.vline(
+                    VLine::new((m.t_ns as f64) / 1e9)
+                        .color(Color32::from_rgb(m.color[0], m.color[1], m.color[2]))
+                        .name(&m.label),
+                );
+            }
+            if let Some(t) = *self.cursor_t {
                 pui.vline(VLine::new((t as f64) / 1e9).color(Color32::YELLOW));
             }
-
-            // Capture cursor from current pointer.
             if let Some(p) = pui.pointer_coordinate() {
                 hover_t = Some(p.x);
             }
         });
 
-        // Right-click removes the channel under the pointer (cheap UX for now;
-        // proper context menu can come later).
-        if inner.response.secondary_clicked() {
-            // Without a per-line hit test this just removes the last entry.
-            // Acceptable for the demo; replace with menu when needed.
-            if let Some(last) = plot.scalars.last().copied() {
-                to_remove_scalar = Some(last);
-            }
-        }
+        // Custom camera: middle-mouse pan, wheel zoom.
+        self.handle_camera(ui, &inner.response, &inner.transform, interactive);
+
         if inner.response.hovered() {
             if let Some(t_s) = hover_t {
-                self.cursor_t = Some((t_s.max(0.0) * 1e9) as u64);
+                *self.cursor_t = Some((t_s.max(0.0) * 1e9) as u64);
+                *self.cursor_last_set = Some(Instant::now());
             }
-        }
-        if !self.follow {
-            // Persist the x bounds the user dragged/zoomed to.
-            let b = inner.transform.bounds();
-            self.free_bounds_s = Some((b.min()[0], b.max()[0]));
-        }
-
-        if let Some(id) = to_remove_scalar {
-            plot.remove(id);
         }
 
         // ----- state lanes -----
-        let mut to_remove_state: Option<ChannelId> = None;
-        for (lane_idx, ch) in plot.states.clone().iter().enumerate() {
-            let Some(info) = by_id.get(ch) else { continue };
+        for (lane_idx, ch) in panel.states.iter().enumerate() {
+            let Some(info) = self.by_id.get(ch) else {
+                continue;
+            };
             let labels = match &info.kind {
                 ChannelKind::State { labels } => labels.clone(),
                 _ => continue,
             };
             let runs = self.store.query_state(*ch, t0, t1);
-
-            let lane_plot = Plot::new(egui::Id::new(("lane", plot.title.clone(), *ch)))
+            let lane_plot = Plot::new(egui::Id::new(("lane", pid.0, *ch)))
                 .height(lane_h)
                 .show_axes([false, false])
                 .show_grid(false)
                 .allow_drag(false)
                 .allow_zoom(false)
                 .allow_scroll(false);
-
-            let resp = lane_plot.show(ui, |pui| {
+            let lane_resp = lane_plot.show(ui, |pui| {
                 let xmin = (t0 as f64) / 1e9;
                 let xmax = (t1 as f64) / 1e9;
                 pui.set_plot_bounds(PlotBounds::from_min_max([xmin, 0.0], [xmax, 1.0]));
-
                 let mut bars: Vec<Bar> = Vec::with_capacity(runs.len());
                 for r in &runs {
                     let s = (r.t_start.max(t0) as f64) / 1e9;
@@ -460,36 +701,112 @@ impl ViewerApp {
                     );
                 }
                 pui.bar_chart(BarChart::new(bars));
-                if let Some(t) = self.cursor_t {
+                if let Some(t) = *self.cursor_t {
                     pui.vline(VLine::new((t as f64) / 1e9).color(Color32::YELLOW));
                 }
             });
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(&info.path).small());
                 if ui.small_button("×").clicked() {
-                    to_remove_state = Some(*ch);
+                    if let Some(PlotKind::TimeSeries(p)) = self.plots.get_mut(pid) {
+                        p.remove(*ch);
+                    }
                 }
             });
-            let _ = resp;
+            let _ = lane_resp;
         }
-        if let Some(id) = to_remove_state {
-            plot.remove(id);
+    }
+
+    fn draw_xy(&mut self, ui: &mut egui::Ui, pid: PlotId, view: (u64, u64), title: &str) {
+        let plot_kind = self.plots.get(pid).cloned();
+        let Some(PlotKind::XY(xy)) = plot_kind else {
+            return;
+        };
+        let (t0, t1) = view;
+
+        ui.label(egui::RichText::new(title).strong());
+
+        // Sample both channels at synchronized timestamps. Use the X channel's
+        // bucket centres as the time grid (cheap, deterministic). For each
+        // bucket, average min/max for a representative point.
+        let bs_x = self.store.query_scalar(xy.x, t0, t1, XY_MAX_POINTS);
+        let mut points: Vec<[f64; 2]> = Vec::with_capacity(bs_x.len());
+        for b in &bs_x {
+            if let Some(yv) = self.store.sample_at(xy.y, b.t) {
+                let xv = (b.min + b.max) * 0.5;
+                points.push([xv, yv]);
+            }
+        }
+
+        let xname = self.by_id.get(&xy.x).map(|c| c.path.as_str()).unwrap_or("?");
+        let yname = self.by_id.get(&xy.y).map(|c| c.path.as_str()).unwrap_or("?");
+
+        let avail = ui.available_size();
+        let plot = Plot::new(egui::Id::new(("xy", pid.0)))
+            .width(avail.x)
+            .height(avail.y - 24.0)
+            .x_axis_label(xname)
+            .y_axis_label(yname)
+            .allow_drag(true)
+            .allow_zoom(true)
+            .allow_scroll(true)
+            .data_aspect(1.0);
+
+        plot.show(ui, |pui| {
+            if !points.is_empty() {
+                pui.line(
+                    Line::new(PlotPoints::from(points))
+                        .color(palette(0))
+                        .name(format!("{xname} vs {yname}")),
+                );
+            }
+        });
+    }
+
+    /// Custom camera handler: middle-mouse pan, wheel zoom. Only active when
+    /// `interactive` (i.e. follow mode is off).
+    fn handle_camera(
+        &mut self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        transform: &egui_plot::PlotTransform,
+        interactive: bool,
+    ) {
+        if !interactive {
+            return;
+        }
+        let bounds = transform.bounds();
+        let cur = (bounds.min()[0], bounds.max()[0]);
+
+        // Middle-mouse pan.
+        if response.dragged_by(egui::PointerButton::Middle) {
+            let dx_px = response.drag_delta().x as f64;
+            let scale = (cur.1 - cur.0) / response.rect.width().max(1.0) as f64;
+            self.cam.pan_x(-dx_px * scale, cur);
+        }
+
+        // Wheel zoom.
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y) as f64;
+            if scroll.abs() > 0.5 {
+                let factor = (-scroll * 0.0015).exp(); // ~ +/- 1 wheel notch = ~+/-0.18
+                let pivot_s = response
+                    .hover_pos()
+                    .map(|p| {
+                        let frac = ((p.x - response.rect.min.x) as f64
+                            / response.rect.width().max(1.0) as f64)
+                            .clamp(0.0, 1.0);
+                        cur.0 + frac * (cur.1 - cur.0)
+                    })
+                    .unwrap_or((cur.0 + cur.1) * 0.5);
+                self.cam.zoom_x(factor, pivot_s, cur);
+            }
         }
     }
 }
 
-impl eframe::App for ViewerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drop any in-flight drag that wasn't accepted, so it doesn't leak
-        // across frames.
-        let _ = DragAndDrop::payload::<ChannelId>(ctx);
-
-        self.poll_redraw(ctx);
-        self.top_bar(ctx);
-        self.tree_panel(ctx);
-        self.cursor_panel(ctx);
-        self.central(ctx);
-    }
+fn short_path(p: &str) -> &str {
+    p.rsplit('.').next().unwrap_or(p)
 }
 
 fn palette(i: usize) -> Color32 {
@@ -521,4 +838,10 @@ fn state_colour(channel_idx: usize, value: u32) -> Color32 {
         ((g as u16 + 96) / 2) as u8,
         ((b as u16 + 96) / 2) as u8,
     )
+}
+
+// Suppress dead-code warning for NodeIndex import — kept for future use.
+#[allow(dead_code)]
+fn _nidx_keepalive() -> NodeIndex {
+    NodeIndex::root()
 }
