@@ -7,7 +7,8 @@ BENCH_DIR := build-bench
 
 VIEWER_PORT ?= 4040
 VIEWER_ADDR ?= 127.0.0.1:$(VIEWER_PORT)
-VIEWER_ENTRIES ?= 5000000
+VIEWER_ENTRIES ?= 0
+VIEWER_RATE ?= 1000
 
 all: build
 
@@ -30,11 +31,13 @@ viewer-rs:
 	cd viewer && cargo run -p btelem-viewer --release -- --addr $(VIEWER_ADDR)
 
 # Convenience: spawn the C counter server and the Rust viewer side by side.
+# Server runs forever (NUM_ENTRIES=0) at VIEWER_RATE Hz by default.
 viewer-demo: build
-	./$(BUILD_DIR)/btelem_test_counter_server $(VIEWER_PORT) $(VIEWER_ENTRIES) & \
+	cd viewer && cargo build -p btelem-viewer --release
+	./$(BUILD_DIR)/btelem_test_counter_server $(VIEWER_PORT) $(VIEWER_ENTRIES) $(VIEWER_RATE) & \
 	  SERVER_PID=$$!; \
 	  trap "kill $$SERVER_PID 2>/dev/null" EXIT; \
-	  cd viewer && cargo run -p btelem-viewer --release -- --addr $(VIEWER_ADDR)
+	  ./viewer/target/release/btelem-viewer --addr $(VIEWER_ADDR)
 
 # Headless soak: spawn server, run ingest+query loop for SOAK_SECS, print JSON metrics.
 SOAK_SECS ?= 10
@@ -43,7 +46,7 @@ viewer-soak: build
 	  --addr $(VIEWER_ADDR) \
 	  --duration $(SOAK_SECS) \
 	  --spawn ../$(BUILD_DIR)/btelem_test_counter_server \
-	  --spawn-entries $(VIEWER_ENTRIES)
+	  --spawn-entries 0
 
 tests: build
 	./$(BUILD_DIR)/btelem_test_ring

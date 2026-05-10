@@ -5,8 +5,9 @@
  * Each counter increments by (index + 1) per sample:
  *   c0 += 1, c1 += 2, c2 += 3, ... c7 += 8
  *
- * Usage: ./btelem_test_counter_server PORT [NUM_ENTRIES]
- *   Default NUM_ENTRIES = 2000000 (2M)
+ * Usage: ./btelem_test_counter_server PORT [NUM_ENTRIES] [RATE_HZ]
+ *   Default NUM_ENTRIES = 2000000 (2M).  Pass 0 for unlimited.
+ *   Default RATE_HZ     = 0 (max rate).  Pass e.g. 1000 to throttle.
  */
 
 #include <stdio.h>
@@ -50,12 +51,17 @@ static void handle_signal(int sig)
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s PORT [NUM_ENTRIES]\n", argv[0]);
+        fprintf(stderr, "usage: %s PORT [NUM_ENTRIES] [RATE_HZ]\n"
+                        "  NUM_ENTRIES=0 -> run forever\n"
+                        "  RATE_HZ=0     -> max rate (default)\n",
+                argv[0]);
         return 1;
     }
 
     int port = atoi(argv[1]);
     int num_entries = (argc >= 3) ? atoi(argv[2]) : 2000000;
+    int rate_hz = (argc >= 4) ? atoi(argv[3]) : 0;
+    useconds_t period_us = (rate_hz > 0) ? (useconds_t)(1000000 / rate_hz) : 0;
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -90,14 +96,18 @@ int main(int argc, char *argv[])
     struct counters val;
     memset(&val, 0, sizeof(val));
 
-    for (int i = 0; i < num_entries && running; i++) {
+    int produced = 0;
+    for (int i = 0; (num_entries == 0 || i < num_entries) && running; i++) {
         for (int j = 0; j < NUM_COUNTERS; j++)
             val.c[j] += (uint32_t)(j + 1);
         BTELEM_LOG(&ctx, COUNTERS, val);
+        produced++;
+        if (period_us)
+            usleep(period_us);
     }
 
     fprintf(stderr, "counter_server: produced %d entries, flushing...\n",
-            num_entries);
+            produced);
 
     /* Let drain loop flush */
     usleep(200000);
