@@ -1,0 +1,12 @@
+[package]
+name = "btelem-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+btelem-wire  = { workspace = true }
+btelem-store = { workspace = true }

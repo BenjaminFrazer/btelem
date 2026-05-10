@@ -1,0 +1,16 @@
+[package]
+name = "btelem-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "btelem-viewer"
+path = "src/main.rs"
+
+[dependencies]
+btelem-store  = { workspace = true }
+btelem-ingest = { workspace = true }

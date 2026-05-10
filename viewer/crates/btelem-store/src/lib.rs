@@ -1,0 +1,115 @@
+//! Viewer ↔ data-source contract for btelem.
+//!
+//! See `docs/rust-viewer-plan.md` for the design rationale.
+//!
+//! The whole crate revolves around the [`Store`] trait. Implementations:
+//!
+//! * [`MockStore`] — scriptable, in-process, used by viewer tests.
+//! * `InMemoryStore` (added in a later phase) — production store fed by ingest.
+//!
+//! Numeric channels collapse to `f64`. Bool / enum / bitfield channels are
+//! exposed as [`ChannelKind::State`] with a label table.
+
+#![forbid(unsafe_code)]
+
+use std::sync::Arc;
+
+mod mock;
+pub use mock::MockStore;
+
+/// Stable identifier for a channel within a session.
+///
+/// Convention: `(schema_id as u32) << 16 | field_index as u32`. Synthetic
+/// channels (e.g. one per bitfield bit) reserve the high bit.
+pub type ChannelId = u32;
+
+/// Nanoseconds since an arbitrary monotonic epoch (matches the wire format).
+pub type Timestamp = u64;
+
+/// Inclusive-exclusive time interval `[t0, t1)`.
+pub type TimeRange = (Timestamp, Timestamp);
+
+/// Description of a channel exposed by a store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelInfo {
+    pub id: ChannelId,
+    /// Dotted path used by the viewer tree, e.g. `"imu.accel_x"`.
+    pub path: String,
+    pub kind: ChannelKind,
+}
+
+/// What a channel contains. Numeric storage is uniformly `f64`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChannelKind {
+    /// Continuous numeric signal.
+    Scalar,
+    /// Discrete value with a small, known label set (bool / enum / bitfield bit).
+    /// `labels[value as usize]` is the display string.
+    State { labels: Arc<[String]> },
+}
+
+/// One bucket of a min/max LOD query result. For raw (level 0) data,
+/// `min == max` and represents a single sample at time `t`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Bucket {
+    pub t: Timestamp,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// One run of a state channel: value held over `[t_start, t_end)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct StateRun {
+    pub t_start: Timestamp,
+    pub t_end: Timestamp,
+    pub value: u32,
+}
+
+/// The viewer ↔ data-source contract.
+///
+/// All methods are pull-style and must be cheap (target: well under 1 ms for
+/// typical viewport queries). Implementations are responsible for any
+/// internal locking; callers may invoke methods from any thread.
+pub trait Store: Send + Sync {
+    /// All channels currently known to the store.
+    fn channels(&self) -> Vec<ChannelInfo>;
+
+    /// Earliest and latest timestamps across all channels, or `None` if empty.
+    fn time_bounds(&self) -> Option<TimeRange>;
+
+    /// Monotonically-increasing global revision. Bumped on any ingest or
+    /// schema change. Viewer caches its last value to decide whether to
+    /// re-query.
+    fn revision(&self) -> u64;
+
+    /// Down-sampled scalar samples in `[t0, t1)`.
+    ///
+    /// Returned buckets are sorted by `t` ascending and number at most
+    /// `max_buckets`. Implementations choose the coarsest LOD level whose
+    /// average bucket width is `<= (t1 - t0) / max_buckets`.
+    ///
+    /// Returns an empty vec if the channel does not exist or has no data
+    /// in range.
+    fn query_scalar(
+        &self,
+        ch: ChannelId,
+        t0: Timestamp,
+        t1: Timestamp,
+        max_buckets: usize,
+    ) -> Vec<Bucket>;
+
+    /// Run-length runs of a state channel intersecting `[t0, t1)`.
+    ///
+    /// Returned runs are sorted by `t_start` ascending and may be clipped to
+    /// the requested range (i.e. `runs[0].t_start` may be `< t0`).
+    fn query_state(&self, ch: ChannelId, t0: Timestamp, t1: Timestamp) -> Vec<StateRun>;
+
+    /// Value at exact timestamp `t`.
+    ///
+    /// * Scalar channels: linear interpolation between bracketing raw samples.
+    /// * State channels: `value as f64` of the run containing `t`.
+    /// * Out-of-range or unknown channel: `None`.
+    fn sample_at(&self, ch: ChannelId, t: Timestamp) -> Option<f64>;
+}
