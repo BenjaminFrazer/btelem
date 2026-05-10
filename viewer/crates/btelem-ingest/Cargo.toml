@@ -10,3 +10,4 @@ workspace = true
 [dependencies]
 btelem-wire  = { workspace = true }
 btelem-store = { workspace = true }
+thiserror    = { workspace = true }
