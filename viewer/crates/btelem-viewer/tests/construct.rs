@@ -9,6 +9,7 @@ use std::sync::Arc;
 fn constructs_offline() {
     let args = Arc::new(btelem_viewer::Args {
         addr: "127.0.0.1:1".to_string(),
+        connect_timeout: 0.0,
     });
     let _app = ViewerApp::new(args);
 }

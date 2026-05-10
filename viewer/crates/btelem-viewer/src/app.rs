@@ -32,9 +32,18 @@ pub struct ViewerApp {
 impl ViewerApp {
     pub fn new(args: Arc<Args>) -> Self {
         let store = MockStore::new();
-        let (handle, status) = match TcpSource::connect(&args.addr, store.clone()) {
-            Ok(h) => (Some(h), format!("connected to {}", args.addr)),
-            Err(e) => (None, format!("connection failed: {e}")),
+        // Retry connect for up to ~5 s so the viewer can be started before
+        // the server is fully up (e.g. via `make viewer-demo`).
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs_f64(args.connect_timeout.max(0.0));
+        let (handle, status) = loop {
+            match TcpSource::connect(&args.addr, store.clone()) {
+                Ok(h) => break (Some(h), format!("connected to {}", args.addr)),
+                Err(e) if std::time::Instant::now() >= deadline => {
+                    break (None, format!("connection failed: {e}"));
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
         };
         Self {
             store,

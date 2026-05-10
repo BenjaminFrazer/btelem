@@ -34,7 +34,6 @@ viewer-demo: build
 	./$(BUILD_DIR)/btelem_test_counter_server $(VIEWER_PORT) $(VIEWER_ENTRIES) & \
 	  SERVER_PID=$$!; \
 	  trap "kill $$SERVER_PID 2>/dev/null" EXIT; \
-	  sleep 0.2; \
 	  cd viewer && cargo run -p btelem-viewer --release -- --addr $(VIEWER_ADDR)
 
 # Headless soak: spawn server, run ingest+query loop for SOAK_SECS, print JSON metrics.
