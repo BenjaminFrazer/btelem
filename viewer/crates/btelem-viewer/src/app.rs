@@ -385,7 +385,12 @@ impl ViewerApp {
                             continue;
                         }
                         egui::CollapsingHeader::new(head)
-                            .default_open(true)
+                            .default_open(false)
+                            .open(if self.tree_query.is_empty() {
+                                None
+                            } else {
+                                Some(true)
+                            })
                             .show(ui, |ui| {
                                 for c in items {
                                     if !matches_query(&c.path, &self.tree_query) {
