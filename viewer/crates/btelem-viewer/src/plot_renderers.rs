@@ -42,8 +42,12 @@ pub fn render_timeseries(
 
     let lanes = panel.states.len();
     let lane_h = 24.0;
-    let scalar_h = (ui.available_height() - lanes as f32 * lane_h - 6.0).max(80.0);
 
+    // Header (title + [follow]/[free]) — render first so we can measure
+    // exactly how much vertical space it consumed, then size the scalar
+    // section to fill the rest minus the lanes. Otherwise the lanes spill
+    // past the tab and force a vertical scrollbar.
+    let y_before_header = ui.cursor().top();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(&panel.title).strong());
         ui.label(
@@ -52,6 +56,12 @@ pub fn render_timeseries(
                 .weak(),
         );
     });
+    let header_h = ui.cursor().top() - y_before_header;
+    let item_spacing = ui.spacing().item_spacing.y;
+    // Each child widget contributes lane_h + item_spacing to the layout.
+    let lanes_total = lanes as f32 * (lane_h + item_spacing);
+    let scalar_h = (ui.available_height() - lanes_total - item_spacing).max(80.0);
+    let _ = header_h; // header is already consumed from available_height
 
     render_scalar_section(ui, ctx, pid, panel, (t0, t1), scalar_h);
 
