@@ -171,6 +171,17 @@ impl Camera {
         self.free_bounds_s = None;
     }
 
+    /// Centre the view on `t_ns` while preserving the current visible
+    /// span. Always switches to free mode. Used by event-log row clicks
+    /// and the "go to time" UX.
+    pub fn jump_to(&mut self, t_ns: u64, fallback_bounds: (f64, f64)) {
+        self.follow = false;
+        let (lo, hi) = self.free_bounds_s.unwrap_or(fallback_bounds);
+        let half = ((hi - lo) * 0.5).max(0.001);
+        let centre = (t_ns as f64) / 1e9;
+        self.free_bounds_s = Some((centre - half, centre + half));
+    }
+
     /// Zoom the follow-mode window by `factor` (>1 = zoom out / longer
     /// window, <1 = zoom in / shorter). Clamped to a sensible range.
     pub fn zoom_window(&mut self, factor: f64) {
@@ -274,6 +285,104 @@ pub fn fit_label(label: &str, available_chars: usize) -> String {
     s
 }
 
+/// Default colour palette for newly-added markers. Cycled by index.
+pub const MARKER_PALETTE: [[u8; 3]; 6] = [
+    [220, 80, 80],
+    [80, 200, 120],
+    [80, 130, 220],
+    [220, 180, 60],
+    [180, 100, 200],
+    [60, 200, 200],
+];
+
+/// Wire protocol for a remote connection. Only `Tcp` is implemented today;
+/// the other variants are placeholders so the UI stays stable when serial
+/// + UDP land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Serial,
+}
+
+impl Protocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "TCP",
+            Protocol::Udp => "UDP",
+            Protocol::Serial => "Serial",
+        }
+    }
+}
+
+/// Connection settings the user can edit in the connection menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connection {
+    pub host: String,
+    pub port: u16,
+    pub protocol: Protocol,
+}
+
+impl Default for Connection {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 4040,
+            protocol: Protocol::Tcp,
+        }
+    }
+}
+
+impl Connection {
+    /// Parse `host:port` (and prefix `tcp://` / `udp://` / `serial://`) into
+    /// a `Connection`. Falls back to current defaults for missing parts.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (proto, rest) = if let Some(r) = s.strip_prefix("tcp://") {
+            (Protocol::Tcp, r)
+        } else if let Some(r) = s.strip_prefix("udp://") {
+            (Protocol::Udp, r)
+        } else if let Some(r) = s.strip_prefix("serial://") {
+            (Protocol::Serial, r)
+        } else {
+            (Protocol::Tcp, s)
+        };
+        if proto == Protocol::Serial {
+            return Ok(Self {
+                host: rest.to_string(),
+                port: 0,
+                protocol: proto,
+            });
+        }
+        let (h, p) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| format!("expected host:port, got {rest:?}"))?;
+        let port: u16 = p.parse().map_err(|e| format!("bad port {p:?}: {e}"))?;
+        Ok(Self {
+            host: h.to_string(),
+            port,
+            protocol: proto,
+        })
+    }
+
+    /// `host:port` form suitable for `TcpStream::connect`.
+    pub fn socket_addr(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Pretty form for the status bar / window title.
+    pub fn pretty(&self) -> String {
+        match self.protocol {
+            Protocol::Serial => format!("serial://{}", self.host),
+            _ => format!(
+                "{}://{}:{}",
+                self.protocol.label().to_lowercase(),
+                self.host,
+                self.port
+            ),
+        }
+    }
+}
+
 /// A user-placed marker on the global time axis.
 #[derive(Debug, Clone)]
 pub struct Marker {
@@ -362,6 +471,27 @@ impl MarkerSet {
         self.selected = id.filter(|i| self.markers.iter().any(|m| m.id == *i));
     }
 
+    /// Establish a pair link between `a` and `b`. Returns `false` if either
+    /// id doesn't exist, they are equal, or either is already paired with
+    /// someone else.
+    pub fn pair(&mut self, a: u64, b: u64) -> bool {
+        if a == b {
+            return false;
+        }
+        let a_free = self.get(a).is_some_and(|m| m.pair.is_none());
+        let b_free = self.get(b).is_some_and(|m| m.pair.is_none());
+        if !(a_free && b_free) {
+            return false;
+        }
+        if let Some(m) = self.get_mut(a) {
+            m.pair = Some(b);
+        }
+        if let Some(m) = self.get_mut(b) {
+            m.pair = Some(a);
+        }
+        true
+    }
+
     pub fn get(&self, id: u64) -> Option<&Marker> {
         self.markers.iter().find(|m| m.id == id)
     }
@@ -396,6 +526,54 @@ impl MarkerSet {
     }
     pub fn len(&self) -> usize {
         self.markers.len()
+    }
+}
+
+/// Rolling-window rate estimator. Keeps `(time, count)` samples within the
+/// configured window; `rate()` returns count/sec across them.
+#[derive(Debug, Clone)]
+pub struct RateEstimator {
+    window: std::collections::VecDeque<(std::time::Instant, u64)>,
+    window_secs: f64,
+}
+
+impl Default for RateEstimator {
+    fn default() -> Self {
+        Self::new(2.0)
+    }
+}
+
+impl RateEstimator {
+    pub fn new(window_secs: f64) -> Self {
+        Self {
+            window: std::collections::VecDeque::with_capacity(64),
+            window_secs,
+        }
+    }
+
+    pub fn push(&mut self, now: std::time::Instant, count: u64) {
+        self.window.push_back((now, count));
+        while let Some(&(t, _)) = self.window.front() {
+            if now.duration_since(t).as_secs_f64() > self.window_secs {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn rate(&self) -> f64 {
+        if self.window.len() < 2 {
+            return 0.0;
+        }
+        let (t0, c0) = *self.window.front().unwrap();
+        let (t1, c1) = *self.window.back().unwrap();
+        let dt = t1.duration_since(t0).as_secs_f64();
+        if dt < 1e-6 {
+            0.0
+        } else {
+            (c1.saturating_sub(c0)) as f64 / dt
+        }
     }
 }
 
@@ -678,13 +856,95 @@ mod tests {
     }
 
     #[test]
-    fn marker_unique_pairs_orders_by_time_and_dedups() {
+    fn marker_pair_method_links_two_free_markers() {
         let mut s = MarkerSet::new();
-        let a = s.add(500, [0; 3]);
-        let _ = s.add_paired_with(a, 100, [0; 3]).unwrap();
-        let pairs = s.unique_pairs();
-        assert_eq!(pairs.len(), 1);
-        let (lo, hi) = pairs[0];
-        assert!(lo.t_ns < hi.t_ns);
+        let a = s.add(0, [0; 3]);
+        let b = s.add(10, [0; 3]);
+        assert!(s.pair(a, b));
+        assert_eq!(s.get(a).unwrap().pair, Some(b));
+        assert_eq!(s.get(b).unwrap().pair, Some(a));
+    }
+
+    #[test]
+    fn marker_pair_rejects_self_or_already_paired() {
+        let mut s = MarkerSet::new();
+        let a = s.add(0, [0; 3]);
+        let b = s.add(10, [0; 3]);
+        let c = s.add(20, [0; 3]);
+        assert!(!s.pair(a, a));
+        assert!(s.pair(a, b));
+        assert!(!s.pair(a, c)); // a already paired
+        assert!(!s.pair(b, c)); // b already paired
+    }
+
+    // ---- Camera::jump_to ----
+
+    #[test]
+    fn jump_to_centres_on_t_preserving_span() {
+        let mut cam = Camera {
+            follow: false,
+            window_ns: 0,
+            free_bounds_s: Some((10.0, 20.0)),
+        };
+        cam.jump_to(50_000_000_000, (0.0, 100.0));
+        let (lo, hi) = cam.free_bounds_s.unwrap();
+        assert!((hi - lo - 10.0).abs() < 1e-9, "span should be preserved");
+        assert!(((lo + hi) * 0.5 - 50.0).abs() < 1e-9, "centred on 50s");
+        assert!(!cam.follow);
+    }
+
+    // ---- Connection ----
+
+    #[test]
+    fn connection_parses_plain_host_port() {
+        let c = Connection::parse("10.0.0.5:7000").unwrap();
+        assert_eq!(c.protocol, Protocol::Tcp);
+        assert_eq!(c.host, "10.0.0.5");
+        assert_eq!(c.port, 7000);
+    }
+
+    #[test]
+    fn connection_parses_protocol_prefix() {
+        let c = Connection::parse("udp://1.2.3.4:9").unwrap();
+        assert_eq!(c.protocol, Protocol::Udp);
+        let s = Connection::parse("serial:///dev/ttyUSB0").unwrap();
+        assert_eq!(s.protocol, Protocol::Serial);
+        assert_eq!(s.host, "/dev/ttyUSB0");
+    }
+
+    #[test]
+    fn connection_pretty_round_trips_protocol() {
+        let c = Connection {
+            host: "h".into(),
+            port: 1,
+            protocol: Protocol::Udp,
+        };
+        assert_eq!(c.pretty(), "udp://h:1");
+    }
+
+    // ---- RateEstimator ----
+
+    #[test]
+    fn rate_estimator_computes_count_per_sec() {
+        use std::time::{Duration, Instant};
+        let mut r = RateEstimator::new(10.0);
+        let t0 = Instant::now();
+        r.push(t0, 0);
+        r.push(t0 + Duration::from_secs(1), 100);
+        let rate = r.rate();
+        assert!(rate > 99.0 && rate < 101.0, "got {rate}");
+    }
+
+    #[test]
+    fn rate_estimator_drops_samples_outside_window() {
+        use std::time::{Duration, Instant};
+        let mut r = RateEstimator::new(1.0);
+        let t0 = Instant::now();
+        r.push(t0, 0);
+        r.push(t0 + Duration::from_millis(500), 50);
+        r.push(t0 + Duration::from_millis(1200), 200);
+        // First sample (1.2s old) is evicted; window now spans 0.5..1.2s.
+        let rate = r.rate();
+        assert!((rate - 214.0).abs() < 5.0, "got {rate}"); // 150 over 0.7s
     }
 }

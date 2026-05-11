@@ -59,8 +59,7 @@ impl MockStore {
     }
 
     /// Append a scalar sample. Timestamps must be non-decreasing per channel.
-    pub fn push_scalar(&self, ch: ChannelId, t: Timestamp, v: f64) {
-        let mut g = self.inner.write().unwrap();
+    pub fn push_scalar(&self, ch: ChannelId, t: Timestamp, v: f64) {        let mut g = self.inner.write().unwrap();
         if let Some(buf) = g.scalars.get_mut(ch as usize) {
             buf.push((t, v));
             g.revision += 1;
@@ -93,6 +92,16 @@ impl MockStore {
             }),
         }
         g.revision += 1;
+    }
+    /// Drop every channel and sample. Bumps the revision once. Used when
+    /// the user reconnects to a different source, since channel ids are
+    /// allocated densely from zero by the mapper.
+    pub fn clear(&self) {
+        let mut g = self.inner.write().unwrap();
+        g.channels.clear();
+        g.scalars.clear();
+        g.states.clear();
+        g.revision = g.revision.wrapping_add(1);
     }
 }
 

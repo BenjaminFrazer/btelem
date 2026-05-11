@@ -10,23 +10,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use btelem_ingest::{SourceHandle, TcpSource};
-use btelem_store::{Bucket, ChannelId, ChannelInfo, ChannelKind, MockStore, Store};
+use btelem_store::{ChannelId, ChannelInfo, ChannelKind, MockStore, Store};
 use eframe::egui;
 use egui::{Color32, DragAndDrop};
-use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
-use egui_plot::{
-    Bar, BarChart, Line, LineStyle, Plot, PlotBounds, PlotPoint, PlotPoints, Text, VLine,
-};
+use egui_dock::{DockArea, DockState, Style, TabViewer};
 
+use crate::plot_renderers::{self, PlotContext};
 use crate::view_state::{
-    compute_view, fit_label, group_by_struct, matches_query, Camera, MarkerSet, PlotId, PlotKind,
-    PlotRegistry, TimeSeriesPlot, XYDragAccumulator, XYPlot,
+    compute_view, group_by_struct, matches_query, Camera, Connection, MarkerSet, PlotId, PlotKind,
+    PlotRegistry, Protocol, RateEstimator, TimeSeriesPlot, XYDragAccumulator, XYPlot,
+    MARKER_PALETTE,
 };
 use crate::Args;
 
-const MAX_BUCKETS_PER_PIXEL: f64 = 1.0;
-const MIN_PLOT_BUCKETS: usize = 64;
-const XY_MAX_POINTS: usize = 50_000;
 const CURSOR_IDLE_MS: u128 = 500;
 
 /// Drag payload from the tree. Plain `ChannelId` would not let us
@@ -63,16 +59,23 @@ pub struct ViewerApp {
 
     // Throughput readout.
     last_revision: u64,
-    rate_window: std::collections::VecDeque<(Instant, u64)>,
+    rate: RateEstimator,
+
+    // Connection settings (editable via the connection dialog).
+    connection: Connection,
+    connection_dialog_open: bool,
+    /// Buffer for the dialog's text edits — committed only on Connect.
+    pending_connection: Connection,
 }
 
 impl ViewerApp {
     pub fn new(args: Arc<Args>) -> Self {
         let store = MockStore::new();
+        let connection = Connection::parse(&args.addr).unwrap_or_default();
         let deadline = Instant::now() + Duration::from_secs_f64(args.connect_timeout.max(0.0));
         let (handle, status) = loop {
-            match TcpSource::connect(&args.addr, store.clone()) {
-                Ok(h) => break (Some(h), format!("connected to {}", args.addr)),
+            match TcpSource::connect(connection.socket_addr(), store.clone()) {
+                Ok(h) => break (Some(h), format!("connected to {}", connection.pretty())),
                 Err(e) if Instant::now() >= deadline => {
                     break (None, format!("connection failed: {e}"));
                 }
@@ -100,7 +103,37 @@ impl ViewerApp {
             markers: MarkerSet::new(),
             dragging_marker: None,
             last_revision: 0,
-            rate_window: std::collections::VecDeque::with_capacity(64),
+            rate: RateEstimator::new(2.0),
+            pending_connection: connection.clone(),
+            connection,
+            connection_dialog_open: false,
+        }
+    }
+
+    /// Tear down the current source, clear the store, and connect to
+    /// `self.connection`. Leaves status with a human-readable result.
+    fn reconnect(&mut self) {
+        if self.connection.protocol != Protocol::Tcp {
+            self.status = format!(
+                "{} not yet implemented (TCP only)",
+                self.connection.protocol.label()
+            );
+            return;
+        }
+        // Drop existing handle first so the producer thread shuts down
+        // before we reset the store.
+        self._handle = None;
+        self.store.clear();
+        self.last_revision = 0;
+        self.rate = RateEstimator::new(2.0);
+        match TcpSource::connect(self.connection.socket_addr(), self.store.clone()) {
+            Ok(h) => {
+                self._handle = Some(h);
+                self.status = format!("connected to {}", self.connection.pretty());
+            }
+            Err(e) => {
+                self.status = format!("connection failed: {e}");
+            }
         }
     }
 
@@ -123,26 +156,8 @@ impl ViewerApp {
     }
 
     fn sample_rate(&mut self) -> f64 {
-        let now = Instant::now();
-        let rev = self.store.revision();
-        self.rate_window.push_back((now, rev));
-        while let Some(&(t, _)) = self.rate_window.front() {
-            if now.duration_since(t).as_secs_f64() > 2.0 {
-                self.rate_window.pop_front();
-            } else {
-                break;
-            }
-        }
-        if self.rate_window.len() < 2 {
-            return 0.0;
-        }
-        let (t0, r0) = *self.rate_window.front().unwrap();
-        let dt = now.duration_since(t0).as_secs_f64();
-        if dt < 1e-6 {
-            0.0
-        } else {
-            (rev.saturating_sub(r0)) as f64 / dt
-        }
+        self.rate.push(Instant::now(), self.store.revision());
+        self.rate.rate()
     }
 
     fn channels_by_id(&self) -> HashMap<ChannelId, ChannelInfo> {
@@ -155,16 +170,8 @@ impl ViewerApp {
 
     fn add_marker_at_cursor(&mut self) {
         if let Some(t) = self.cursor_t {
-            let palette: [[u8; 3]; 6] = [
-                [220, 80, 80],
-                [80, 200, 120],
-                [80, 130, 220],
-                [220, 180, 60],
-                [180, 100, 200],
-                [60, 200, 200],
-            ];
             let n = self.markers.len();
-            let id = self.markers.add(t, palette[n % palette.len()]);
+            let id = self.markers.add(t, MARKER_PALETTE[n % MARKER_PALETTE.len()]);
             self.markers.select(Some(id));
         }
     }
@@ -193,6 +200,15 @@ impl ViewerApp {
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(&self.status);
+                ui.separator();
+                if ui
+                    .button("🔌 Connection…")
+                    .on_hover_text(format!("currently {}", self.connection.pretty()))
+                    .clicked()
+                {
+                    self.pending_connection = self.connection.clone();
+                    self.connection_dialog_open = true;
+                }
                 ui.separator();
                 let was_follow = self.cam.follow;
                 ui.checkbox(&mut self.cam.follow, "follow (f)");
@@ -244,6 +260,80 @@ impl ViewerApp {
                 }
             });
         });
+    }
+
+    fn connection_dialog(&mut self, ctx: &egui::Context) {
+        if !self.connection_dialog_open {
+            return;
+        }
+        let mut open = self.connection_dialog_open;
+        let mut do_connect = false;
+        let mut cancel = false;
+        egui::Window::new("Connection")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("conn_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Host:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pending_connection.host)
+                                .desired_width(180.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Port:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pending_connection.port)
+                                .range(1..=65535),
+                        );
+                        ui.end_row();
+
+                        ui.label("Protocol:");
+                        egui::ComboBox::from_id_salt("conn_proto")
+                            .selected_text(self.pending_connection.protocol.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.pending_connection.protocol,
+                                    Protocol::Tcp,
+                                    "TCP",
+                                );
+                                ui.selectable_value(
+                                    &mut self.pending_connection.protocol,
+                                    Protocol::Udp,
+                                    "UDP",
+                                )
+                                .on_hover_text("not yet implemented");
+                                ui.selectable_value(
+                                    &mut self.pending_connection.protocol,
+                                    Protocol::Serial,
+                                    "Serial",
+                                )
+                                .on_hover_text("not yet implemented");
+                            });
+                        ui.end_row();
+                    });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Connect").clicked() {
+                        do_connect = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if do_connect {
+            self.connection = self.pending_connection.clone();
+            self.reconnect();
+            open = false;
+        } else if cancel {
+            open = false;
+        }
+        self.connection_dialog_open = open;
     }
 
     fn tree_panel(&mut self, ctx: &egui::Context) {
@@ -321,7 +411,7 @@ impl ViewerApp {
                 ui.label(format!("t = {:.6} s", (t as f64) / 1e9));
                 ui.separator();
                 let by_id = self.channels_by_id();
-                for (pid, kind) in self.iter_plots() {
+                for (_, kind) in self.iter_plots() {
                     ui.label(egui::RichText::new(kind.title()).strong());
                     match kind {
                         PlotKind::TimeSeries(p) => {
@@ -334,7 +424,6 @@ impl ViewerApp {
                             self.cursor_row(ui, &by_id, p.y, t);
                         }
                     }
-                    let _ = pid;
                     ui.add_space(4.0);
                 }
                 if !self.markers.is_empty() {
@@ -426,19 +515,6 @@ impl ViewerApp {
     }
 
     fn iter_plots(&self) -> Vec<(PlotId, &PlotKind)> {
-        // Iterate dock leaves so the cursor panel lists plots in display
-        // order. (DockState doesn't expose an ordered iterator over all
-        // tabs in 0.14, so just use the registry order.)
-        let mut out: Vec<(PlotId, &PlotKind)> = Vec::new();
-        for (id, kind) in self.plots_iter() {
-            out.push((id, kind));
-        }
-        out
-    }
-
-    fn plots_iter(&self) -> Vec<(PlotId, &PlotKind)> {
-        // PlotRegistry doesn't expose a public iter; collect via known ids
-        // from the dock plus any orphans (none expected).
         let mut ids = Vec::new();
         for (_, node) in self.dock.iter_all_nodes() {
             if let egui_dock::Node::Leaf { tabs, .. } = node {
@@ -458,6 +534,7 @@ impl eframe::App for ViewerApp {
         self.poll_redraw(ctx);
         self.handle_global_keys(ctx);
         self.top_bar(ctx);
+        self.connection_dialog(ctx);
         self.tree_panel(ctx);
         self.cursor_panel(ctx);
 
@@ -551,23 +628,28 @@ impl<'a> TabViewer for ViewerTabs<'a> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         let pid = *tab;
-        let Some(view) = self.view else {
-            ui.centered_and_justified(|ui| ui.label("waiting for data…"));
-            return;
-        };
 
-        // Drop zone covering the whole tab. egui's dnd_drop_zone returns the
-        // payload on drop frame.
         let dropped = ui
             .dnd_drop_zone::<DragPayload, _>(egui::Frame::none(), |ui| {
-                let title = self.plots.get(pid).map(|k| k.title().to_string());
-                if let Some(title) = title {
-                    let kind_clone = self.plots.get(pid).cloned();
-                    if let Some(kind) = kind_clone {
-                        match kind {
-                            PlotKind::TimeSeries(_) => self.draw_timeseries(ui, pid, view, &title),
-                            PlotKind::XY(_) => self.draw_xy(ui, pid, view, &title),
-                        }
+                let kind_clone = self.plots.get(pid).cloned();
+                let Some(kind) = kind_clone else { return };
+                let mut ctx = PlotContext {
+                    store: self.store,
+                    plots: self.plots,
+                    view: self.view,
+                    by_id: self.by_id,
+                    cam: self.cam,
+                    markers: self.markers,
+                    dragging_marker: self.dragging_marker,
+                    cursor_t: self.cursor_t,
+                    cursor_last_set: self.cursor_last_set,
+                };
+                match kind {
+                    PlotKind::TimeSeries(panel) => {
+                        plot_renderers::render_timeseries(ui, &mut ctx, pid.0, &panel);
+                    }
+                    PlotKind::XY(xy) => {
+                        plot_renderers::render_xy(ui, &mut ctx, pid.0, &xy);
                     }
                 }
             })
@@ -589,8 +671,12 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     if let Some((x, y)) = self.xy_drag.feed(ch) {
                         let title = format!(
                             "XY {} vs {}",
-                            short_path(self.by_id.get(&x).map(|i| i.path.as_str()).unwrap_or("?")),
-                            short_path(self.by_id.get(&y).map(|i| i.path.as_str()).unwrap_or("?")),
+                            plot_renderers::short_name(
+                                self.by_id.get(&x).map(|i| i.path.as_str()).unwrap_or("?"),
+                            ),
+                            plot_renderers::short_name(
+                                self.by_id.get(&y).map(|i| i.path.as_str()).unwrap_or("?"),
+                            ),
                         );
                         self.new_plots.push(PlotKind::XY(XYPlot {
                             title,
@@ -605,501 +691,3 @@ impl<'a> TabViewer for ViewerTabs<'a> {
     }
 }
 
-impl<'a> ViewerTabs<'a> {
-    fn draw_timeseries(&mut self, ui: &mut egui::Ui, pid: PlotId, view: (u64, u64), title: &str) {
-        let plot_kind = self.plots.get(pid).cloned();
-        let Some(PlotKind::TimeSeries(panel)) = plot_kind else {
-            return;
-        };
-        let (t0, t1) = view;
-        let width_px = ui.available_width().max(64.0);
-        let max_buckets = ((width_px as f64) * MAX_BUCKETS_PER_PIXEL) as usize;
-        let max_buckets = max_buckets.max(MIN_PLOT_BUCKETS);
-
-        let lanes = panel.states.len();
-        let lane_h = 24.0;
-        let scalar_h = (ui.available_height() - lanes as f32 * (lane_h + 6.0) - 8.0).max(80.0);
-
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(title).strong());
-            ui.label(
-                egui::RichText::new(if self.cam.follow {
-                    "[follow]"
-                } else {
-                    "[free]"
-                })
-                .small()
-                .weak(),
-            );
-        });
-
-        let interactive = !self.cam.follow;
-        let mut hover_t: Option<f64> = None;
-
-        let scalar_plot = Plot::new(egui::Id::new(("scalar", pid.0)))
-            .height(scalar_h)
-            .legend(egui_plot::Legend::default())
-            .allow_drag(false) // we handle pan/zoom ourselves
-            .allow_zoom(false)
-            .allow_scroll(false)
-            .allow_boxed_zoom(false)
-            .allow_double_click_reset(false);
-
-        let inner = scalar_plot.show(ui, |pui| {
-            let mut ymin = f64::INFINITY;
-            let mut ymax = f64::NEG_INFINITY;
-            for (idx, ch) in panel.scalars.iter().enumerate() {
-                let bs: Vec<Bucket> = self.store.query_scalar(*ch, t0, t1, max_buckets);
-                if bs.is_empty() {
-                    continue;
-                }
-                for b in &bs {
-                    if b.min < ymin {
-                        ymin = b.min;
-                    }
-                    if b.max > ymax {
-                        ymax = b.max;
-                    }
-                }
-                // Mid line (solid). Min/max envelope drawn as dashed lines
-                // in the same hue; they collapse onto the mid when LOD is
-                // not aggregating, so they're invisible at raw zoom.
-                let mids: PlotPoints = bs
-                    .iter()
-                    .map(|b| [(b.t as f64) / 1e9, (b.min + b.max) * 0.5])
-                    .collect();
-                let mins: PlotPoints =
-                    bs.iter().map(|b| [(b.t as f64) / 1e9, b.min]).collect();
-                let maxs: PlotPoints =
-                    bs.iter().map(|b| [(b.t as f64) / 1e9, b.max]).collect();
-                let name = self
-                    .by_id
-                    .get(ch)
-                    .map(|c| c.path.clone())
-                    .unwrap_or_default();
-                let colour = palette(idx);
-                let envelope = colour.linear_multiply(0.6);
-                pui.line(
-                    Line::new(mins)
-                        .color(envelope)
-                        .style(LineStyle::dashed_loose())
-                        .name(format!("{name} (min)")),
-                );
-                pui.line(
-                    Line::new(maxs)
-                        .color(envelope)
-                        .style(LineStyle::dashed_loose())
-                        .name(format!("{name} (max)")),
-                );
-                pui.line(Line::new(mids).color(colour).name(name));
-            }
-
-            let xmin = (t0 as f64) / 1e9;
-            let xmax = (t1 as f64) / 1e9;
-            let (ylo, yhi) = if ymin.is_finite() && ymax.is_finite() && ymax > ymin {
-                let pad = (ymax - ymin) * 0.05;
-                (ymin - pad, ymax + pad)
-            } else {
-                (-1.0, 1.0)
-            };
-            pui.set_plot_bounds(PlotBounds::from_min_max([xmin, ylo], [xmax, yhi]));
-
-            // Markers (draggable, clickable). Selected marker drawn thicker.
-            // Pair connector + Δt label rendered per pair near the top.
-            let sel = self.markers.selected;
-            for m in self.markers.markers.iter() {
-                let col = Color32::from_rgb(m.color[0], m.color[1], m.color[2]);
-                let selected = Some(m.id) == sel;
-                pui.vline(
-                    VLine::new((m.t_ns as f64) / 1e9)
-                        .color(col)
-                        .width(if selected { 3.0 } else { 1.5 })
-                        .name(&m.label),
-                );
-            }
-            // Pair Δt labels near top of the plot.
-            for (a, b) in self.markers.unique_pairs() {
-                let xa = (a.t_ns as f64) / 1e9;
-                let xb = (b.t_ns as f64) / 1e9;
-                let mid = (xa + xb) * 0.5;
-                let label_y = yhi - (yhi - ylo) * 0.04;
-                pui.text(
-                    Text::new(
-                        PlotPoint::new(mid, label_y),
-                        egui::RichText::new(format!("Δt = {:+.4}s", xb - xa))
-                            .monospace()
-                            .background_color(Color32::from_rgba_unmultiplied(0, 0, 0, 180))
-                            .color(Color32::WHITE),
-                    )
-                    .anchor(egui::Align2::CENTER_CENTER),
-                );
-                // Subtle horizontal connector line.
-                pui.line(
-                    Line::new(PlotPoints::from(vec![[xa, label_y], [xb, label_y]]))
-                        .color(Color32::from_rgba_unmultiplied(255, 255, 255, 90))
-                        .width(1.0),
-                );
-            }
-            if let Some(p) = pui.pointer_coordinate() {
-                hover_t = Some(p.x);
-            }
-        });
-
-        // Custom camera: middle-mouse pan, wheel zoom.
-        self.handle_camera(ui, &inner.response, &inner.transform, interactive);
-
-        // Marker drag.
-        self.handle_marker_drag(ui, &inner.response, &inner.transform);
-
-        if inner.response.hovered() {
-            if let Some(t_s) = hover_t {
-                *self.cursor_t = Some((t_s.max(0.0) * 1e9) as u64);
-                *self.cursor_last_set = Some(Instant::now());
-            }
-        }
-
-        // ----- state lanes -----
-        for (lane_idx, ch) in panel.states.iter().enumerate() {
-            let Some(info) = self.by_id.get(ch) else {
-                continue;
-            };
-            let labels = match &info.kind {
-                ChannelKind::State { labels } => labels.clone(),
-                _ => continue,
-            };
-            let runs = self.store.query_state(*ch, t0, t1);
-            let lane_plot = Plot::new(egui::Id::new(("lane", pid.0, *ch)))
-                .height(lane_h)
-                .show_axes([false, false])
-                .show_grid(false)
-                .allow_drag(false)
-                .allow_zoom(false)
-                .allow_scroll(false);
-            let lane_resp = lane_plot.show(ui, |pui| {
-                let xmin = (t0 as f64) / 1e9;
-                let xmax = (t1 as f64) / 1e9;
-                pui.set_plot_bounds(PlotBounds::from_min_max([xmin, 0.0], [xmax, 1.0]));
-                let px_per_sec = pui.transform().dpos_dvalue_x();
-                let mut bars: Vec<Bar> = Vec::with_capacity(runs.len());
-                let mut texts: Vec<(f64, String, Color32)> = Vec::with_capacity(runs.len());
-                for r in &runs {
-                    let s = (r.t_start.max(t0) as f64) / 1e9;
-                    let e = (r.t_end.min(t1) as f64) / 1e9;
-                    let mid = (s + e) / 2.0;
-                    let w = (e - s).max(1e-9);
-                    let label = labels
-                        .get(r.value as usize)
-                        .cloned()
-                        .unwrap_or_else(|| r.value.to_string());
-                    let fill = state_colour(lane_idx, r.value);
-                    bars.push(
-                        Bar::new(mid, 1.0)
-                            .width(w)
-                            .name(format!("{}: {label}", info.path))
-                            .fill(fill),
-                    );
-                    let bar_px = w * px_per_sec;
-                    let chars = ((bar_px / 7.0).floor() as i64).max(0) as usize;
-                    let fitted = fit_label(&label, chars);
-                    if !fitted.is_empty() {
-                        texts.push((mid, fitted, contrast_text_colour(fill)));
-                    }
-                }
-                pui.bar_chart(BarChart::new(bars));
-                for (mid, t, col) in texts {
-                    pui.text(
-                        Text::new(PlotPoint::new(mid, 0.5), egui::RichText::new(t).monospace())
-                            .color(col)
-                            .anchor(egui::Align2::CENTER_CENTER),
-                    );
-                }
-                // Channel name pinned to the left edge of the lane, behind
-                // the data. Slight horizontal pad so it doesn't sit flush
-                // against the y-axis line.
-                let pad_s = (xmax - xmin) * 0.005;
-                pui.text(
-                    Text::new(
-                        PlotPoint::new(xmin + pad_s, 0.5),
-                        egui::RichText::new(short_path(&info.path))
-                            .monospace()
-                            .color(Color32::from_rgba_unmultiplied(255, 255, 255, 200))
-                            .background_color(Color32::from_rgba_unmultiplied(0, 0, 0, 160)),
-                    )
-                    .anchor(egui::Align2::LEFT_CENTER),
-                );
-                // Markers continue across the lane.
-                let sel = self.markers.selected;
-                for m in self.markers.markers.iter() {
-                    let selected = Some(m.id) == sel;
-                    pui.vline(
-                        VLine::new((m.t_ns as f64) / 1e9)
-                            .color(Color32::from_rgb(m.color[0], m.color[1], m.color[2]))
-                            .width(if selected { 3.0 } else { 1.5 }),
-                    );
-                }
-            });
-            // Right-click context menu to remove this signal.
-            let ch_id = *ch;
-            lane_resp.response.context_menu(|ui| {
-                if ui.button("Remove from plot").clicked() {
-                    if let Some(PlotKind::TimeSeries(p)) = self.plots.get_mut(pid) {
-                        p.remove(ch_id);
-                    }
-                    ui.close_menu();
-                }
-            });
-            // Marker drag also works on the state lane.
-            self.handle_marker_drag(ui, &lane_resp.response, &lane_resp.transform);
-        }
-    }
-
-    fn draw_xy(&mut self, ui: &mut egui::Ui, pid: PlotId, view: (u64, u64), title: &str) {
-        let plot_kind = self.plots.get(pid).cloned();
-        let Some(PlotKind::XY(xy)) = plot_kind else {
-            return;
-        };
-        let (t0, t1) = view;
-
-        ui.label(egui::RichText::new(title).strong());
-
-        // Sample both channels at synchronized timestamps. Use the X channel's
-        // bucket centres as the time grid (cheap, deterministic). For each
-        // bucket, average min/max for a representative point.
-        let bs_x = self.store.query_scalar(xy.x, t0, t1, XY_MAX_POINTS);
-        let mut points: Vec<[f64; 2]> = Vec::with_capacity(bs_x.len());
-        for b in &bs_x {
-            if let Some(yv) = self.store.sample_at(xy.y, b.t) {
-                let xv = (b.min + b.max) * 0.5;
-                points.push([xv, yv]);
-            }
-        }
-
-        let xname = self.by_id.get(&xy.x).map(|c| c.path.as_str()).unwrap_or("?");
-        let yname = self.by_id.get(&xy.y).map(|c| c.path.as_str()).unwrap_or("?");
-
-        let avail = ui.available_size();
-        let plot = Plot::new(egui::Id::new(("xy", pid.0)))
-            .width(avail.x)
-            .height(avail.y - 24.0)
-            .x_axis_label(xname)
-            .y_axis_label(yname)
-            .allow_drag(true)
-            .allow_zoom(true)
-            .allow_scroll(true)
-            .data_aspect(1.0);
-
-        plot.show(ui, |pui| {
-            if !points.is_empty() {
-                pui.line(
-                    Line::new(PlotPoints::from(points))
-                        .color(palette(0))
-                        .name(format!("{xname} vs {yname}")),
-                );
-            }
-        });
-    }
-
-    /// Custom camera handler: middle-mouse pan (free mode only) and wheel
-    /// zoom (always — in follow mode it adjusts `window_ns`, in free mode
-    /// it zooms about the cursor). Also consumes the scroll so it doesn't
-    /// leak into outer scroll containers.
-    fn handle_camera(
-        &mut self,
-        ui: &mut egui::Ui,
-        response: &egui::Response,
-        transform: &egui_plot::PlotTransform,
-        interactive: bool,
-    ) {
-        let bounds = transform.bounds();
-        let cur = (bounds.min()[0], bounds.max()[0]);
-
-        if interactive && response.dragged_by(egui::PointerButton::Middle) {
-            let dx_px = response.drag_delta().x as f64;
-            let scale = (cur.1 - cur.0) / response.rect.width().max(1.0) as f64;
-            self.cam.pan_x(-dx_px * scale, cur);
-        }
-
-        if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y) as f64;
-            if scroll.abs() > 0.5 {
-                let factor = (-scroll * 0.0015).exp();
-                if self.cam.follow {
-                    self.cam.zoom_window(factor);
-                } else {
-                    let pivot_s = response
-                        .hover_pos()
-                        .map(|p| {
-                            let frac = ((p.x - response.rect.min.x) as f64
-                                / response.rect.width().max(1.0) as f64)
-                                .clamp(0.0, 1.0);
-                            cur.0 + frac * (cur.1 - cur.0)
-                        })
-                        .unwrap_or((cur.0 + cur.1) * 0.5);
-                    self.cam.zoom_x(factor, pivot_s, cur);
-                }
-                // Consume so the panel/scroll-area doesn't also react.
-                ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
-            }
-        }
-    }
-
-    /// Combined marker interaction handler:
-    /// - hover near a marker + primary press → start drag
-    /// - drag → snap marker.t_ns to pointer.x
-    /// - click on empty (no drag) → clears selection
-    /// - click on a marker → select it
-    /// - shift+click on empty space (with selection) → create new marker at
-    ///   the click and pair it with the selected
-    /// - shift+click on a different marker (with selection) → pair them
-    fn handle_marker_drag(
-        &mut self,
-        ui: &mut egui::Ui,
-        response: &egui::Response,
-        transform: &egui_plot::PlotTransform,
-    ) {
-        let primary_down = ui.input(|i| i.pointer.primary_down());
-        let shift = ui.input(|i| i.modifiers.shift);
-
-        // -- start drag on press --
-        if response.drag_started_by(egui::PointerButton::Primary) {
-            if let Some(p) = response.hover_pos() {
-                if let Some(id) = self.hit_marker(transform, p.x) {
-                    *self.dragging_marker = Some(id);
-                }
-            }
-        }
-
-        // -- update drag --
-        if let Some(id) = *self.dragging_marker {
-            if let Some(p) = response
-                .hover_pos()
-                .or_else(|| response.interact_pointer_pos())
-            {
-                let new_t_s = transform.value_from_position(p).x.max(0.0);
-                if let Some(m) = self.markers.get_mut(id) {
-                    m.t_ns = (new_t_s * 1e9) as u64;
-                }
-            }
-        }
-
-        if !primary_down {
-            *self.dragging_marker = None;
-        }
-
-        // -- click (selection / pair) --
-        if response.clicked_by(egui::PointerButton::Primary) {
-            let pos = response.interact_pointer_pos().or_else(|| response.hover_pos());
-            let hit = pos.and_then(|p| self.hit_marker(transform, p.x));
-            match (shift, self.markers.selected, hit, pos) {
-                // Shift+click on empty with a selection: spawn a paired marker.
-                (true, Some(sel), None, Some(p)) => {
-                    let t_s = transform.value_from_position(p).x.max(0.0);
-                    let t_ns = (t_s * 1e9) as u64;
-                    let palette: [[u8; 3]; 6] = [
-                        [220, 80, 80],
-                        [80, 200, 120],
-                        [80, 130, 220],
-                        [220, 180, 60],
-                        [180, 100, 200],
-                        [60, 200, 200],
-                    ];
-                    let n = self.markers.len();
-                    let _ = self
-                        .markers
-                        .add_paired_with(sel, t_ns, palette[n % palette.len()]);
-                }
-                // Shift+click on a different existing marker: pair them.
-                (true, Some(sel), Some(id), _) if id != sel => {
-                    // Only pair if neither is already paired.
-                    let a_free = self.markers.get(sel).is_some_and(|m| m.pair.is_none());
-                    let b_free = self.markers.get(id).is_some_and(|m| m.pair.is_none());
-                    if a_free && b_free {
-                        if let Some(b) = self.markers.get_mut(id) {
-                            b.pair = Some(sel);
-                        }
-                        if let Some(a) = self.markers.get_mut(sel) {
-                            a.pair = Some(id);
-                        }
-                    }
-                }
-                // Plain click on a marker: select it.
-                (false, _, Some(id), _) => {
-                    self.markers.select(Some(id));
-                }
-                // Plain click on empty: clear selection.
-                (false, _, None, _) => {
-                    self.markers.select(None);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Return the id of the closest marker within 6 px of `pointer_x_screen`.
-    fn hit_marker(
-        &self,
-        transform: &egui_plot::PlotTransform,
-        pointer_x_screen: f32,
-    ) -> Option<u64> {
-        let mut best: Option<(u64, f32)> = None;
-        for m in self.markers.markers.iter() {
-            let mx = transform.position_from_point_x((m.t_ns as f64) / 1e9);
-            let dx = (mx - pointer_x_screen).abs();
-            if dx <= 6.0 && best.is_none_or(|(_, d)| dx < d) {
-                best = Some((m.id, dx));
-            }
-        }
-        best.map(|(id, _)| id)
-    }
-}
-
-fn short_path(p: &str) -> &str {
-    p.rsplit('.').next().unwrap_or(p)
-}
-
-fn palette(i: usize) -> Color32 {
-    const P: &[(u8, u8, u8)] = &[
-        (76, 114, 176),
-        (221, 132, 82),
-        (85, 168, 104),
-        (196, 78, 82),
-        (129, 114, 179),
-        (147, 120, 96),
-        (218, 139, 195),
-        (140, 140, 140),
-        (204, 185, 116),
-        (100, 182, 205),
-    ];
-    let (r, g, b) = P[i % P.len()];
-    Color32::from_rgb(r, g, b)
-}
-
-fn state_colour(channel_idx: usize, value: u32) -> Color32 {
-    let h = (channel_idx as u32)
-        .wrapping_mul(2654435761)
-        .wrapping_add(value.wrapping_mul(40503));
-    let r = ((h >> 16) & 0xff) as u8;
-    let g = ((h >> 8) & 0xff) as u8;
-    let b = (h & 0xff) as u8;
-    Color32::from_rgb(
-        ((r as u16 + 96) / 2) as u8,
-        ((g as u16 + 96) / 2) as u8,
-        ((b as u16 + 96) / 2) as u8,
-    )
-}
-
-/// Pick black or white text based on background luminance.
-fn contrast_text_colour(bg: Color32) -> Color32 {
-    let lum = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
-    if lum > 140.0 {
-        Color32::BLACK
-    } else {
-        Color32::WHITE
-    }
-}
-
-// Suppress dead-code warning for NodeIndex import — kept for future use.
-#[allow(dead_code)]
-fn _nidx_keepalive() -> NodeIndex {
-    NodeIndex::root()
-}
