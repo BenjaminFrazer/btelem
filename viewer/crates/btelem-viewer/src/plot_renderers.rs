@@ -23,6 +23,10 @@ const PX_PER_CHAR: f64 = 7.0;
 /// visible (zoomed in far enough that LOD aggregation is no longer hiding
 /// individual samples).
 const SCATTER_THRESHOLD: usize = 40;
+/// Minimum width reserved for the y-axis label gutter. Applied to both the
+/// scalar plot and every state lane so their plot regions line up
+/// horizontally regardless of tick label content.
+const Y_AXIS_GUTTER: f32 = 48.0;
 
 // ============================================================================
 //  Public entry points
@@ -187,6 +191,7 @@ fn render_scalar_section(
 
     let plot = Plot::new(egui::Id::new(("scalar", pid)))
         .height(height)
+        .y_axis_min_width(Y_AXIS_GUTTER)
         .legend(egui_plot::Legend::default())
         .allow_drag(false)
         .allow_zoom(false)
@@ -391,7 +396,9 @@ fn render_state_lane(
 
     let plot = Plot::new(egui::Id::new(("lane", pid, ch)))
         .height(height)
-        .show_axes([false, false])
+        .show_axes([false, true])
+        .y_axis_min_width(Y_AXIS_GUTTER)
+        .y_axis_formatter(|_, _| String::new())
         .show_grid(false)
         .allow_drag(false)
         .allow_zoom(false)
