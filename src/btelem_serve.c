@@ -9,8 +9,35 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #define BTELEM_SERVE_PKT_BUF    65536
+
+/* TCP keepalive parameters for shedding viewers that vanished without
+ * sending FIN (e.g. cable yanked, host crash).  Tuned for "notice within
+ * ~25s" which is plenty for a developer-facing telemetry stream. */
+#define BTELEM_KEEPALIVE_IDLE_S    10
+#define BTELEM_KEEPALIVE_INTVL_S   5
+#define BTELEM_KEEPALIVE_PROBES    3
+
+/* Returns 1 if the peer has closed the connection (FIN received), 0 if the
+ * socket still looks healthy, -1 on any other error.  Non-blocking MSG_PEEK
+ * does not consume data — important because the server never reads from
+ * client sockets in normal operation. */
+static int peer_closed(int fd)
+{
+    uint8_t b;
+    ssize_t n = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0)
+        return 1; /* orderly close: peer sent FIN */
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return 0; /* no data, no FIN — connection still up */
+        return -1; /* ECONNRESET, etc. — treat as closed by caller */
+    }
+    return 0; /* peer sent unexpected data — connection still up */
+}
 
 /* --------------------------------------------------------------------------
  * Helpers
@@ -122,6 +149,19 @@ static void *client_thread(void *arg)
             empty_drains = 0;
         } else {
             empty_drains++;
+            /* Cheap liveness probe: detect viewers that quietly went away
+             * without sending us data we'd otherwise stumble over.  Without
+             * this the drain loop happily spins forever and the slot is
+             * never reclaimed. */
+            if ((empty_drains & 0xFF) == 0) {
+                int pc = peer_closed(conn->fd);
+                if (pc != 0) {
+                    fprintf(stderr, "btelem_serve: client %d peer gone "
+                            "(peer_closed=%d) — disconnecting\n",
+                            conn->btelem_client_id, pc);
+                    break;
+                }
+            }
             usleep(1000);
         }
 
@@ -176,8 +216,25 @@ static void *accept_thread(void *arg)
         if (fd < 0)
             break;
 
+        /* Enable TCP keepalive so the kernel notices half-open connections
+         * even when we have nothing to write (idle drain loop). */
+        {
+            int one = 1;
+            int idle = BTELEM_KEEPALIVE_IDLE_S;
+            int intvl = BTELEM_KEEPALIVE_INTVL_S;
+            int cnt = BTELEM_KEEPALIVE_PROBES;
+            setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  &one,   sizeof(one));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+        }
+
         int btelem_cid = btelem_client_open(srv->ctx, NULL, 0);
         if (btelem_cid < 0) {
+            fprintf(stderr, "btelem_serve: refusing client — "
+                    "btelem_client_open() failed "
+                    "(all %d btelem client slots in use)\n",
+                    BTELEM_MAX_CLIENTS);
             close(fd);
             continue;
         }
