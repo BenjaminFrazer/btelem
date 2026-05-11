@@ -211,7 +211,7 @@ fn render_scalar_section(
         egui::Sense::click_and_drag(),
     );
     handle_marker_interaction(ui, ctx, &drag, &inner.transform);
-    handle_camera(ui, ctx.cam, &inner.response, &inner.transform, interactive);
+    handle_camera(ui, ctx.cam, &drag, &inner.transform, interactive);
 
     if let Some(t_s) = hover_t {
         if inner.response.hovered() || drag.hovered() {
