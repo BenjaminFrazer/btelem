@@ -203,8 +203,8 @@ fn render_scalar_section(
     handle_marker_interaction(ui, ctx, &drag, &inner.transform);
     handle_camera(ui, ctx.cam, &inner.response, &inner.transform, interactive);
 
-    if inner.response.hovered() {
-        if let Some(t_s) = hover_t {
+    if let Some(t_s) = hover_t {
+        if inner.response.hovered() || drag.hovered() {
             *ctx.cursor_t = Some((t_s.max(0.0) * 1e9) as u64);
             *ctx.cursor_last_set = Some(std::time::Instant::now());
         }
