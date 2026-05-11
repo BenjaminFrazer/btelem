@@ -18,8 +18,7 @@ use egui_dock::{DockArea, DockState, Style, TabViewer};
 use crate::plot_renderers::{self, PlotContext};
 use crate::view_state::{
     compute_view, group_by_struct, matches_query, Camera, Connection, MarkerSet, PlotId, PlotKind,
-    PlotRegistry, Protocol, RateEstimator, TimeSeriesPlot, XYDragAccumulator, XYPlot,
-    MARKER_PALETTE,
+    PlotRegistry, Protocol, RateEstimator, TimeBase, TimeSeriesPlot, XYDragAccumulator, XYPlot,
 };
 use crate::Args;
 
@@ -56,6 +55,10 @@ pub struct ViewerApp {
     // Markers.
     markers: MarkerSet,
     dragging_marker: Option<u64>,
+    /// True when "marker mode" is active: left-click on a plot places a
+    /// marker, shift+left-click places a paired marker. Toggled by the M
+    /// key or the marker button in the top bar.
+    marker_mode: bool,
 
     // Throughput readout.
     last_revision: u64,
@@ -102,6 +105,7 @@ impl ViewerApp {
             cursor_last_set: None,
             markers: MarkerSet::new(),
             dragging_marker: None,
+            marker_mode: false,
             last_revision: 0,
             rate: RateEstimator::new(2.0),
             pending_connection: connection.clone(),
@@ -168,19 +172,11 @@ impl ViewerApp {
             .collect()
     }
 
-    fn add_marker_at_cursor(&mut self) {
-        if let Some(t) = self.cursor_t {
-            let n = self.markers.len();
-            let id = self.markers.add(t, MARKER_PALETTE[n % MARKER_PALETTE.len()]);
-            self.markers.select(Some(id));
-        }
-    }
-
     fn handle_global_keys(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
             if i.key_pressed(egui::Key::F) {
-                self.cam.follow = !self.cam.follow;
-                if self.cam.follow {
+                self.cam.mode = self.cam.mode.cycle();
+                if self.cam.mode == TimeBase::Follow {
                     self.cam.free_bounds_s = None;
                 }
             }
@@ -188,10 +184,16 @@ impl ViewerApp {
                 self.cam.reset();
             }
             if i.key_pressed(egui::Key::M) {
-                self.add_marker_at_cursor();
+                self.marker_mode = !self.marker_mode;
+            }
+            if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+                if let Some(sel) = self.markers.selected {
+                    self.markers.remove(sel);
+                }
             }
             if i.key_pressed(egui::Key::Escape) {
                 self.xy_drag.cancel();
+                self.marker_mode = false;
             }
         });
     }
@@ -210,24 +212,34 @@ impl ViewerApp {
                     self.connection_dialog_open = true;
                 }
                 ui.separator();
-                let was_follow = self.cam.follow;
-                ui.checkbox(&mut self.cam.follow, "follow (f)");
-                if !was_follow && self.cam.follow {
-                    self.cam.free_bounds_s = None;
+                ui.label("timebase:");
+                for mode in [TimeBase::Follow, TimeBase::Max, TimeBase::Pan] {
+                    let resp = ui.selectable_label(self.cam.mode == mode, mode.label());
+                    if resp.clicked() && self.cam.mode != mode {
+                        let prev = self.cam.mode;
+                        self.cam.mode = mode;
+                        if mode == TimeBase::Follow {
+                            self.cam.free_bounds_s = None;
+                        }
+                        let _ = prev;
+                    }
                 }
-                ui.label("window:");
-                let mut secs = (self.cam.window_ns as f64) / 1e9;
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut secs)
-                            .range(0.1..=3600.0)
-                            .speed(0.1),
-                    )
-                    .changed()
-                {
-                    self.cam.window_ns = (secs * 1e9) as u64;
+                ui.label("(f)").on_hover_text("press F to cycle");
+                if self.cam.mode == TimeBase::Follow {
+                    ui.label("window:");
+                    let mut secs = (self.cam.window_ns as f64) / 1e9;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut secs)
+                                .range(0.1..=3600.0)
+                                .speed(0.1),
+                        )
+                        .changed()
+                    {
+                        self.cam.window_ns = (secs * 1e9) as u64;
+                    }
+                    ui.label("s");
                 }
-                ui.label("s");
                 ui.separator();
                 if ui.button("+ TimeSeries").clicked() {
                     let title = format!("plot {}", self.next_plot_num);
@@ -237,8 +249,16 @@ impl ViewerApp {
                         .insert(PlotKind::TimeSeries(TimeSeriesPlot::new(title)));
                     self.dock.push_to_focused_leaf(id);
                 }
-                if ui.button("⌖ marker (m)").clicked() {
-                    self.add_marker_at_cursor();
+                let marker_btn =
+                    egui::SelectableLabel::new(self.marker_mode, "⌖ marker mode (m)");
+                if ui
+                    .add(marker_btn)
+                    .on_hover_text(
+                        "click to place markers; shift+click for paired; Delete to remove",
+                    )
+                    .clicked()
+                {
+                    self.marker_mode = !self.marker_mode;
                 }
                 if ui.button("Home").on_hover_text("reset camera").clicked() {
                     self.cam.reset();
@@ -554,6 +574,7 @@ impl eframe::App for ViewerApp {
             cursor_last_set: &mut self.cursor_last_set,
             markers: &mut self.markers,
             dragging_marker: &mut self.dragging_marker,
+            marker_mode: self.marker_mode,
             xy_drag: &mut self.xy_drag,
             new_plots: Vec::new(),
             removed: Vec::new(),
@@ -601,6 +622,7 @@ struct ViewerTabs<'a> {
     cursor_last_set: &'a mut Option<Instant>,
     markers: &'a mut MarkerSet,
     dragging_marker: &'a mut Option<u64>,
+    marker_mode: bool,
     xy_drag: &'a mut XYDragAccumulator,
     new_plots: Vec<PlotKind>,
     removed: Vec<PlotId>,
@@ -641,6 +663,7 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     cam: self.cam,
                     markers: self.markers,
                     dragging_marker: self.dragging_marker,
+                    marker_mode: self.marker_mode,
                     cursor_t: self.cursor_t,
                     cursor_last_set: self.cursor_last_set,
                 };

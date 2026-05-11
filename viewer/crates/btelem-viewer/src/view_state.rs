@@ -128,19 +128,53 @@ impl PlotRegistry {
     }
 }
 
+/// Time-base controller modes. Cycled by the `F` key (Follow → Max → Pan).
+///
+/// - `Follow`: lock the right edge to the latest sample; show the trailing
+///   `window_ns` of data. Scroll wheel adjusts `window_ns`.
+/// - `Max`: show every sample we have. Scrolling switches to `Pan` and
+///   zooms about the pointer.
+/// - `Pan`: free navigation. Left-drag pans (when not interacting with
+///   markers), middle-drag also pans, scroll zooms about the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeBase {
+    Follow,
+    Max,
+    Pan,
+}
+
+impl TimeBase {
+    pub fn label(self) -> &'static str {
+        match self {
+            TimeBase::Follow => "follow",
+            TimeBase::Max => "max",
+            TimeBase::Pan => "pan",
+        }
+    }
+
+    /// Cycle Follow → Max → Pan → Follow.
+    pub fn cycle(self) -> Self {
+        match self {
+            TimeBase::Follow => TimeBase::Max,
+            TimeBase::Max => TimeBase::Pan,
+            TimeBase::Pan => TimeBase::Follow,
+        }
+    }
+}
+
 /// Camera state. Pure: feed pointer events in, get bounds out.
 #[derive(Debug, Clone)]
 pub struct Camera {
-    pub follow: bool,
+    pub mode: TimeBase,
     pub window_ns: u64,
-    /// Persisted bounds for free mode. Only meaningful when `!follow`.
+    /// Persisted bounds for pan mode. Only meaningful when `mode == Pan`.
     pub free_bounds_s: Option<(f64, f64)>,
 }
 
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            follow: true,
+            mode: TimeBase::Follow,
             window_ns: 10_000_000_000,
             free_bounds_s: None,
         }
@@ -148,18 +182,22 @@ impl Default for Camera {
 }
 
 impl Camera {
-    /// Apply a horizontal pan in plot units (seconds). Switches to free mode
-    /// if currently following.
+    /// Convenience: true while in follow mode. Kept for back-compat with
+    /// callers that just want to know "is the right edge auto-tracking?".
+    pub fn follow(&self) -> bool {
+        self.mode == TimeBase::Follow
+    }
+
+    /// Apply a horizontal pan in plot units (seconds). Switches to Pan mode.
     pub fn pan_x(&mut self, delta_s: f64, fallback_bounds: (f64, f64)) {
-        self.follow = false;
+        self.mode = TimeBase::Pan;
         let (lo, hi) = self.free_bounds_s.unwrap_or(fallback_bounds);
         self.free_bounds_s = Some((lo + delta_s, hi + delta_s));
     }
 
-    /// Zoom about a plot-space x coordinate by `factor` (>1 = zoom out,
-    /// <1 = zoom in).
+    /// Zoom about a plot-space x coordinate. Switches to Pan mode.
     pub fn zoom_x(&mut self, factor: f64, pivot_s: f64, fallback_bounds: (f64, f64)) {
-        self.follow = false;
+        self.mode = TimeBase::Pan;
         let (lo, hi) = self.free_bounds_s.unwrap_or(fallback_bounds);
         let new_lo = pivot_s + (lo - pivot_s) * factor;
         let new_hi = pivot_s + (hi - pivot_s) * factor;
@@ -167,23 +205,21 @@ impl Camera {
     }
 
     pub fn reset(&mut self) {
-        self.follow = true;
+        self.mode = TimeBase::Follow;
         self.free_bounds_s = None;
     }
 
     /// Centre the view on `t_ns` while preserving the current visible
-    /// span. Always switches to free mode. Used by event-log row clicks
-    /// and the "go to time" UX.
+    /// span. Always switches to Pan mode.
     pub fn jump_to(&mut self, t_ns: u64, fallback_bounds: (f64, f64)) {
-        self.follow = false;
+        self.mode = TimeBase::Pan;
         let (lo, hi) = self.free_bounds_s.unwrap_or(fallback_bounds);
         let half = ((hi - lo) * 0.5).max(0.001);
         let centre = (t_ns as f64) / 1e9;
         self.free_bounds_s = Some((centre - half, centre + half));
     }
 
-    /// Zoom the follow-mode window by `factor` (>1 = zoom out / longer
-    /// window, <1 = zoom in / shorter). Clamped to a sensible range.
+    /// Zoom the follow-mode window by `factor`. Clamped to a sensible range.
     pub fn zoom_window(&mut self, factor: f64) {
         let new = (self.window_ns as f64 * factor).clamp(1e6, 3.6e12) as u64;
         self.window_ns = new.max(1);
@@ -193,16 +229,22 @@ impl Camera {
 /// Compute the visible time window in nanoseconds.
 pub fn compute_view(cam: &Camera, data: Option<(u64, u64)>) -> Option<(u64, u64)> {
     let (earliest, latest) = data?;
-    if cam.follow {
-        let left = latest.saturating_sub(cam.window_ns).max(earliest);
-        let right = latest.max(left + 1);
-        Some((left, right))
-    } else if let Some((a, b)) = cam.free_bounds_s {
-        let lo = (a.max(0.0) * 1e9) as u64;
-        let hi = (b.max(0.0) * 1e9) as u64;
-        Some((lo.min(hi), hi.max(lo + 1)))
-    } else {
-        Some((earliest, latest.max(earliest + 1)))
+    match cam.mode {
+        TimeBase::Follow => {
+            let left = latest.saturating_sub(cam.window_ns).max(earliest);
+            let right = latest.max(left + 1);
+            Some((left, right))
+        }
+        TimeBase::Max => Some((earliest, latest.max(earliest + 1))),
+        TimeBase::Pan => {
+            if let Some((a, b)) = cam.free_bounds_s {
+                let lo = (a.max(0.0) * 1e9) as u64;
+                let hi = (b.max(0.0) * 1e9) as u64;
+                Some((lo.min(hi), hi.max(lo + 1)))
+            } else {
+                Some((earliest, latest.max(earliest + 1)))
+            }
+        }
     }
 }
 
@@ -500,6 +542,29 @@ impl MarkerSet {
         self.markers.iter_mut().find(|m| m.id == id)
     }
 
+    /// Return each pair exactly once as `(first_placed, second_placed)`
+    /// where order is determined by allocation id (lower id was placed
+    /// first). Useful for sign-aware Δt / Δy colouring.
+    pub fn placement_pairs(&self) -> Vec<(&Marker, &Marker)> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for m in &self.markers {
+            let Some(pid) = m.pair else { continue };
+            if seen.contains(&m.id) {
+                continue;
+            }
+            let Some(p) = self.get(pid) else { continue };
+            seen.insert(m.id);
+            seen.insert(p.id);
+            if m.id <= p.id {
+                out.push((m, p));
+            } else {
+                out.push((p, m));
+            }
+        }
+        out
+    }
+
     /// Return each pair exactly once as `(lo, hi)` ordered by t_ns.
     pub fn unique_pairs(&self) -> Vec<(&Marker, &Marker)> {
         let mut out = Vec::new();
@@ -608,7 +673,7 @@ mod tests {
     #[test]
     fn follow_locks_right_edge() {
         let cam = Camera {
-            follow: true,
+            mode: TimeBase::Follow,
             window_ns: 10_000_000_000,
             free_bounds_s: None,
         };
@@ -619,7 +684,7 @@ mod tests {
     #[test]
     fn follow_clamps_to_earliest_when_window_exceeds_history() {
         let cam = Camera {
-            follow: true,
+            mode: TimeBase::Follow,
             window_ns: 1_000_000_000_000,
             free_bounds_s: None,
         };
@@ -629,12 +694,30 @@ mod tests {
     #[test]
     fn free_uses_explicit_bounds() {
         let cam = Camera {
-            follow: false,
+            mode: TimeBase::Pan,
             window_ns: 10_000_000_000,
             free_bounds_s: Some((1.0, 2.0)),
         };
         let v = compute_view(&cam, Some((0, 100)));
         assert_eq!(v, Some((1_000_000_000, 2_000_000_000)));
+    }
+
+    #[test]
+    fn max_mode_shows_all_data() {
+        let cam = Camera {
+            mode: TimeBase::Max,
+            window_ns: 1,
+            free_bounds_s: Some((1.0, 2.0)), // ignored in Max
+        };
+        let v = compute_view(&cam, Some((42, 4242)));
+        assert_eq!(v, Some((42, 4242)));
+    }
+
+    #[test]
+    fn timebase_cycles() {
+        assert_eq!(TimeBase::Follow.cycle(), TimeBase::Max);
+        assert_eq!(TimeBase::Max.cycle(), TimeBase::Pan);
+        assert_eq!(TimeBase::Pan.cycle(), TimeBase::Follow);
     }
 
     #[test]
@@ -646,32 +729,32 @@ mod tests {
     // ---- camera ----
 
     #[test]
-    fn pan_switches_to_free_mode() {
+    fn pan_switches_to_pan_mode() {
         let mut cam = Camera::default();
         cam.pan_x(1.0, (10.0, 20.0));
-        assert!(!cam.follow);
+        assert_eq!(cam.mode, TimeBase::Pan);
         assert_eq!(cam.free_bounds_s, Some((11.0, 21.0)));
-        cam.pan_x(-2.0, (0.0, 0.0)); // fallback ignored, free_bounds set
+        cam.pan_x(-2.0, (0.0, 0.0));
         assert_eq!(cam.free_bounds_s, Some((9.0, 19.0)));
     }
 
     #[test]
     fn zoom_keeps_pivot_stationary() {
         let mut cam = Camera::default();
-        // Pivot at 5, zoom in by 0.5: 0..10 -> 2.5..7.5
         cam.zoom_x(0.5, 5.0, (0.0, 10.0));
         assert_eq!(cam.free_bounds_s, Some((2.5, 7.5)));
+        assert_eq!(cam.mode, TimeBase::Pan);
     }
 
     #[test]
     fn reset_returns_to_follow() {
         let mut cam = Camera {
-            follow: false,
+            mode: TimeBase::Pan,
             window_ns: 1,
             free_bounds_s: Some((1.0, 2.0)),
         };
         cam.reset();
-        assert!(cam.follow);
+        assert_eq!(cam.mode, TimeBase::Follow);
         assert!(cam.free_bounds_s.is_none());
     }
 
@@ -882,7 +965,7 @@ mod tests {
     #[test]
     fn jump_to_centres_on_t_preserving_span() {
         let mut cam = Camera {
-            follow: false,
+            mode: TimeBase::Pan,
             window_ns: 0,
             free_bounds_s: Some((10.0, 20.0)),
         };
@@ -890,7 +973,7 @@ mod tests {
         let (lo, hi) = cam.free_bounds_s.unwrap();
         assert!((hi - lo - 10.0).abs() < 1e-9, "span should be preserved");
         assert!(((lo + hi) * 0.5 - 50.0).abs() < 1e-9, "centred on 50s");
-        assert!(!cam.follow);
+        assert_eq!(cam.mode, TimeBase::Pan);
     }
 
     // ---- Connection ----

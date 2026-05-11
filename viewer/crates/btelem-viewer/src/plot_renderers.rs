@@ -8,12 +8,12 @@ use std::collections::HashMap;
 use btelem_store::{ChannelId, ChannelInfo, ChannelKind, MockStore, Store};
 use eframe::egui::{self, Color32};
 use egui_plot::{
-    Bar, BarChart, Line, LineStyle, Plot, PlotBounds, PlotPoint, PlotPoints, PlotUi, Points, Text,
-    VLine,
+    Bar, BarChart, Line, LineStyle, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, PlotUi,
+    Points, Text, VLine,
 };
 
 use crate::view_state::{
-    fit_label, Camera, MarkerSet, PlotKind, PlotRegistry, TimeSeriesPlot, XYPlot,
+    fit_label, Camera, MarkerSet, PlotKind, PlotRegistry, TimeBase, TimeSeriesPlot, XYPlot,
 };
 
 /// Pixels per character used to truncate state-lane labels. Matches the
@@ -51,7 +51,7 @@ pub fn render_timeseries(
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(&panel.title).strong());
         ui.label(
-            egui::RichText::new(if ctx.cam.follow { "[follow]" } else { "[free]" })
+            egui::RichText::new(format!("[{}]", ctx.cam.mode.label()))
                 .small()
                 .weak(),
         );
@@ -125,6 +125,7 @@ pub struct PlotContext<'a> {
     pub cam: &'a mut Camera,
     pub markers: &'a mut MarkerSet,
     pub dragging_marker: &'a mut Option<u64>,
+    pub marker_mode: bool,
     pub cursor_t: &'a mut Option<u64>,
     pub cursor_last_set: &'a mut Option<std::time::Instant>,
 }
@@ -181,7 +182,7 @@ fn render_scalar_section(
         (-1.0, 1.0)
     };
 
-    let interactive = !ctx.cam.follow;
+    let interactive = ctx.cam.mode != TimeBase::Follow;
     let mut hover_t: Option<f64> = None;
 
     let plot = Plot::new(egui::Id::new(("scalar", pid)))
@@ -211,7 +212,18 @@ fn render_scalar_section(
         egui::Sense::click_and_drag(),
     );
     handle_marker_interaction(ui, ctx, &drag, &inner.transform);
-    handle_camera(ui, ctx.cam, &drag, &inner.transform, interactive);
+    // Primary-button drag for camera pan is only available when the marker
+    // system isn't holding it (no marker is being dragged, no marker hit
+    // under cursor on press, and we're not in marker-mode placement).
+    let primary_drag_available = ctx.dragging_marker.is_none() && !ctx.marker_mode;
+    handle_camera(
+        ui,
+        ctx.cam,
+        &drag,
+        &inner.transform,
+        interactive,
+        primary_drag_available,
+    );
 
     if let Some(t_s) = hover_t {
         if inner.response.hovered() || drag.hovered() {
@@ -265,7 +277,7 @@ fn draw_signal(pui: &mut PlotUi, sig: &SignalData) {
 //  Markers + pair overlays
 // ============================================================================
 
-/// Render every marker as a VLine. Selected one drawn thicker.
+/// Render every marker as a dashed VLine. Selected one drawn thicker.
 pub fn render_markers(pui: &mut PlotUi, markers: &MarkerSet) {
     let sel = markers.selected;
     for m in markers.markers.iter() {
@@ -274,24 +286,32 @@ pub fn render_markers(pui: &mut PlotUi, markers: &MarkerSet) {
         pui.vline(
             VLine::new((m.t_ns as f64) / 1e9)
                 .color(col)
+                .style(LineStyle::dashed_loose())
                 .width(if selected { 3.0 } else { 1.5 })
                 .name(&m.label),
         );
     }
 }
 
+const PAIR_POS: Color32 = Color32::from_rgb(120, 180, 255); // light blue
+const PAIR_NEG: Color32 = Color32::from_rgb(255, 130, 130); // light red
+
 /// For each pair, draw an L-shape (horizontal Δt + vertical Δy) per signal
-/// connecting the (t, value) intersection points, with dx/dy labels.
+/// connecting the (t, value) intersection points, with dx/dy labels. Lines
+/// are solid; light blue when (second − first) is positive, light red when
+/// negative — for both legs independently.
 fn render_pair_overlays(
     pui: &mut PlotUi,
     markers: &MarkerSet,
     store: &MockStore,
     signals: &[SignalData],
 ) {
-    for (a, b) in markers.unique_pairs() {
+    for (a, b) in markers.placement_pairs() {
+        // a = first placed, b = second placed.
         let xa = (a.t_ns as f64) / 1e9;
         let xb = (b.t_ns as f64) / 1e9;
-        let pair_col = Color32::from_rgba_unmultiplied(255, 255, 255, 110);
+        let dt = xb - xa;
+        let dt_col = if dt >= 0.0 { PAIR_POS } else { PAIR_NEG };
         let label_bg = Color32::from_rgba_unmultiplied(0, 0, 0, 180);
 
         for sig in signals {
@@ -301,32 +321,34 @@ fn render_pair_overlays(
             let Some(vb) = store.sample_at(sig.ch, b.t_ns) else {
                 continue;
             };
-            // Horizontal leg at va, vertical leg at xb.
+            let dy = vb - va;
+            let dy_col = if dy >= 0.0 { PAIR_POS } else { PAIR_NEG };
+
+            // Horizontal leg at va, vertical leg at xb. Solid lines.
             pui.line(
                 Line::new(PlotPoints::from(vec![[xa, va], [xb, va]]))
-                    .color(pair_col)
-                    .style(LineStyle::dashed_dense())
-                    .width(1.0),
+                    .color(dt_col)
+                    .width(1.5),
             );
             pui.line(
                 Line::new(PlotPoints::from(vec![[xb, va], [xb, vb]]))
-                    .color(pair_col)
-                    .style(LineStyle::dashed_dense())
-                    .width(1.0),
+                    .color(dy_col)
+                    .width(1.5),
             );
             pui.points(
                 Points::new(PlotPoints::from(vec![[xa, va], [xb, vb]]))
-                    .color(sig.colour)
-                    .radius(3.5),
+                    .color(Color32::from_rgb(255, 64, 64))
+                    .shape(MarkerShape::Cross)
+                    .radius(6.0),
             );
             let dx_mid = (xa + xb) * 0.5;
             pui.text(
                 Text::new(
                     PlotPoint::new(dx_mid, va),
-                    egui::RichText::new(format!("Δt={:+.4}s", xb - xa))
+                    egui::RichText::new(format!("Δt={dt:+.4}s"))
                         .monospace()
                         .background_color(label_bg)
-                        .color(Color32::WHITE),
+                        .color(dt_col),
                 )
                 .anchor(egui::Align2::CENTER_BOTTOM),
             );
@@ -334,10 +356,10 @@ fn render_pair_overlays(
             pui.text(
                 Text::new(
                     PlotPoint::new(xb, dy_mid),
-                    egui::RichText::new(format!(" Δ{}={:+.4}", short_name(&sig.name), vb - va))
+                    egui::RichText::new(format!(" Δ{}={:+.4}", short_name(&sig.name), dy))
                         .monospace()
                         .background_color(label_bg)
-                        .color(sig.colour),
+                        .color(dy_col),
                 )
                 .anchor(egui::Align2::LEFT_CENTER),
             );
@@ -458,14 +480,27 @@ fn handle_camera(
     response: &egui::Response,
     transform: &egui_plot::PlotTransform,
     interactive: bool,
+    primary_drag_available: bool,
 ) {
     let bounds = transform.bounds();
     let cur = (bounds.min()[0], bounds.max()[0]);
 
-    if interactive && response.dragged_by(egui::PointerButton::Middle) {
-        let dx_px = response.drag_delta().x as f64;
+    // Middle-mouse pan works whenever interactive (Pan or Max). Left-drag
+    // pan is only used in Pan mode and only when no other system (marker
+    // mode, marker drag) wants the primary button.
+    let drag_dx = if interactive
+        && (response.dragged_by(egui::PointerButton::Middle)
+            || (primary_drag_available
+                && cam.mode == TimeBase::Pan
+                && response.dragged_by(egui::PointerButton::Primary)))
+    {
+        response.drag_delta().x as f64
+    } else {
+        0.0
+    };
+    if drag_dx.abs() > 0.0 {
         let scale = (cur.1 - cur.0) / response.rect.width().max(1.0) as f64;
-        cam.pan_x(-dx_px * scale, cur);
+        cam.pan_x(-drag_dx * scale, cur);
     }
 
     // Scroll-zoom: read raw scroll + check pointer is in our rect, rather
@@ -479,7 +514,7 @@ fn handle_camera(
         let scroll = ui.input(|i| i.smooth_scroll_delta.y) as f64;
         if scroll.abs() > 0.5 {
             let factor = (-scroll * 0.0015).exp();
-            if cam.follow {
+            if cam.follow() {
                 cam.zoom_window(factor);
             } else {
                 let pivot_s = ui
@@ -536,6 +571,38 @@ fn handle_marker_interaction(
             .interact_pointer_pos()
             .or_else(|| response.hover_pos());
         let hit = pos.and_then(|p| hit_marker(ctx.markers, transform, p.x));
+
+        // In marker mode, plain click on empty space *places* a free
+        // marker; shift+click places one paired with the most recently
+        // selected (or the last placed if nothing is selected). Hits on
+        // existing markers fall through to the normal select / pair logic.
+        if ctx.marker_mode && hit.is_none() {
+            if let Some(p) = pos {
+                let t_s = transform.value_from_position(p).x.max(0.0);
+                let t_ns = (t_s * 1e9) as u64;
+                let n = ctx.markers.len();
+                let colour =
+                    crate::view_state::MARKER_PALETTE[n % crate::view_state::MARKER_PALETTE.len()];
+                if shift {
+                    let anchor = ctx.markers.selected.or_else(|| {
+                        ctx.markers
+                            .markers
+                            .iter()
+                            .rfind(|m| m.pair.is_none())
+                            .map(|m| m.id)
+                    });
+                    let new_id = anchor
+                        .and_then(|a| ctx.markers.add_paired_with(a, t_ns, colour))
+                        .unwrap_or_else(|| ctx.markers.add(t_ns, colour));
+                    ctx.markers.select(Some(new_id));
+                } else {
+                    let id = ctx.markers.add(t_ns, colour);
+                    ctx.markers.select(Some(id));
+                }
+            }
+            return;
+        }
+
         match (shift, ctx.markers.selected, hit, pos) {
             // Shift+click on empty + selection → spawn paired marker.
             (true, Some(sel), None, Some(p)) => {
