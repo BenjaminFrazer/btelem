@@ -456,8 +456,8 @@ impl ViewerApp {
                         if Some(m.id) == sel {
                             text = format!("► {text}");
                         }
-                        if let Some(pid) = m.pair {
-                            text = format!("{text} ↔ M{pid}");
+                        if let Some(cid) = m.chain {
+                            text = format!("{text} ⛓{cid}");
                         }
                         ui.colored_label(
                             Color32::from_rgb(m.color[0], m.color[1], m.color[2]),

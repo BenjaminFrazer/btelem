@@ -595,7 +595,7 @@ fn handle_marker_interaction(
                         ctx.markers
                             .markers
                             .iter()
-                            .rfind(|m| m.pair.is_none())
+                            .rfind(|m| m.chain.is_none())
                             .map(|m| m.id)
                     });
                     let new_id = anchor

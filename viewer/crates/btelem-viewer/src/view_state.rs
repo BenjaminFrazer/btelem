@@ -432,19 +432,21 @@ pub struct Marker {
     pub t_ns: u64,
     pub label: String,
     pub color: [u8; 3],
-    /// If part of a pair, the partner's id.
-    pub pair: Option<u64>,
+    /// If part of a chain, the chain group id. All markers sharing the
+    /// same chain id are linked into a single ordered chain.
+    pub chain: Option<u64>,
 }
 
-/// Owns the marker list, selection state, and pair links. All mutation
-/// goes through this so invariants (every paired marker references its
-/// partner; deletion of one breaks the pair on the other) are enforced
-/// in one place and can be unit-tested headlessly.
+/// Owns the marker list, selection state, and chain links. All mutation
+/// goes through this so invariants (chains always have ≥ 2 members;
+/// removal dissolves chains that would otherwise become singletons) are
+/// enforced in one place and can be unit-tested headlessly.
 #[derive(Debug, Default)]
 pub struct MarkerSet {
     pub markers: Vec<Marker>,
     pub selected: Option<u64>,
     next_id: u64,
+    next_chain: u64,
 }
 
 impl MarkerSet {
@@ -453,6 +455,7 @@ impl MarkerSet {
             markers: Vec::new(),
             selected: None,
             next_id: 1,
+            next_chain: 1,
         }
     }
 
@@ -462,7 +465,13 @@ impl MarkerSet {
         id
     }
 
-    /// Add a new free (unpaired) marker. Returns the new id.
+    fn alloc_chain(&mut self) -> u64 {
+        let id = self.next_chain;
+        self.next_chain += 1;
+        id
+    }
+
+    /// Add a new free (unchained) marker. Returns the new id.
     pub fn add(&mut self, t_ns: u64, color: [u8; 3]) -> u64 {
         let id = self.alloc_id();
         self.markers.push(Marker {
@@ -470,42 +479,63 @@ impl MarkerSet {
             t_ns,
             label: format!("M{id}"),
             color,
-            pair: None,
+            chain: None,
         });
         id
     }
 
-    /// Create a marker at `t_ns` paired with `anchor_id`. Returns the new
-    /// id, or `None` if the anchor doesn't exist or is already paired.
+    /// Add a marker at `t_ns` and link it into the chain containing
+    /// `anchor_id`. If the anchor is free, a new chain is allocated and
+    /// both anchor and new marker join it. Returns the new id, or `None`
+    /// if the anchor doesn't exist.
+    ///
+    /// This replaces the old "pair" semantics: chains can grow arbitrarily.
     pub fn add_paired_with(&mut self, anchor_id: u64, t_ns: u64, color: [u8; 3]) -> Option<u64> {
         let anchor_idx = self.markers.iter().position(|m| m.id == anchor_id)?;
-        if self.markers[anchor_idx].pair.is_some() {
-            return None;
-        }
+        let chain_id = match self.markers[anchor_idx].chain {
+            Some(c) => c,
+            None => {
+                let c = self.alloc_chain();
+                self.markers[anchor_idx].chain = Some(c);
+                c
+            }
+        };
         let new_id = self.alloc_id();
-        self.markers[anchor_idx].pair = Some(new_id);
         self.markers.push(Marker {
             id: new_id,
             t_ns,
             label: format!("M{new_id}"),
             color,
-            pair: Some(anchor_id),
+            chain: Some(chain_id),
         });
         Some(new_id)
     }
 
     pub fn remove(&mut self, id: u64) {
-        if let Some(idx) = self.markers.iter().position(|m| m.id == id) {
-            let partner = self.markers[idx].pair;
-            self.markers.remove(idx);
-            if let Some(pid) = partner {
-                if let Some(p) = self.markers.iter_mut().find(|m| m.id == pid) {
-                    p.pair = None;
+        let Some(idx) = self.markers.iter().position(|m| m.id == id) else {
+            return;
+        };
+        let chain = self.markers[idx].chain;
+        self.markers.remove(idx);
+        if let Some(cid) = chain {
+            // If the chain has fewer than 2 members left, dissolve it so
+            // singletons go back to being free markers.
+            let remaining: Vec<u64> = self
+                .markers
+                .iter()
+                .filter(|m| m.chain == Some(cid))
+                .map(|m| m.id)
+                .collect();
+            if remaining.len() < 2 {
+                for rid in remaining {
+                    if let Some(m) = self.get_mut(rid) {
+                        m.chain = None;
+                    }
                 }
             }
-            if self.selected == Some(id) {
-                self.selected = None;
-            }
+        }
+        if self.selected == Some(id) {
+            self.selected = None;
         }
     }
 
@@ -513,23 +543,44 @@ impl MarkerSet {
         self.selected = id.filter(|i| self.markers.iter().any(|m| m.id == *i));
     }
 
-    /// Establish a pair link between `a` and `b`. Returns `false` if either
-    /// id doesn't exist, they are equal, or either is already paired with
-    /// someone else.
+    /// Link `a` and `b` into the same chain. If neither has a chain a new
+    /// one is allocated. If exactly one has a chain the other joins it.
+    /// If both already have different chains they are merged (b's chain is
+    /// rewritten to a's). Returns `false` if either id is missing or `a == b`.
     pub fn pair(&mut self, a: u64, b: u64) -> bool {
-        if a == b {
+        if a == b || self.get(a).is_none() || self.get(b).is_none() {
             return false;
         }
-        let a_free = self.get(a).is_some_and(|m| m.pair.is_none());
-        let b_free = self.get(b).is_some_and(|m| m.pair.is_none());
-        if !(a_free && b_free) {
-            return false;
-        }
-        if let Some(m) = self.get_mut(a) {
-            m.pair = Some(b);
-        }
-        if let Some(m) = self.get_mut(b) {
-            m.pair = Some(a);
+        let ca = self.get(a).and_then(|m| m.chain);
+        let cb = self.get(b).and_then(|m| m.chain);
+        match (ca, cb) {
+            (None, None) => {
+                let c = self.alloc_chain();
+                if let Some(m) = self.get_mut(a) {
+                    m.chain = Some(c);
+                }
+                if let Some(m) = self.get_mut(b) {
+                    m.chain = Some(c);
+                }
+            }
+            (Some(c), None) => {
+                if let Some(m) = self.get_mut(b) {
+                    m.chain = Some(c);
+                }
+            }
+            (None, Some(c)) => {
+                if let Some(m) = self.get_mut(a) {
+                    m.chain = Some(c);
+                }
+            }
+            (Some(c1), Some(c2)) if c1 != c2 => {
+                for m in self.markers.iter_mut() {
+                    if m.chain == Some(c2) {
+                        m.chain = Some(c1);
+                    }
+                }
+            }
+            _ => {} // already in same chain
         }
         true
     }
@@ -542,48 +593,55 @@ impl MarkerSet {
         self.markers.iter_mut().find(|m| m.id == id)
     }
 
-    /// Return each pair exactly once as `(first_placed, second_placed)`
-    /// where order is determined by allocation id (lower id was placed
-    /// first). Useful for sign-aware Δt / Δy colouring.
+    /// Iterate the chain containing `id` in placement order (ascending id),
+    /// or an empty vec if the marker is free / missing.
+    pub fn chain_of(&self, id: u64) -> Vec<&Marker> {
+        let Some(cid) = self.get(id).and_then(|m| m.chain) else {
+            return Vec::new();
+        };
+        self.chain_members(cid)
+    }
+
+    fn chain_members(&self, cid: u64) -> Vec<&Marker> {
+        let mut v: Vec<&Marker> = self
+            .markers
+            .iter()
+            .filter(|m| m.chain == Some(cid))
+            .collect();
+        v.sort_by_key(|m| m.id);
+        v
+    }
+
+    fn chain_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.markers.iter().filter_map(|m| m.chain).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Return every consecutive segment in every chain as
+    /// `(earlier_placed, later_placed)` ordered by allocation id. With
+    /// 3-marker chain `[M1, M2, M3]` this yields `[(M1, M2), (M2, M3)]`.
     pub fn placement_pairs(&self) -> Vec<(&Marker, &Marker)> {
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for m in &self.markers {
-            let Some(pid) = m.pair else { continue };
-            if seen.contains(&m.id) {
-                continue;
-            }
-            let Some(p) = self.get(pid) else { continue };
-            seen.insert(m.id);
-            seen.insert(p.id);
-            if m.id <= p.id {
-                out.push((m, p));
-            } else {
-                out.push((p, m));
+        for cid in self.chain_ids() {
+            let chain = self.chain_members(cid);
+            for w in chain.windows(2) {
+                out.push((w[0], w[1]));
             }
         }
         out
     }
 
-    /// Return each pair exactly once as `(lo, hi)` ordered by t_ns.
+    /// Return every consecutive segment in every chain ordered by `t_ns`
+    /// rather than placement order. Segments use the same id-based
+    /// adjacency as `placement_pairs` (so M1→M2→M3 by id, not re-sorted by
+    /// time) — only each segment's tuple is reordered so `lo.t_ns <= hi.t_ns`.
     pub fn unique_pairs(&self) -> Vec<(&Marker, &Marker)> {
-        let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for m in &self.markers {
-            let Some(pid) = m.pair else { continue };
-            if seen.contains(&m.id) {
-                continue;
-            }
-            let Some(p) = self.get(pid) else { continue };
-            seen.insert(m.id);
-            seen.insert(p.id);
-            if m.t_ns <= p.t_ns {
-                out.push((m, p));
-            } else {
-                out.push((p, m));
-            }
-        }
-        out
+        self.placement_pairs()
+            .into_iter()
+            .map(|(a, b)| if a.t_ns <= b.t_ns { (a, b) } else { (b, a) })
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -891,7 +949,7 @@ mod tests {
         let b = s.add(200, [2, 2, 2]);
         assert_ne!(a, b);
         assert_eq!(s.len(), 2);
-        assert!(s.get(a).unwrap().pair.is_none());
+        assert!(s.get(a).unwrap().chain.is_none());
     }
 
     #[test]
@@ -899,27 +957,56 @@ mod tests {
         let mut s = MarkerSet::new();
         let a = s.add(100, [0; 3]);
         let b = s.add_paired_with(a, 200, [0; 3]).unwrap();
-        assert_eq!(s.get(a).unwrap().pair, Some(b));
-        assert_eq!(s.get(b).unwrap().pair, Some(a));
+        let ca = s.get(a).unwrap().chain;
+        let cb = s.get(b).unwrap().chain;
+        assert!(ca.is_some());
+        assert_eq!(ca, cb);
     }
 
     #[test]
-    fn marker_pair_refuses_already_paired_anchor() {
+    fn marker_add_paired_with_extends_chain() {
         let mut s = MarkerSet::new();
         let a = s.add(0, [0; 3]);
-        s.add_paired_with(a, 1, [0; 3]).unwrap();
-        // Trying to pair `a` again should fail.
-        assert!(s.add_paired_with(a, 2, [0; 3]).is_none());
+        let b = s.add_paired_with(a, 10, [0; 3]).unwrap();
+        // A third call must succeed — chains can grow arbitrarily.
+        let c = s.add_paired_with(b, 20, [0; 3]).unwrap();
+        let chain = s.chain_of(a);
+        let ids: Vec<u64> = chain.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![a, b, c]);
     }
 
     #[test]
-    fn marker_remove_breaks_partner_link() {
+    fn marker_remove_dissolves_two_chain() {
         let mut s = MarkerSet::new();
         let a = s.add(0, [0; 3]);
         let b = s.add_paired_with(a, 10, [0; 3]).unwrap();
         s.remove(a);
         assert!(s.get(a).is_none());
-        assert_eq!(s.get(b).unwrap().pair, None);
+        // Surviving lone marker should be detached from the chain.
+        assert_eq!(s.get(b).unwrap().chain, None);
+    }
+
+    #[test]
+    fn marker_remove_keeps_chain_when_at_least_two_remain() {
+        let mut s = MarkerSet::new();
+        let a = s.add(0, [0; 3]);
+        let b = s.add_paired_with(a, 10, [0; 3]).unwrap();
+        let c = s.add_paired_with(b, 20, [0; 3]).unwrap();
+        s.remove(b);
+        // a and c should remain in the same (still-valid) chain.
+        assert_eq!(s.get(a).unwrap().chain, s.get(c).unwrap().chain);
+        assert!(s.get(a).unwrap().chain.is_some());
+    }
+
+    #[test]
+    fn marker_placement_pairs_yields_consecutive_segments() {
+        let mut s = MarkerSet::new();
+        let a = s.add(0, [0; 3]);
+        let b = s.add_paired_with(a, 10, [0; 3]).unwrap();
+        let c = s.add_paired_with(b, 20, [0; 3]).unwrap();
+        let pairs: Vec<(u64, u64)> =
+            s.placement_pairs().iter().map(|(x, y)| (x.id, y.id)).collect();
+        assert_eq!(pairs, vec![(a, b), (b, c)]);
     }
 
     #[test]
@@ -944,20 +1031,35 @@ mod tests {
         let a = s.add(0, [0; 3]);
         let b = s.add(10, [0; 3]);
         assert!(s.pair(a, b));
-        assert_eq!(s.get(a).unwrap().pair, Some(b));
-        assert_eq!(s.get(b).unwrap().pair, Some(a));
+        let ca = s.get(a).unwrap().chain;
+        let cb = s.get(b).unwrap().chain;
+        assert!(ca.is_some());
+        assert_eq!(ca, cb);
     }
 
     #[test]
-    fn marker_pair_rejects_self_or_already_paired() {
+    fn marker_pair_merges_two_chains() {
         let mut s = MarkerSet::new();
         let a = s.add(0, [0; 3]);
-        let b = s.add(10, [0; 3]);
+        let b = s.add_paired_with(a, 10, [0; 3]).unwrap();
         let c = s.add(20, [0; 3]);
+        let d = s.add_paired_with(c, 30, [0; 3]).unwrap();
+        // a-b chain ≠ c-d chain initially.
+        assert_ne!(s.get(a).unwrap().chain, s.get(c).unwrap().chain);
+        // Pairing a member of each merges them.
+        assert!(s.pair(b, c));
+        let chain = s.get(a).unwrap().chain;
+        assert!(chain.is_some());
+        assert_eq!(s.get(b).unwrap().chain, chain);
+        assert_eq!(s.get(c).unwrap().chain, chain);
+        assert_eq!(s.get(d).unwrap().chain, chain);
+    }
+
+    #[test]
+    fn marker_pair_rejects_self() {
+        let mut s = MarkerSet::new();
+        let a = s.add(0, [0; 3]);
         assert!(!s.pair(a, a));
-        assert!(s.pair(a, b));
-        assert!(!s.pair(a, c)); // a already paired
-        assert!(!s.pair(b, c)); // b already paired
     }
 
     // ---- Camera::jump_to ----
