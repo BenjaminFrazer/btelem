@@ -468,15 +468,22 @@ fn handle_camera(
         cam.pan_x(-dx_px * scale, cur);
     }
 
-    if response.hovered() {
+    // Scroll-zoom: read raw scroll + check pointer is in our rect, rather
+    // than relying on response.hovered() which other UI layers (drop zones,
+    // overlays) can swallow.
+    let pointer_in_rect = ui
+        .input(|i| i.pointer.hover_pos())
+        .map(|p| response.rect.contains(p))
+        .unwrap_or(false);
+    if pointer_in_rect {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y) as f64;
         if scroll.abs() > 0.5 {
             let factor = (-scroll * 0.0015).exp();
             if cam.follow {
                 cam.zoom_window(factor);
             } else {
-                let pivot_s = response
-                    .hover_pos()
+                let pivot_s = ui
+                    .input(|i| i.pointer.hover_pos())
                     .map(|p| {
                         let frac = ((p.x - response.rect.min.x) as f64
                             / response.rect.width().max(1.0) as f64)
