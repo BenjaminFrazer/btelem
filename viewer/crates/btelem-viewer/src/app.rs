@@ -9,16 +9,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use btelem_capture::{Capture, CaptureStats};
 use btelem_ingest::{SourceHandle, TcpSource};
 use btelem_store::{ChannelId, ChannelInfo, ChannelKind, MockStore, Store};
 use eframe::egui;
 use egui::{Color32, DragAndDrop};
-use egui_dock::{DockArea, DockState, Style, TabViewer};
+use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 
 use crate::plot_renderers::{self, PlotContext};
 use crate::view_state::{
     compute_view, group_by_struct, matches_query, Camera, Connection, MarkerSet, PlotId, PlotKind,
-    PlotRegistry, Protocol, RateEstimator, TimeBase, TimeSeriesPlot, XYDragAccumulator, XYPlot,
+    PlotRegistry, Protocol, RateEstimator, ScalarPanel, StateChartPanel, TimeBase,
+    XYDragAccumulator, XYPlot,
 };
 use crate::Args;
 
@@ -36,6 +38,7 @@ enum DragPayload {
 
 pub struct ViewerApp {
     store: MockStore,
+    capture: Capture,
     _handle: Option<SourceHandle>,
     _args: Arc<Args>,
     status: String,
@@ -94,15 +97,34 @@ pub struct ViewerApp {
     connection_dialog_open: bool,
     /// Buffer for the dialog's text edits — committed only on Connect.
     pending_connection: Connection,
+
+    /// True while the "Discard accrued data?" confirmation popup is open.
+    confirm_clear_open: bool,
+}
+
+/// Build a fresh dock with one Scalar plot and one StateChart plot placed
+/// side-by-side. Also seeds `plots` with the two corresponding entries.
+fn make_default_dock(plots: &mut PlotRegistry) -> DockState<PlotId> {
+    let scalar_id = plots.insert(PlotKind::Scalar(ScalarPanel::new("scalar 1")));
+    let state_id = plots.insert(PlotKind::StateChart(StateChartPanel::new("states 2")));
+    let mut dock = DockState::new(vec![scalar_id]);
+    dock.main_surface_mut()
+        .split_right(NodeIndex::root(), 0.5, vec![state_id]);
+    dock
 }
 
 impl ViewerApp {
     pub fn new(args: Arc<Args>) -> Self {
         let store = MockStore::new();
+        let capture = Capture::default();
         let connection = Connection::parse(&args.addr).unwrap_or_default();
         let deadline = Instant::now() + Duration::from_secs_f64(args.connect_timeout.max(0.0));
         let (handle, status) = loop {
-            match TcpSource::connect(connection.socket_addr(), store.clone()) {
+            match TcpSource::connect(
+                connection.socket_addr(),
+                store.clone(),
+                Some(capture.clone()),
+            ) {
                 Ok(h) => break (Some(h), format!("connected to {}", connection.pretty())),
                 Err(e) if Instant::now() >= deadline => {
                     break (None, format!("connection failed: {e}"));
@@ -112,17 +134,17 @@ impl ViewerApp {
         };
 
         let mut plots = PlotRegistry::new();
-        let id = plots.insert(PlotKind::TimeSeries(TimeSeriesPlot::new("plot 1")));
-        let dock = DockState::new(vec![id]);
+        let dock = make_default_dock(&mut plots);
 
         Self {
             store,
+            capture,
             _handle: handle,
             _args: args,
             status,
             dock,
             plots,
-            next_plot_num: 2,
+            next_plot_num: 3,
             tree_query: String::new(),
             xy_drag: XYDragAccumulator::default(),
             tree_selection: HashSet::new(),
@@ -143,6 +165,7 @@ impl ViewerApp {
             pending_connection: connection.clone(),
             connection,
             connection_dialog_open: false,
+            confirm_clear_open: false,
         }
     }
 
@@ -160,9 +183,14 @@ impl ViewerApp {
         // before we reset the store.
         self._handle = None;
         self.store.clear();
+        self.capture.clear();
         self.last_revision = 0;
         self.rate = RateEstimator::new(2.0);
-        match TcpSource::connect(self.connection.socket_addr(), self.store.clone()) {
+        match TcpSource::connect(
+            self.connection.socket_addr(),
+            self.store.clone(),
+            Some(self.capture.clone()),
+        ) {
             Ok(h) => {
                 self._handle = Some(h);
                 self.status = format!("connected to {}", self.connection.pretty());
@@ -170,6 +198,130 @@ impl ViewerApp {
             Err(e) => {
                 self.status = format!("connection failed: {e}");
             }
+        }
+    }
+
+    /// Reset the live store + capture ring. Called by the 🗑 Clear button
+    /// after the user confirms; also re-used by the reconnect path.
+    fn do_clear(&mut self) {
+        self.store.clear();
+        self.capture.clear();
+        self.last_revision = 0;
+        self.rate = RateEstimator::new(2.0);
+        self.cam.reset();
+        self.markers = MarkerSet::new();
+        self.tree_selection.clear();
+        self.tree_anchor = None;
+        self.group_counts.clear();
+        self.group_counts_last_refresh = None;
+        self.flash("capture cleared");
+    }
+
+    /// Open a native save dialog and write the current ring as a .btlm.
+    fn do_save_capture(&mut self) {
+        if !self.capture.has_data() {
+            self.flash("nothing to save (no packets captured yet)");
+            return;
+        }
+        let default_name = btelem_capture::suggested_filename();
+        let pick = rfd::FileDialog::new()
+            .add_filter("btelem capture", &["btlm"])
+            .set_file_name(&default_name)
+            .save_file();
+        let Some(mut path) = pick else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("btlm");
+        }
+        match self.capture.save_btlm(&path) {
+            Ok(r) => self.flash(format!(
+                "saved {} packets ({}) to {}",
+                r.packets,
+                fmt_bytes(r.bytes),
+                path.display()
+            )),
+            Err(e) => self.flash(format!("save failed: {e}")),
+        }
+    }
+
+    /// Render the "💾 Capture …" top-bar entry plus its inline stats.
+    fn capture_menu(&mut self, ui: &mut egui::Ui) {
+        let stats = self.capture.stats();
+        let has_data = stats.packets > 0;
+        ui.menu_button("💾 Capture", |ui| {
+            ui.label(
+                egui::RichText::new(fmt_capture_stats(&stats))
+                    .small()
+                    .weak(),
+            );
+            ui.separator();
+            ui.add_enabled_ui(has_data, |ui| {
+                if ui.button("💾 Save…").clicked() {
+                    self.do_save_capture();
+                    ui.close_menu();
+                }
+            });
+            ui.add_enabled_ui(has_data || stats.has_schema, |ui| {
+                if ui.button("🗑 Clear…").clicked() {
+                    self.confirm_clear_open = true;
+                    ui.close_menu();
+                }
+            });
+        });
+        // Compact inline indicator next to the button so the user sees
+        // the ring is filling up without opening the menu.
+        if has_data {
+            ui.label(
+                egui::RichText::new(format!("({})", fmt_bytes(stats.bytes)))
+                    .small()
+                    .weak(),
+            );
+        }
+    }
+
+    /// Modal popup for the destructive 🗑 Clear action.
+    fn confirm_clear_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_clear_open {
+            return;
+        }
+        let stats = self.capture.stats();
+        let mut open = true;
+        let mut do_clear = false;
+        let mut cancel = false;
+        egui::Window::new("Discard captured data?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This will drop {} packets ({}) and reset {} channels.",
+                    stats.packets,
+                    fmt_bytes(stats.bytes),
+                    self.store.channels().len(),
+                ));
+                ui.label(
+                    egui::RichText::new("Save first if you want to keep this data.").weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("🗑 Clear").color(Color32::LIGHT_RED))
+                        .clicked()
+                    {
+                        do_clear = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if do_clear {
+            self.do_clear();
+            self.confirm_clear_open = false;
+        } else if cancel || !open {
+            self.confirm_clear_open = false;
         }
     }
 
@@ -313,12 +465,20 @@ impl ViewerApp {
                     ui.label("s");
                 }
                 ui.separator();
-                if ui.button("+ TimeSeries").clicked() {
-                    let title = format!("plot {}", self.next_plot_num);
+                if ui.button("+ Scalar").clicked() {
+                    let title = format!("scalar {}", self.next_plot_num);
                     self.next_plot_num += 1;
                     let id = self
                         .plots
-                        .insert(PlotKind::TimeSeries(TimeSeriesPlot::new(title)));
+                        .insert(PlotKind::Scalar(ScalarPanel::new(title)));
+                    self.dock.push_to_focused_leaf(id);
+                }
+                if ui.button("+ State Chart").clicked() {
+                    let title = format!("states {}", self.next_plot_num);
+                    self.next_plot_num += 1;
+                    let id = self
+                        .plots
+                        .insert(PlotKind::StateChart(StateChartPanel::new(title)));
                     self.dock.push_to_focused_leaf(id);
                 }
                 let marker_btn =
@@ -337,6 +497,8 @@ impl ViewerApp {
                 }
                 ui.separator();
                 self.layouts_menu(ui);
+                ui.separator();
+                self.capture_menu(ui);
                 ui.separator();
                 let rate = self.sample_rate();
                 ui.label(format!(
@@ -751,9 +913,19 @@ impl ViewerApp {
                 for (_, kind) in self.iter_plots() {
                     ui.label(egui::RichText::new(kind.title()).strong());
                     match kind {
-                        PlotKind::TimeSeries(p) => {
-                            for ch in p.scalars.iter().chain(p.states.iter()) {
+                        PlotKind::Scalar(p) => {
+                            for ch in p.channels.iter() {
                                 self.cursor_row(ui, &by_id, *ch, t);
+                            }
+                        }
+                        PlotKind::StateChart(p) => {
+                            for ch in p.lanes.iter() {
+                                self.cursor_row(ui, &by_id, *ch, t);
+                            }
+                        }
+                        PlotKind::LogicAnalyser(p) => {
+                            for lane in p.lanes.iter() {
+                                self.cursor_row(ui, &by_id, lane.ch, t);
                             }
                         }
                         PlotKind::XY(p) => {
@@ -798,8 +970,8 @@ impl ViewerApp {
                             // TimeSeries plots.
                             let mut shown = std::collections::HashSet::new();
                             for (_, kind) in self.iter_plots() {
-                                if let PlotKind::TimeSeries(p) = kind {
-                                    for ch in p.scalars.iter() {
+                                if let PlotKind::Scalar(p) = kind {
+                                    for ch in p.channels.iter() {
                                         if !shown.insert(*ch) {
                                             continue;
                                         }
@@ -874,6 +1046,7 @@ impl eframe::App for ViewerApp {
         self.top_bar(ctx);
         self.connection_dialog(ctx);
         self.save_as_dialog(ctx);
+        self.confirm_clear_dialog(ctx);
         self.tree_panel(ctx);
         self.cursor_panel(ctx);
 
@@ -918,11 +1091,8 @@ impl eframe::App for ViewerApp {
 
         // Always keep at least one tab so the user has somewhere to drop.
         if self.plots.is_empty() {
-            let id = self
-                .plots
-                .insert(PlotKind::TimeSeries(TimeSeriesPlot::new("plot 1")));
-            self.dock = DockState::new(vec![id]);
-            self.next_plot_num = 2;
+            self.dock = make_default_dock(&mut self.plots);
+            self.next_plot_num = 3;
         }
     }
 }
@@ -987,8 +1157,14 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     cursor_last_set: self.cursor_last_set,
                 };
                 match kind {
-                    PlotKind::TimeSeries(panel) => {
-                        plot_renderers::render_timeseries(ui, &mut ctx, pid.0, &panel);
+                    PlotKind::Scalar(panel) => {
+                        plot_renderers::render_scalar_plot(ui, &mut ctx, pid.0, &panel);
+                    }
+                    PlotKind::StateChart(panel) => {
+                        plot_renderers::render_state_chart(ui, &mut ctx, pid.0, &panel);
+                    }
+                    PlotKind::LogicAnalyser(panel) => {
+                        plot_renderers::render_logic_analyser(ui, &mut ctx, pid.0, &panel);
                     }
                     PlotKind::XY(xy) => {
                         plot_renderers::render_xy(ui, &mut ctx, pid.0, &xy);
@@ -1003,19 +1179,47 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     if let (Some(info), Some(plot)) = (self.by_id.get(&ch), self.plots.get_mut(pid))
                     {
                         if plot.accepts(info) {
-                            if let PlotKind::TimeSeries(p) = plot {
-                                p.add(info);
+                            match plot {
+                                PlotKind::Scalar(p) => {
+                                    p.add(info);
+                                }
+                                PlotKind::StateChart(p) => {
+                                    p.add(info);
+                                }
+                                PlotKind::LogicAnalyser(p) => {
+                                    p.add(info);
+                                }
+                                PlotKind::XY(_) => {}
                             }
                         }
                     }
                 }
                 DragPayload::Channels(chs) => {
-                    if let Some(PlotKind::TimeSeries(p)) = self.plots.get_mut(pid) {
-                        for ch in chs {
-                            if let Some(info) = self.by_id.get(&ch) {
-                                p.add(info);
+                    // Multi-drag may contain a mix of kinds; silently drop
+                    // anything the target panel doesn't accept.
+                    match self.plots.get_mut(pid) {
+                        Some(PlotKind::Scalar(p)) => {
+                            for ch in chs {
+                                if let Some(info) = self.by_id.get(&ch) {
+                                    p.add(info);
+                                }
                             }
                         }
+                        Some(PlotKind::StateChart(p)) => {
+                            for ch in chs {
+                                if let Some(info) = self.by_id.get(&ch) {
+                                    p.add(info);
+                                }
+                            }
+                        }
+                        Some(PlotKind::LogicAnalyser(p)) => {
+                            for ch in chs {
+                                if let Some(info) = self.by_id.get(&ch) {
+                                    p.add(info);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 DragPayload::XYSeed(ch) => {
@@ -1099,6 +1303,40 @@ fn fmt_count(n: u64) -> String {
     } else {
         format!("{:.1}G", n as f64 / G as f64)
     }
+}
+
+/// Format a byte count as KiB/MiB/GiB (binary, matches OS file sizes).
+fn fmt_bytes(n: u64) -> String {
+    const K: u64 = 1024;
+    const M: u64 = K * 1024;
+    const G: u64 = M * 1024;
+    if n < K {
+        format!("{n} B")
+    } else if n < M {
+        format!("{:.1} KiB", n as f64 / K as f64)
+    } else if n < G {
+        format!("{:.1} MiB", n as f64 / M as f64)
+    } else {
+        format!("{:.2} GiB", n as f64 / G as f64)
+    }
+}
+
+fn fmt_capture_stats(s: &CaptureStats) -> String {
+    let mins = (s.age_secs / 60.0).floor() as u64;
+    let secs = (s.age_secs - (mins * 60) as f64).floor() as u64;
+    let dropped = if s.packets_dropped > 0 {
+        format!(" · {} dropped (ring full)", fmt_count(s.packets_dropped))
+    } else {
+        String::new()
+    };
+    format!(
+        "{} packets · {} · {:02}:{:02}{}",
+        fmt_count(s.packets),
+        fmt_bytes(s.bytes),
+        mins,
+        secs,
+        dropped,
+    )
 }
 
 #[cfg(test)]

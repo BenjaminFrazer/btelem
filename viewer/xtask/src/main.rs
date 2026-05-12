@@ -119,7 +119,7 @@ fn replay(
     let handle = (0..40)
         .find_map(|_| {
             thread::sleep(Duration::from_millis(50));
-            TcpSource::connect(&addr, store.clone()).ok()
+            TcpSource::connect(&addr, store.clone(), None).ok()
         })
         .expect("connect failed after 2s of retries");
 

@@ -57,7 +57,7 @@ fn counter_server_round_trip() {
     let mut handle = None;
     for _ in 0..40 {
         thread::sleep(Duration::from_millis(50));
-        if let Ok(h) = TcpSource::connect(&addr, store.clone()) {
+        if let Ok(h) = TcpSource::connect(&addr, store.clone(), None) {
             handle = Some(h);
             break;
         }

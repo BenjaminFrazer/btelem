@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-btelem-wire  = { workspace = true }
-btelem-store = { workspace = true }
-thiserror    = { workspace = true }
+btelem-wire    = { workspace = true }
+btelem-store   = { workspace = true }
+btelem-capture = { workspace = true }
+thiserror      = { workspace = true }

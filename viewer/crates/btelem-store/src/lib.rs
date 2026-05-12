@@ -122,4 +122,8 @@ pub trait Store: Send + Sync {
     /// pushed samples; for state channels it's the number of distinct runs.
     /// Returns 0 for unknown channels. Cheap (O(1)).
     fn sample_count(&self, ch: ChannelId) -> u64;
+
+    /// Drop every channel and sample. Bumps the revision once so consumers
+    /// invalidate their caches.
+    fn clear(&self);
 }

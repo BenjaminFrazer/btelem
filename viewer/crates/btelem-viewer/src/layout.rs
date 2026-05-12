@@ -21,12 +21,15 @@ use btelem_store::{ChannelId, ChannelInfo, ChannelKind};
 use serde::{Deserialize, Serialize};
 
 use crate::view_state::{
-    PlotId, PlotKind, PlotRegistry, SignalStyle, TimeSeriesPlot, XYPlot,
+    LabelRadix, LogicAnalyserPanel, PlotId, PlotKind, PlotRegistry, ScalarPanel,
+    SignalStyle, StateChartPanel, XYPlot,
 };
 
 /// Bumped when the on-disk JSON shape changes in a non-backwards-
-/// compatible way. Loaders refuse anything they don't recognise.
-pub const SCHEMA_VERSION: u32 = 1;
+/// compatible way. Loaders refuse anything they don't recognise (with the
+/// exception of the legacy `time_series` plot spec, which is migrated
+/// into `scalar` + `state_chart` plots on load).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// In-memory representation of a layout file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,12 +48,29 @@ pub struct Layout {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlotSpec {
+    /// Legacy combined plot (pre-v2). Always migrated on load: scalars
+    /// become a `Scalar` plot and states become an adjacent `StateChart`
+    /// plot. Never produced by `capture` — kept only for migration.
     TimeSeries {
         title: String,
         scalars: Vec<String>,
         states: Vec<String>,
         #[serde(default)]
         styles: HashMap<String, SignalStyle>,
+    },
+    Scalar {
+        title: String,
+        channels: Vec<String>,
+        #[serde(default)]
+        styles: HashMap<String, SignalStyle>,
+    },
+    StateChart {
+        title: String,
+        lanes: Vec<String>,
+    },
+    LogicAnalyser {
+        title: String,
+        lanes: Vec<LogicLaneSpec>,
     },
     Xy {
         title: String,
@@ -59,6 +79,15 @@ pub enum PlotSpec {
         #[serde(default)]
         trail_ns: Option<u64>,
     },
+}
+
+/// Serialised logic-analyser lane. Channel referenced by dotted path so
+/// layouts can be moved between sessions with different channel ids.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogicLaneSpec {
+    pub ch_path: String,
+    #[serde(default)]
+    pub radix: LabelRadix,
 }
 
 /// Outcome of applying a layout to a live `Store`.
@@ -124,7 +153,7 @@ pub fn list() -> io::Result<Vec<String>> {
         }
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(layout) = serde_json::from_slice::<Layout>(&bytes) {
-                if layout.version == SCHEMA_VERSION {
+                if layout.version == SCHEMA_VERSION || layout.version == 1 {
                     names.push(layout.name);
                 }
             }
@@ -138,7 +167,10 @@ pub fn load(name: &str) -> io::Result<Layout> {
     let bytes = fs::read(path_for(name))?;
     let layout: Layout = serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if layout.version != SCHEMA_VERSION {
+    // Accept v1 files (legacy `TimeSeries` plots) and migrate them on
+    // load; reject anything else. No backwards-compat guarantee — see
+    // the module docs.
+    if layout.version != SCHEMA_VERSION && layout.version != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -226,14 +258,9 @@ fn spec_from_kind(
     by_id: &HashMap<ChannelId, ChannelInfo>,
 ) -> PlotSpec {
     match kind {
-        PlotKind::TimeSeries(p) => {
-            let scalars = p
-                .scalars
-                .iter()
-                .filter_map(|id| by_id.get(id).map(|c| c.path.clone()))
-                .collect::<Vec<_>>();
-            let states = p
-                .states
+        PlotKind::Scalar(p) => {
+            let channels = p
+                .channels
                 .iter()
                 .filter_map(|id| by_id.get(id).map(|c| c.path.clone()))
                 .collect::<Vec<_>>();
@@ -243,11 +270,37 @@ fn spec_from_kind(
                     styles.insert(info.path.clone(), st);
                 }
             }
-            PlotSpec::TimeSeries {
+            PlotSpec::Scalar {
                 title: p.title.clone(),
-                scalars,
-                states,
+                channels,
                 styles,
+            }
+        }
+        PlotKind::StateChart(p) => {
+            let lanes = p
+                .lanes
+                .iter()
+                .filter_map(|id| by_id.get(id).map(|c| c.path.clone()))
+                .collect::<Vec<_>>();
+            PlotSpec::StateChart {
+                title: p.title.clone(),
+                lanes,
+            }
+        }
+        PlotKind::LogicAnalyser(p) => {
+            let lanes = p
+                .lanes
+                .iter()
+                .filter_map(|l| {
+                    by_id.get(&l.ch).map(|c| LogicLaneSpec {
+                        ch_path: c.path.clone(),
+                        radix: l.radix,
+                    })
+                })
+                .collect::<Vec<_>>();
+            PlotSpec::LogicAnalyser {
+                title: p.title.clone(),
+                lanes,
             }
         }
         PlotKind::XY(xy) => PlotSpec::Xy {
@@ -273,6 +326,12 @@ fn spec_from_kind(
 ///
 /// Channel paths are resolved against `channels`. Unknown paths are
 /// dropped silently but counted in the returned `ApplyReport`.
+///
+/// Legacy `TimeSeries` specs (v1 files) are migrated into one `Scalar`
+/// plot plus one adjacent `StateChart` plot. The dock tab originally
+/// pointing at the combined plot is rewritten to the scalar plot; the
+/// state-chart plot is appended into the same leaf so the two end up
+/// adjacent.
 pub fn apply(
     layout: &Layout,
     channels: &[ChannelInfo],
@@ -282,9 +341,12 @@ pub fn apply(
 
     let mut report = ApplyReport::default();
     let mut registry = PlotRegistry::new();
-    // For each input plot index, the new PlotId (or None if the plot
-    // ended up unusable and was dropped).
+    // Primary plot id per input spec — used for dock-index remapping.
     let mut new_ids: Vec<Option<PlotId>> = Vec::with_capacity(layout.plots.len());
+    // Companion plots produced by migration (legacy TimeSeries → StateChart),
+    // alongside their primary counterpart. Appended into the same dock leaf
+    // after the dock skeleton is built.
+    let mut companions: Vec<(PlotId, PlotId)> = Vec::new();
 
     for spec in &layout.plots {
         match spec {
@@ -294,11 +356,12 @@ pub fn apply(
                 states,
                 styles,
             } => {
-                let mut p = TimeSeriesPlot::new(title);
+                // Build a Scalar panel from the legacy `scalars` half.
+                let mut sp = ScalarPanel::new(title);
                 for path in scalars {
                     if let Some(info) = by_path.get(path.as_str()) {
                         if matches!(info.kind, ChannelKind::Scalar) {
-                            p.add(info);
+                            sp.add(info);
                         } else {
                             report.missing_channels += 1;
                         }
@@ -306,9 +369,48 @@ pub fn apply(
                         report.missing_channels += 1;
                     }
                 }
-                for path in states {
+                for (path, style) in styles {
                     if let Some(info) = by_path.get(path.as_str()) {
-                        if matches!(info.kind, ChannelKind::State { .. }) {
+                        if matches!(info.kind, ChannelKind::Scalar) {
+                            *sp.style_for_mut(info.id) = *style;
+                        }
+                    }
+                }
+                let scalar_id = registry.insert(PlotKind::Scalar(sp));
+
+                // And a StateChart panel from the legacy `states` half,
+                // only if it actually had any states.
+                if !states.is_empty() {
+                    let mut chart = StateChartPanel::new(format!("{title} (states)"));
+                    let mut had_any = false;
+                    for path in states {
+                        if let Some(info) = by_path.get(path.as_str()) {
+                            if matches!(info.kind, ChannelKind::State { .. }) {
+                                chart.add(info);
+                                had_any = true;
+                            } else {
+                                report.missing_channels += 1;
+                            }
+                        } else {
+                            report.missing_channels += 1;
+                        }
+                    }
+                    if had_any {
+                        let state_id = registry.insert(PlotKind::StateChart(chart));
+                        companions.push((scalar_id, state_id));
+                    }
+                }
+                new_ids.push(Some(scalar_id));
+            }
+            PlotSpec::Scalar {
+                title,
+                channels: paths,
+                styles,
+            } => {
+                let mut p = ScalarPanel::new(title);
+                for path in paths {
+                    if let Some(info) = by_path.get(path.as_str()) {
+                        if matches!(info.kind, ChannelKind::Scalar) {
                             p.add(info);
                         } else {
                             report.missing_channels += 1;
@@ -322,7 +424,46 @@ pub fn apply(
                         *p.style_for_mut(info.id) = *style;
                     }
                 }
-                let id = registry.insert(PlotKind::TimeSeries(p));
+                let id = registry.insert(PlotKind::Scalar(p));
+                new_ids.push(Some(id));
+            }
+            PlotSpec::StateChart { title, lanes } => {
+                let mut p = StateChartPanel::new(title);
+                for path in lanes {
+                    if let Some(info) = by_path.get(path.as_str()) {
+                        if matches!(info.kind, ChannelKind::State { .. }) {
+                            p.add(info);
+                        } else {
+                            report.missing_channels += 1;
+                        }
+                    } else {
+                        report.missing_channels += 1;
+                    }
+                }
+                let id = registry.insert(PlotKind::StateChart(p));
+                new_ids.push(Some(id));
+            }
+            PlotSpec::LogicAnalyser { title, lanes } => {
+                let mut p = LogicAnalyserPanel::new(title);
+                for ls in lanes {
+                    if let Some(info) = by_path.get(ls.ch_path.as_str()) {
+                        if info.integer_storage {
+                            // Use the panel's add() so dedup logic runs,
+                            // then overwrite the radix back to the saved
+                            // value (add() defaults to Hex).
+                            if p.add(info) {
+                                if let Some(r) = p.radix_for_mut(info.id) {
+                                    *r = ls.radix;
+                                }
+                            }
+                        } else {
+                            report.missing_channels += 1;
+                        }
+                    } else {
+                        report.missing_channels += 1;
+                    }
+                }
+                let id = registry.insert(PlotKind::LogicAnalyser(p));
                 new_ids.push(Some(id));
             }
             PlotSpec::Xy {
@@ -363,8 +504,37 @@ pub fn apply(
 
     // Rebuild the dock: parse saved DockState<usize>, then remap to
     // DockState<PlotId> via `new_ids`, then strip empty slots.
-    let dock = build_dock(&layout.dock, &new_ids);
+    let mut dock = build_dock(&layout.dock, &new_ids);
+
+    // Append migration-generated companions next to their primary. We do
+    // this by looking up the surface/node containing the primary id and
+    // inserting the companion as a new tab in the same leaf.
+    for (primary, companion) in companions {
+        if !insert_next_to(&mut dock, primary, companion) {
+            // Fallback: just stuff it into the focused leaf.
+            dock.push_to_focused_leaf(companion);
+        }
+    }
+
     (registry, dock, report)
+}
+
+/// Find the dock leaf that contains `anchor` and push `extra` into it.
+/// Returns true if the anchor was found and the insert happened.
+fn insert_next_to(
+    dock: &mut egui_dock::DockState<PlotId>,
+    anchor: PlotId,
+    extra: PlotId,
+) -> bool {
+    for (_si, node) in dock.iter_all_nodes_mut() {
+        if let egui_dock::Node::Leaf { tabs, .. } = node {
+            if tabs.contains(&anchor) {
+                tabs.push(extra);
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn build_dock(
@@ -442,8 +612,7 @@ mod tests {
 
     #[test]
     fn capture_then_apply_round_trips_plots_and_styles() {
-        // Build a small registry with one timeseries plot referencing
-        // two scalars and one state, with a custom style on one scalar.
+        // Build a small registry with one scalar plot and one state chart.
         let chs = vec![
             ch_scalar(0, "imu.accel.x"),
             ch_scalar(1, "imu.accel.y"),
@@ -452,21 +621,27 @@ mod tests {
         let by_id: HashMap<ChannelId, ChannelInfo> =
             chs.iter().map(|c| (c.id, c.clone())).collect();
         let mut reg = PlotRegistry::new();
-        let mut ts = TimeSeriesPlot::new("imu");
-        for c in &chs {
-            ts.add(c);
+        let mut sp = ScalarPanel::new("imu");
+        for c in chs.iter().filter(|c| matches!(c.kind, ChannelKind::Scalar)) {
+            sp.add(c);
         }
-        *ts.style_for_mut(0) = SignalStyle {
+        *sp.style_for_mut(0) = SignalStyle {
             line: crate::view_state::LineStyle::Step,
             width: crate::view_state::LineWidth::Thick,
             envelope: false,
         };
-        let pid = reg.insert(PlotKind::TimeSeries(ts));
-        let dock = egui_dock::DockState::new(vec![pid]);
+        let scalar_pid = reg.insert(PlotKind::Scalar(sp));
+
+        let mut chart = StateChartPanel::new("fsm");
+        chart.add(&chs[2]);
+        let state_pid = reg.insert(PlotKind::StateChart(chart));
+
+        let dock = egui_dock::DockState::new(vec![scalar_pid, state_pid]);
 
         let snap = capture("imu overview", &reg, &dock, &by_id);
         assert_eq!(snap.name, "imu overview");
-        assert_eq!(snap.plots.len(), 1);
+        assert_eq!(snap.plots.len(), 2);
+        assert_eq!(snap.version, SCHEMA_VERSION);
 
         // Round-trip through JSON.
         let json = serde_json::to_vec(&snap).unwrap();
@@ -474,42 +649,54 @@ mod tests {
         assert_eq!(snap2.plots, snap.plots);
 
         // Apply against the same channel set.
-        let (reg2, dock2, report) = apply(&snap2, &chs);
+        let (reg2, _dock2, report) = apply(&snap2, &chs);
         assert_eq!(report, ApplyReport::default());
-        let only = reg2.iter_ids().next().unwrap();
-        let PlotKind::TimeSeries(rebuilt) = reg2.get(only).unwrap() else {
-            panic!("wrong kind");
-        };
-        assert_eq!(rebuilt.title, "imu");
-        assert_eq!(rebuilt.scalars, vec![0, 1]);
-        assert_eq!(rebuilt.states, vec![2]);
-        assert_eq!(
-            rebuilt.style_for(0),
-            SignalStyle {
-                line: crate::view_state::LineStyle::Step,
-                width: crate::view_state::LineWidth::Thick,
-                envelope: false,
+
+        // Find the scalar and the state chart back.
+        let mut got_scalar = false;
+        let mut got_state = false;
+        for id in reg2.iter_ids() {
+            match reg2.get(id).unwrap() {
+                PlotKind::Scalar(p) => {
+                    assert_eq!(p.title, "imu");
+                    assert_eq!(p.channels, vec![0, 1]);
+                    assert_eq!(
+                        p.style_for(0),
+                        SignalStyle {
+                            line: crate::view_state::LineStyle::Step,
+                            width: crate::view_state::LineWidth::Thick,
+                            envelope: false,
+                        }
+                    );
+                    got_scalar = true;
+                }
+                PlotKind::StateChart(p) => {
+                    assert_eq!(p.lanes, vec![2]);
+                    got_state = true;
+                }
+                PlotKind::XY(_) => panic!("unexpected XY"),
+                PlotKind::LogicAnalyser(_) => panic!("unexpected LogicAnalyser"),
             }
-        );
-        // Dock has exactly one tab pointing at the new plot id.
-        let tabs: Vec<_> = dock2.iter_all_tabs().map(|(_, p)| *p).collect();
-        assert_eq!(tabs, vec![only]);
+        }
+        assert!(got_scalar && got_state);
     }
 
     #[test]
     fn apply_drops_unknown_channels_and_counts_them() {
         let chs = vec![ch_scalar(0, "imu.accel.x")];
-        // Layout that references a missing channel and a missing XY pair.
         let snap = Layout {
             version: SCHEMA_VERSION,
             name: "t".into(),
-            dock: serde_json::Value::Null, // forces fallback
+            dock: serde_json::Value::Null,
             plots: vec![
-                PlotSpec::TimeSeries {
+                PlotSpec::Scalar {
                     title: "ts".into(),
-                    scalars: vec!["imu.accel.x".into(), "imu.accel.z".into()],
-                    states: vec!["nope.state".into()],
+                    channels: vec!["imu.accel.x".into(), "imu.accel.z".into()],
                     styles: HashMap::new(),
+                },
+                PlotSpec::StateChart {
+                    title: "sc".into(),
+                    lanes: vec!["nope.state".into()],
                 },
                 PlotSpec::Xy {
                     title: "xy".into(),
@@ -520,9 +707,93 @@ mod tests {
             ],
         };
         let (reg, _dock, report) = apply(&snap, &chs);
-        assert_eq!(report.missing_channels, 3); // accel.z + nope.state + missing.y
+        // accel.z (scalar missing) + nope.state + missing.y
+        assert_eq!(report.missing_channels, 3);
         assert_eq!(report.dropped_plots, 1); // the xy
-        // Only the timeseries plot was kept.
+        // Scalar + StateChart kept (StateChart kept even though empty —
+        // dropping empty ones isn't part of this code path today).
+        assert_eq!(reg.iter_ids().count(), 2);
+    }
+
+    #[test]
+    fn legacy_timeseries_layout_migrates_to_scalar_and_state_chart() {
+        // Fixture: a v1 layout JSON containing a single combined TimeSeries
+        // plot with two scalars and one state. After load+apply we expect
+        // exactly one Scalar plot (carrying the two scalars + a style
+        // override) and one StateChart plot (carrying the state lane).
+        let v1_json = serde_json::json!({
+            "version": 1,
+            "name": "legacy",
+            "dock": null,
+            "plots": [
+                {
+                    "kind": "time_series",
+                    "title": "combined",
+                    "scalars": ["imu.accel.x", "imu.accel.y"],
+                    "states": ["fsm.mode"],
+                    "styles": {
+                        "imu.accel.x": {
+                            "line": "Step",
+                            "width": "Thick",
+                            "envelope": false
+                        }
+                    }
+                }
+            ]
+        });
+        let layout: Layout = serde_json::from_value(v1_json).expect("legacy layout parses");
+        assert_eq!(layout.version, 1);
+
+        let chs = vec![
+            ch_scalar(0, "imu.accel.x"),
+            ch_scalar(1, "imu.accel.y"),
+            ch_state(2, "fsm.mode"),
+        ];
+        let (reg, _dock, report) = apply(&layout, &chs);
+        assert_eq!(report.missing_channels, 0);
+        assert_eq!(report.dropped_plots, 0);
+
+        let mut got_scalar = false;
+        let mut got_state = false;
+        for id in reg.iter_ids() {
+            match reg.get(id).unwrap() {
+                PlotKind::Scalar(p) => {
+                    assert_eq!(p.title, "combined");
+                    assert_eq!(p.channels, vec![0, 1]);
+                    assert_eq!(p.style_for(0).line, crate::view_state::LineStyle::Step);
+                    assert!(!p.style_for(0).envelope);
+                    got_scalar = true;
+                }
+                PlotKind::StateChart(p) => {
+                    assert!(p.title.contains("combined"));
+                    assert_eq!(p.lanes, vec![2]);
+                    got_state = true;
+                }
+                PlotKind::XY(_) => panic!("unexpected XY"),
+                PlotKind::LogicAnalyser(_) => panic!("unexpected LogicAnalyser"),
+            }
+        }
+        assert!(got_scalar, "scalar half should have been produced");
+        assert!(got_state, "state half should have been produced");
+    }
+
+    #[test]
+    fn legacy_timeseries_with_no_states_only_produces_scalar() {
+        let layout = Layout {
+            version: 1,
+            name: "legacy".into(),
+            dock: serde_json::Value::Null,
+            plots: vec![PlotSpec::TimeSeries {
+                title: "s".into(),
+                scalars: vec!["a.x".into()],
+                states: vec![],
+                styles: HashMap::new(),
+            }],
+        };
+        let chs = vec![ch_scalar(0, "a.x")];
+        let (reg, _dock, _) = apply(&layout, &chs);
         assert_eq!(reg.iter_ids().count(), 1);
+        let only = reg.iter_ids().next().unwrap();
+        assert!(matches!(reg.get(only), Some(PlotKind::Scalar(_))));
     }
 }

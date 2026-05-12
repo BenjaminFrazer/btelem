@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/btelem-wire",
     "crates/btelem-store",
+    "crates/btelem-capture",
     "crates/btelem-ingest",
     "crates/btelem-viewer",
     "xtask",
@@ -21,9 +22,10 @@ unsafe_op_in_unsafe_fn = "warn"
 all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
-btelem-wire   = { path = "crates/btelem-wire" }
-btelem-store  = { path = "crates/btelem-store" }
-btelem-ingest = { path = "crates/btelem-ingest" }
+btelem-wire    = { path = "crates/btelem-wire" }
+btelem-store   = { path = "crates/btelem-store" }
+btelem-capture = { path = "crates/btelem-capture" }
+btelem-ingest  = { path = "crates/btelem-ingest" }
 
 bytemuck   = { version = "1.16", features = ["derive"] }
 thiserror  = "1"

@@ -11,26 +11,58 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlotId(pub u64);
 
-/// One plot pane. The two variants are the only first-class plot
-/// primitives in the viewer.
+/// One plot pane. Time-domain primitives are typed: scalar lines and
+/// state lanes live in separate panels (a panel only accepts one kind).
 #[derive(Debug, Clone)]
 pub enum PlotKind {
-    /// Y vs T. Multiple scalars on a shared axis, plus optional state lanes
-    /// drawn underneath.
-    TimeSeries(TimeSeriesPlot),
+    /// Continuous line + envelope, shared y-axis. Accepts only scalars.
+    Scalar(ScalarPanel),
+    /// Stacked coloured lanes, one per state channel. Panel height grows
+    /// with lane count.
+    StateChart(StateChartPanel),
+    /// Stacked equally-sized stairs lanes, one per integer-storage
+    /// channel. Each lane shows the integer value as a step plot with
+    /// numeric labels inside wide steps.
+    LogicAnalyser(LogicAnalyserPanel),
     /// Parametric scalar X vs scalar Y over time.
     XY(XYPlot),
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct TimeSeriesPlot {
+pub struct ScalarPanel {
     pub title: String,
-    pub scalars: Vec<ChannelId>,
-    pub states: Vec<ChannelId>,
+    pub channels: Vec<ChannelId>,
     /// Per-channel render style overrides. Sparse: absent channels render
-    /// with `SignalStyle::default()` so existing plots (or any plot whose
-    /// user hasn't touched the style menu) look exactly as before.
+    /// with `SignalStyle::default()`.
     pub styles: HashMap<ChannelId, SignalStyle>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StateChartPanel {
+    pub title: String,
+    pub lanes: Vec<ChannelId>,
+}
+
+/// Radix used to format the value text rendered inside each step of a
+/// logic-analyser lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LabelRadix {
+    Dec,
+    #[default]
+    Hex,
+    Bin,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LogicLane {
+    pub ch: ChannelId,
+    pub radix: LabelRadix,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LogicAnalyserPanel {
+    pub title: String,
+    pub lanes: Vec<LogicLane>,
 }
 
 /// How a scalar signal is drawn.
@@ -87,63 +119,130 @@ pub struct XYPlot {
     pub trail_ns: Option<u64>,
 }
 
-impl TimeSeriesPlot {
+impl ScalarPanel {
     pub fn new(title: impl Into<String>) -> Self {
         Self {
             title: title.into(),
-            scalars: Vec::new(),
-            states: Vec::new(),
+            channels: Vec::new(),
             styles: HashMap::new(),
         }
     }
 
-    /// Add a channel if not already present. Returns true if added.
+    /// Add a scalar channel if not already present. Returns true if added.
+    /// Non-scalar channels are silently rejected.
     pub fn add(&mut self, ch: &ChannelInfo) -> bool {
-        let bucket = match ch.kind {
-            ChannelKind::Scalar => &mut self.scalars,
-            ChannelKind::State { .. } => &mut self.states,
-        };
-        if bucket.contains(&ch.id) {
+        if !matches!(ch.kind, ChannelKind::Scalar) {
             return false;
         }
-        bucket.push(ch.id);
+        if self.channels.contains(&ch.id) {
+            return false;
+        }
+        self.channels.push(ch.id);
         true
     }
 
     pub fn remove(&mut self, id: ChannelId) {
-        self.scalars.retain(|x| *x != id);
-        self.states.retain(|x| *x != id);
+        self.channels.retain(|x| *x != id);
         self.styles.remove(&id);
     }
 
     /// Resolve the style for `ch`, falling back to the default when no
-    /// override has been set. Always returns a valid style — callers
-    /// shouldn't have to think about absent entries.
+    /// override has been set.
     pub fn style_for(&self, ch: ChannelId) -> SignalStyle {
         self.styles.get(&ch).copied().unwrap_or_default()
     }
 
     /// Mutably access the style for `ch`, inserting a default if absent.
-    /// Useful when wiring up UI widgets that read-modify-write.
     pub fn style_for_mut(&mut self, ch: ChannelId) -> &mut SignalStyle {
         self.styles.entry(ch).or_default()
     }
 
-    /// Iterate over every explicit style override (channels left at the
-    /// default are not yielded). Used by layout capture.
+    /// Iterate over every explicit style override.
     pub fn styles_iter(&self) -> impl Iterator<Item = (ChannelId, SignalStyle)> + '_ {
         self.styles.iter().map(|(k, v)| (*k, *v))
     }
 
     pub fn is_empty(&self) -> bool {
-        self.scalars.is_empty() && self.states.is_empty()
+        self.channels.is_empty()
+    }
+}
+
+impl StateChartPanel {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            lanes: Vec::new(),
+        }
+    }
+
+    /// Add a state channel as a new lane if not already present. Returns
+    /// true if added. Non-state channels are silently rejected.
+    pub fn add(&mut self, ch: &ChannelInfo) -> bool {
+        if !matches!(ch.kind, ChannelKind::State { .. }) {
+            return false;
+        }
+        if self.lanes.contains(&ch.id) {
+            return false;
+        }
+        self.lanes.push(ch.id);
+        true
+    }
+
+    pub fn remove(&mut self, id: ChannelId) {
+        self.lanes.retain(|x| *x != id);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+}
+
+impl LogicAnalyserPanel {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            lanes: Vec::new(),
+        }
+    }
+
+    /// Add an integer-storage channel as a new lane (default radix: hex).
+    /// Returns true if added. Non-integer channels are silently rejected;
+    /// duplicates are rejected too.
+    pub fn add(&mut self, ch: &ChannelInfo) -> bool {
+        if !ch.integer_storage {
+            return false;
+        }
+        if self.lanes.iter().any(|l| l.ch == ch.id) {
+            return false;
+        }
+        self.lanes.push(LogicLane {
+            ch: ch.id,
+            radix: LabelRadix::Hex,
+        });
+        true
+    }
+
+    pub fn remove(&mut self, id: ChannelId) {
+        self.lanes.retain(|l| l.ch != id);
+    }
+
+    /// Mutably access the radix for `ch`, returning `None` if the channel
+    /// isn't a lane in this panel.
+    pub fn radix_for_mut(&mut self, id: ChannelId) -> Option<&mut LabelRadix> {
+        self.lanes.iter_mut().find(|l| l.ch == id).map(|l| &mut l.radix)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
     }
 }
 
 impl PlotKind {
     pub fn title(&self) -> &str {
         match self {
-            PlotKind::TimeSeries(p) => &p.title,
+            PlotKind::Scalar(p) => &p.title,
+            PlotKind::StateChart(p) => &p.title,
+            PlotKind::LogicAnalyser(p) => &p.title,
             PlotKind::XY(p) => &p.title,
         }
     }
@@ -151,7 +250,9 @@ impl PlotKind {
     /// True if dropping `ch` onto this plot is meaningful.
     pub fn accepts(&self, ch: &ChannelInfo) -> bool {
         match self {
-            PlotKind::TimeSeries(_) => true,
+            PlotKind::Scalar(_) => matches!(ch.kind, ChannelKind::Scalar),
+            PlotKind::StateChart(_) => matches!(ch.kind, ChannelKind::State { .. }),
+            PlotKind::LogicAnalyser(_) => ch.integer_storage,
             PlotKind::XY(_) => matches!(ch.kind, ChannelKind::Scalar),
         }
     }
@@ -803,6 +904,11 @@ mod tests {
     fn scalar(id: u32, path: &str) -> ChannelInfo {
         ch(id, path, ChannelKind::Scalar)
     }
+    fn scalar_int(id: u32, path: &str) -> ChannelInfo {
+        let mut c = ch(id, path, ChannelKind::Scalar);
+        c.integer_storage = true;
+        c
+    }
     fn state(id: u32, path: &str) -> ChannelInfo {
         ch(
             id,
@@ -953,23 +1059,35 @@ mod tests {
         assert!(!matches_query("foo", "bar"));
     }
 
-    // ---- TimeSeriesPlot ----
+    // ---- ScalarPanel / StateChartPanel ----
 
     #[test]
-    fn timeseries_routes_by_kind_and_dedupes() {
-        let mut p = TimeSeriesPlot::new("p1");
+    fn scalar_panel_dedupes_and_rejects_states() {
+        let mut p = ScalarPanel::new("p1");
         let s = scalar(10, "x.y");
         let st = state(20, "x.s");
         assert!(p.add(&s));
-        assert!(!p.add(&s));
-        assert!(p.add(&st));
-        assert_eq!(p.scalars, vec![10]);
-        assert_eq!(p.states, vec![20]);
+        assert!(!p.add(&s), "duplicate scalar must be rejected");
+        assert!(!p.add(&st), "state must be rejected by ScalarPanel");
+        assert_eq!(p.channels, vec![10]);
         p.remove(10);
-        assert!(p.scalars.is_empty());
+        assert!(p.channels.is_empty());
     }
 
-    // ---- SignalStyle / TimeSeriesPlot.styles ----
+    #[test]
+    fn state_chart_panel_dedupes_and_rejects_scalars() {
+        let mut p = StateChartPanel::new("p1");
+        let s = scalar(10, "x.y");
+        let st = state(20, "x.s");
+        assert!(p.add(&st));
+        assert!(!p.add(&st));
+        assert!(!p.add(&s), "scalar must be rejected by StateChartPanel");
+        assert_eq!(p.lanes, vec![20]);
+        p.remove(20);
+        assert!(p.lanes.is_empty());
+    }
+
+    // ---- SignalStyle / ScalarPanel.styles ----
 
     #[test]
     fn signal_style_default_matches_legacy_render() {
@@ -981,13 +1099,13 @@ mod tests {
 
     #[test]
     fn style_for_returns_default_when_absent() {
-        let p = TimeSeriesPlot::new("p");
+        let p = ScalarPanel::new("p");
         assert_eq!(p.style_for(42), SignalStyle::default());
     }
 
     #[test]
     fn style_for_mut_inserts_default_then_overwrites() {
-        let mut p = TimeSeriesPlot::new("p");
+        let mut p = ScalarPanel::new("p");
         {
             let s = p.style_for_mut(7);
             s.line = LineStyle::Step;
@@ -1002,18 +1120,31 @@ mod tests {
 
     #[test]
     fn removing_channel_clears_its_style() {
-        let mut p = TimeSeriesPlot::new("p");
+        let mut p = ScalarPanel::new("p");
         let s = scalar(99, "ch");
         p.add(&s);
         p.style_for_mut(99).line = LineStyle::Points;
         assert!(p.styles.contains_key(&99));
         p.remove(99);
         assert!(!p.styles.contains_key(&99));
-        // And style_for falls back to default again.
         assert_eq!(p.style_for(99), SignalStyle::default());
     }
 
     // ---- PlotKind / accepts ----
+
+    #[test]
+    fn scalar_plot_only_accepts_scalars() {
+        let p = PlotKind::Scalar(ScalarPanel::new("s"));
+        assert!(p.accepts(&scalar(1, "a.b")));
+        assert!(!p.accepts(&state(2, "a.s")));
+    }
+
+    #[test]
+    fn state_chart_only_accepts_states() {
+        let p = PlotKind::StateChart(StateChartPanel::new("sc"));
+        assert!(p.accepts(&state(2, "a.s")));
+        assert!(!p.accepts(&scalar(1, "a.b")));
+    }
 
     #[test]
     fn xy_only_accepts_scalars() {
@@ -1028,13 +1159,66 @@ mod tests {
         assert_eq!(xy.title(), "xy");
     }
 
+    // ---- LogicAnalyserPanel ----
+
+    #[test]
+    fn logic_analyser_accepts_integers_only() {
+        let p = PlotKind::LogicAnalyser(LogicAnalyserPanel::new("la"));
+        // integer-storage scalar (u32 etc.) is accepted
+        assert!(p.accepts(&scalar_int(1, "flags")));
+        // state channel (enum / bool / bit) is accepted
+        assert!(p.accepts(&state(2, "fsm")));
+        // float-storage scalar is rejected
+        assert!(!p.accepts(&scalar(3, "imu.x")));
+    }
+
+    #[test]
+    fn logic_analyser_add_rejects_duplicates() {
+        let mut p = LogicAnalyserPanel::new("la");
+        let c = scalar_int(7, "flags");
+        assert!(p.add(&c));
+        assert!(!p.add(&c), "duplicate must be rejected");
+        assert_eq!(p.lanes.len(), 1);
+        assert_eq!(p.lanes[0].radix, LabelRadix::Hex);
+    }
+
+    #[test]
+    fn logic_analyser_add_rejects_float() {
+        let mut p = LogicAnalyserPanel::new("la");
+        let f = scalar(8, "imu.x"); // float-storage scalar
+        assert!(!p.add(&f));
+        assert!(p.lanes.is_empty());
+    }
+
+    #[test]
+    fn logic_analyser_remove_drops_lane() {
+        let mut p = LogicAnalyserPanel::new("la");
+        let a = scalar_int(1, "a");
+        let b = scalar_int(2, "b");
+        p.add(&a);
+        p.add(&b);
+        p.remove(1);
+        assert_eq!(p.lanes.len(), 1);
+        assert_eq!(p.lanes[0].ch, 2);
+    }
+
+    #[test]
+    fn logic_analyser_radix_for_mut_finds_lane() {
+        let mut p = LogicAnalyserPanel::new("la");
+        let a = scalar_int(1, "a");
+        p.add(&a);
+        *p.radix_for_mut(1).unwrap() = LabelRadix::Bin;
+        assert_eq!(p.lanes[0].radix, LabelRadix::Bin);
+        assert!(p.radix_for_mut(99).is_none());
+    }
+
     // ---- PlotRegistry ----
 
     #[test]
     fn registry_assigns_unique_ids_and_owns_plots() {
         let mut r = PlotRegistry::new();
-        let a = r.insert(PlotKind::TimeSeries(TimeSeriesPlot::new("a")));
-        let b = r.insert(PlotKind::TimeSeries(TimeSeriesPlot::new("b")));
+        let a = r.insert(PlotKind::Scalar(ScalarPanel::new("a")));
+        let b = r.insert(PlotKind::Scalar(ScalarPanel::new("b")));
         assert_ne!(a, b);
         assert_eq!(r.len(), 2);
         assert_eq!(r.get(a).unwrap().title(), "a");

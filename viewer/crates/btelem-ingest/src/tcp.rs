@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use btelem_capture::Capture;
 use btelem_store::MockStore;
 use btelem_wire::{decode_packet, Schema};
 
@@ -52,9 +53,13 @@ impl TcpSource {
     /// into `store`. Returns once the schema has been read and channels
     /// registered; the packet loop continues in the background until EOF or
     /// the returned handle is dropped.
+    ///
+    /// If `capture` is `Some`, the schema blob and every raw packet are
+    /// also pushed into it for later `.btlm` saving.
     pub fn connect(
         addr: impl ToSocketAddrs,
         store: MockStore,
+        capture: Option<Capture>,
     ) -> Result<SourceHandle, IngestError> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_millis(250)))?;
@@ -64,12 +69,15 @@ impl TcpSource {
         read_exact_or_eof(&mut stream, &mut buf)?;
         let schema = Schema::decode(&buf)?;
         let map = ChannelMap::build(&schema, &store)?;
+        if let Some(cap) = &capture {
+            cap.set_schema(buf);
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let join = thread::Builder::new()
             .name("btelem-ingest-tcp".into())
-            .spawn(move || packet_loop(stream, store, map, stop_thread))?;
+            .spawn(move || packet_loop(stream, store, map, capture, stop_thread))?;
 
         Ok(SourceHandle {
             stop,
@@ -82,6 +90,7 @@ fn packet_loop(
     mut stream: TcpStream,
     store: MockStore,
     map: ChannelMap,
+    capture: Option<Capture>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), IngestError> {
     let mut pkt = Vec::new();
@@ -101,6 +110,10 @@ fn packet_loop(
         let p = decode_packet(&pkt)?;
         for e in &p.entries {
             map.dispatch(e.id, e.timestamp, e.payload, &store);
+        }
+        if let Some(cap) = &capture {
+            // Decode already succeeded; tee a copy of the raw bytes.
+            let _ = cap.push_packet(pkt.clone());
         }
     }
     Ok(())

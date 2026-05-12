@@ -35,9 +35,8 @@ impl MockStore {
     }
 
     /// Register a scalar channel whose underlying storage is an integer
-    /// type (u8/u16/.../i64, bitfield word). Behaves like
-    /// [`Self::add_scalar`] for query purposes but sets
-    /// `integer_storage = true` on the [`ChannelInfo`].
+    /// type (u8/u16/.../i64). Behaves like [`Self::add_scalar`] for query
+    /// purposes but sets `integer_storage = true` on the [`ChannelInfo`].
     pub fn add_scalar_int(&self, path: impl Into<String>) -> ChannelId {
         self.add_scalar_with(path, true)
     }
@@ -110,18 +109,7 @@ impl MockStore {
         }
         g.revision += 1;
     }
-    /// Drop every channel and sample. Bumps the revision once. Used when
-    /// the user reconnects to a different source, since channel ids are
-    /// allocated densely from zero by the mapper.
-    pub fn clear(&self) {
-        let mut g = self.inner.write().unwrap();
-        g.channels.clear();
-        g.scalars.clear();
-        g.states.clear();
-        g.revision = g.revision.wrapping_add(1);
-    }
 }
-
 impl Store for MockStore {
     fn channels(&self) -> Vec<ChannelInfo> {
         self.inner.read().unwrap().channels.clone()
@@ -269,6 +257,14 @@ impl Store for MockStore {
                 .unwrap_or(0),
         }
     }
+
+    fn clear(&self) {
+        let mut g = self.inner.write().unwrap();
+        g.channels.clear();
+        g.scalars.clear();
+        g.states.clear();
+        g.revision = g.revision.wrapping_add(1);
+    }
 }
 
 #[cfg(test)]
@@ -393,5 +389,19 @@ mod tests {
     fn sample_count_unknown_channel_returns_zero() {
         let s = MockStore::new();
         assert_eq!(s.sample_count(99), 0);
+    }
+
+    #[test]
+    fn clear_empties_store_and_bumps_revision() {
+        let s = MockStore::new();
+        let sc = s.add_scalar("a");
+        s.push_scalar(sc, 0, 1.0);
+        s.push_scalar(sc, 10, 2.0);
+        let rev_before = s.revision();
+        Store::clear(&s);
+        assert!(s.channels().is_empty());
+        assert_eq!(s.time_bounds(), None);
+        assert_eq!(s.sample_count(sc), 0);
+        assert!(s.revision() > rev_before);
     }
 }

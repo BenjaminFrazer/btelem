@@ -13,8 +13,8 @@ use egui_plot::{
 };
 
 use crate::view_state::{
-    fit_label, Camera, LineStyle as SigLineStyle, LineWidth, MarkerSet, PlotKind, PlotRegistry,
-    SignalStyle, TimeBase, TimeSeriesPlot, XYPlot,
+    fit_label, Camera, LabelRadix, LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel,
+    MarkerSet, PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateChartPanel, TimeBase, XYPlot,
 };
 
 /// Pixels per character used to truncate state-lane labels. Matches the
@@ -33,26 +33,19 @@ const Y_AXIS_GUTTER: f32 = 48.0;
 //  Public entry points
 // ============================================================================
 
-/// Render a TimeSeries plot (scalar overlay + state lanes).
-pub fn render_timeseries(
+/// Render a Scalar plot (continuous line + envelope, shared y-axis).
+pub fn render_scalar_plot(
     ui: &mut egui::Ui,
     ctx: &mut PlotContext<'_>,
     pid: u64,
-    panel: &TimeSeriesPlot,
+    panel: &ScalarPanel,
 ) {
     let Some((t0, t1)) = ctx.view else {
         ui.centered_and_justified(|ui| ui.label("waiting for data…"));
         return;
     };
 
-    let lanes = panel.states.len();
-    let lane_h = 24.0;
-
-    // Header (title + [follow]/[free]) — render first so we can measure
-    // exactly how much vertical space it consumed, then size the scalar
-    // section to fill the rest minus the lanes. Otherwise the lanes spill
-    // past the tab and force a vertical scrollbar.
-    let y_before_header = ui.cursor().top();
+    // Header (title + [mode]) — sized first so the plot can claim the rest.
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(&panel.title).strong());
         ui.label(
@@ -61,18 +54,113 @@ pub fn render_timeseries(
                 .weak(),
         );
     });
-    let header_h = ui.cursor().top() - y_before_header;
     let item_spacing = ui.spacing().item_spacing.y;
-    // Each child widget contributes lane_h + item_spacing to the layout.
-    let lanes_total = lanes as f32 * (lane_h + item_spacing);
-    let scalar_h = (ui.available_height() - lanes_total - item_spacing).max(80.0);
-    let _ = header_h; // header is already consumed from available_height
+    let height = (ui.available_height() - item_spacing).max(80.0);
 
-    let gutter = render_scalar_section(ui, ctx, pid, panel, (t0, t1), scalar_h);
+    let _ = render_scalar_section(ui, ctx, pid, panel, (t0, t1), height);
+}
 
-    for (lane_idx, ch) in panel.states.iter().enumerate() {
-        render_state_lane(ui, ctx, pid, *ch, lane_idx, (t0, t1), lane_h, gutter);
+/// Render a StateChart plot (stacked coloured lanes — one per state channel).
+/// The panel's vertical footprint is `lanes * lane_h`; if lanes don't fit a
+/// scroll area is used so each lane keeps its fixed height.
+pub fn render_state_chart(
+    ui: &mut egui::Ui,
+    ctx: &mut PlotContext<'_>,
+    pid: u64,
+    panel: &StateChartPanel,
+) {
+    let Some((t0, t1)) = ctx.view else {
+        ui.centered_and_justified(|ui| ui.label("waiting for data…"));
+        return;
+    };
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(&panel.title).strong());
+        ui.label(
+            egui::RichText::new(format!("[{}]", ctx.cam.mode.label()))
+                .small()
+                .weak(),
+        );
+    });
+
+    if panel.lanes.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.label(
+                egui::RichText::new("drop state channels here")
+                    .weak(),
+            );
+        });
+        return;
     }
+
+    const LANE_H: f32 = 24.0;
+    // Gutter mirrors the scalar plot so lanes line up when placed adjacent.
+    let gutter = Y_AXIS_GUTTER;
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (lane_idx, ch) in panel.lanes.iter().enumerate() {
+                render_state_lane(ui, ctx, pid, *ch, lane_idx, (t0, t1), LANE_H, gutter);
+            }
+        });
+}
+
+/// Render a Logic Analyser panel: stacked equally-sized stairs lanes,
+/// one per integer-storage channel. Wide enough steps get a numeric
+/// label formatted per the lane's `radix` (Hex / Dec / Bin).
+pub fn render_logic_analyser(
+    ui: &mut egui::Ui,
+    ctx: &mut PlotContext<'_>,
+    pid: u64,
+    panel: &LogicAnalyserPanel,
+) {
+    let Some((t0, t1)) = ctx.view else {
+        ui.centered_and_justified(|ui| ui.label("waiting for data…"));
+        return;
+    };
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(&panel.title).strong());
+        ui.label(
+            egui::RichText::new(format!("[{}]", ctx.cam.mode.label()))
+                .small()
+                .weak(),
+        );
+    });
+
+    if panel.lanes.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.label(egui::RichText::new("drop integer channels here").weak());
+        });
+        return;
+    }
+
+    let item_spacing = ui.spacing().item_spacing.y;
+    let lane_count = panel.lanes.len() as f32;
+    // Equally-sized lanes filling the available pane height, clamped to
+    // a sensible band so they don't shrink to nothing on tall stacks.
+    let lane_h = ((ui.available_height() - (lane_count - 1.0).max(0.0) * item_spacing)
+        / lane_count)
+        .clamp(20.0, 60.0);
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (lane_idx, lane) in panel.lanes.iter().enumerate() {
+                render_logic_lane(
+                    ui,
+                    ctx,
+                    pid,
+                    lane_idx,
+                    lane.ch,
+                    lane.radix,
+                    (t0, t1),
+                    lane_h,
+                    Y_AXIS_GUTTER,
+                );
+            }
+        });
 }
 
 /// Render an XY plot (parametric scalar X vs scalar Y).
@@ -143,17 +231,17 @@ fn render_scalar_section(
     ui: &mut egui::Ui,
     ctx: &mut PlotContext<'_>,
     pid: u64,
-    panel: &TimeSeriesPlot,
+    panel: &ScalarPanel,
     (t0, t1): (u64, u64),
     height: f32,
 ) -> f32 {
     let width_px = ui.available_width().max(64.0);
     let max_buckets = (width_px as usize).max(64);
 
-    let mut signals: Vec<SignalData> = Vec::with_capacity(panel.scalars.len());
+    let mut signals: Vec<SignalData> = Vec::with_capacity(panel.channels.len());
     let mut ymin = f64::INFINITY;
     let mut ymax = f64::NEG_INFINITY;
-    for (idx, ch) in panel.scalars.iter().enumerate() {
+    for (idx, ch) in panel.channels.iter().enumerate() {
         let bs = ctx.store.query_scalar(*ch, t0, t1, max_buckets);
         if bs.is_empty() {
             continue;
@@ -278,7 +366,7 @@ fn render_scalar_section(
 
 /// Per-signal style submenu. Mutates the plot via `ctx.plots`.
 fn signal_style_menu(ui: &mut egui::Ui, ctx: &mut PlotContext<'_>, pid: u64, ch: ChannelId) {
-    let Some(PlotKind::TimeSeries(panel)) = ctx.plots.get_mut(crate::view_state::PlotId(pid))
+    let Some(PlotKind::Scalar(panel)) = ctx.plots.get_mut(crate::view_state::PlotId(pid))
     else {
         return;
     };
@@ -583,7 +671,8 @@ fn render_state_lane(
     let ch_id = ch;
     inner.response.context_menu(|ui| {
         if ui.button("Remove from plot").clicked() {
-            if let Some(PlotKind::TimeSeries(p)) = ctx.plots.get_mut(crate::view_state::PlotId(pid))
+            if let Some(PlotKind::StateChart(p)) =
+                ctx.plots.get_mut(crate::view_state::PlotId(pid))
             {
                 p.remove(ch_id);
             }
@@ -598,6 +687,201 @@ fn render_state_lane(
         egui::Sense::click_and_drag(),
     );
     handle_marker_interaction(ui, ctx, &drag, &inner.transform);
+}
+
+/// One row in a Logic Analyser panel. Renders the channel's integer
+/// value as stairs across the visible time window. Wide enough steps get
+/// a numeric label formatted per `radix`.
+#[allow(clippy::too_many_arguments)]
+fn render_logic_lane(
+    ui: &mut egui::Ui,
+    ctx: &mut PlotContext<'_>,
+    pid: u64,
+    lane_idx: usize,
+    ch: ChannelId,
+    radix: LabelRadix,
+    (t0, t1): (u64, u64),
+    height: f32,
+    gutter: f32,
+) {
+    let Some(info) = ctx.by_id.get(&ch) else {
+        return;
+    };
+    let path = info.path.clone();
+
+    // Collect "runs" of held integer values, regardless of channel kind.
+    let runs: Vec<LogicRun> = match &info.kind {
+        ChannelKind::State { .. } => ctx
+            .store
+            .query_state(ch, t0, t1)
+            .into_iter()
+            .map(|r| LogicRun {
+                t_start: r.t_start,
+                t_end: r.t_end,
+                value: r.value as i64,
+            })
+            .collect(),
+        ChannelKind::Scalar => {
+            let max_buckets = (ui.available_width() as usize).max(64);
+            let bs = ctx.store.query_scalar(ch, t0, t1, max_buckets);
+            let mut out: Vec<LogicRun> = Vec::with_capacity(bs.len());
+            for b in &bs {
+                let v = b.max as i64;
+                if let Some(last) = out.last_mut() {
+                    if last.value == v {
+                        last.t_end = b.t;
+                        continue;
+                    } else {
+                        last.t_end = b.t;
+                    }
+                }
+                out.push(LogicRun {
+                    t_start: b.t,
+                    t_end: b.t,
+                    value: v,
+                });
+            }
+            if let Some(last) = out.last_mut() {
+                last.t_end = t1;
+            }
+            out
+        }
+    };
+
+    let plot = Plot::new(egui::Id::new(("logic_lane", pid, ch)))
+        .height(height)
+        .show_axes([false, true])
+        .y_axis_min_width(gutter)
+        .y_axis_formatter(|_, _| String::new())
+        .show_grid(false)
+        .allow_drag(false)
+        .allow_zoom(false)
+        .allow_scroll(false);
+
+    let inner = plot.show(ui, |pui| {
+        let xmin = (t0 as f64) / 1e9;
+        let xmax = (t1 as f64) / 1e9;
+        pui.set_plot_bounds(PlotBounds::from_min_max([xmin, 0.0], [xmax, 1.0]));
+        let px_per_sec = pui.transform().dpos_dvalue_x();
+        let fill = palette(lane_idx);
+        let mut bars: Vec<Bar> = Vec::with_capacity(runs.len());
+        let mut texts: Vec<(f64, String, Color32)> = Vec::with_capacity(runs.len());
+        for r in &runs {
+            let s = (r.t_start.max(t0) as f64) / 1e9;
+            let e = (r.t_end.min(t1) as f64) / 1e9;
+            if e <= s {
+                continue;
+            }
+            let mid = (s + e) / 2.0;
+            let w = (e - s).max(1e-9);
+            bars.push(
+                Bar::new(mid, 1.0)
+                    .width(w)
+                    .name(format!("{}: {}", path, format_logic_value(r.value, radix)))
+                    .fill(fill),
+            );
+            // Only label steps wider than ~20px.
+            let bar_px = w * px_per_sec;
+            if bar_px >= 20.0 {
+                let label = format_logic_value(r.value, radix);
+                let chars = ((bar_px / PX_PER_CHAR).floor() as i64).max(0) as usize;
+                let fitted = fit_label(&label, chars);
+                if !fitted.is_empty() {
+                    texts.push((mid, fitted, contrast_text_colour(fill)));
+                }
+            }
+        }
+        pui.bar_chart(BarChart::new(bars));
+        for (mid, t, col) in texts {
+            pui.text(
+                Text::new(PlotPoint::new(mid, 0.5), egui::RichText::new(t).monospace())
+                    .color(col)
+                    .anchor(egui::Align2::CENTER_CENTER),
+            );
+        }
+        let pad_s = (xmax - xmin) * 0.005;
+        pui.text(
+            Text::new(
+                PlotPoint::new(xmin + pad_s, 0.5),
+                egui::RichText::new(short_name(&path))
+                    .monospace()
+                    .color(Color32::from_rgba_unmultiplied(255, 255, 255, 220))
+                    .background_color(Color32::from_rgba_unmultiplied(0, 0, 0, 160)),
+            )
+            .anchor(egui::Align2::LEFT_CENTER),
+        );
+        render_markers(pui, ctx.markers);
+    });
+
+    // Per-lane context menu: Remove + radix submenu.
+    let ch_id = ch;
+    inner.response.context_menu(|ui| {
+        if ui.button("Remove from plot").clicked() {
+            if let Some(PlotKind::LogicAnalyser(p)) =
+                ctx.plots.get_mut(crate::view_state::PlotId(pid))
+            {
+                p.remove(ch_id);
+            }
+            ui.close_menu();
+        }
+        ui.menu_button("Radix", |ui| {
+            let mut new_radix: Option<LabelRadix> = None;
+            if ui.radio(radix == LabelRadix::Hex, "Hex (0xFF)").clicked() {
+                new_radix = Some(LabelRadix::Hex);
+            }
+            if ui.radio(radix == LabelRadix::Dec, "Decimal").clicked() {
+                new_radix = Some(LabelRadix::Dec);
+            }
+            if ui.radio(radix == LabelRadix::Bin, "Binary (0b…)").clicked() {
+                new_radix = Some(LabelRadix::Bin);
+            }
+            if let Some(r) = new_radix {
+                if let Some(PlotKind::LogicAnalyser(p)) =
+                    ctx.plots.get_mut(crate::view_state::PlotId(pid))
+                {
+                    if let Some(slot) = p.radix_for_mut(ch_id) {
+                        *slot = r;
+                    }
+                }
+                ui.close_menu();
+            }
+        });
+    });
+
+    // Marker drag also works on logic lanes.
+    let drag = ui.interact(
+        inner.response.rect,
+        egui::Id::new(("logic_lane_marker_overlay", pid, ch)),
+        egui::Sense::click_and_drag(),
+    );
+    handle_marker_interaction(ui, ctx, &drag, &inner.transform);
+}
+
+#[derive(Clone, Copy)]
+struct LogicRun {
+    t_start: u64,
+    t_end: u64,
+    value: i64,
+}
+
+fn format_logic_value(v: i64, radix: LabelRadix) -> String {
+    match radix {
+        LabelRadix::Dec => v.to_string(),
+        LabelRadix::Hex => {
+            if v < 0 {
+                format!("-0x{:X}", -v)
+            } else {
+                format!("0x{:X}", v)
+            }
+        }
+        LabelRadix::Bin => {
+            if v < 0 {
+                format!("-0b{:b}", -v)
+            } else {
+                format!("0b{:b}", v)
+            }
+        }
+    }
 }
 
 // ============================================================================
