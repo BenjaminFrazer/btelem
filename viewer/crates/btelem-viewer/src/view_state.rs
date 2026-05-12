@@ -26,6 +26,54 @@ pub struct TimeSeriesPlot {
     pub title: String,
     pub scalars: Vec<ChannelId>,
     pub states: Vec<ChannelId>,
+    /// Per-channel render style overrides. Sparse: absent channels render
+    /// with `SignalStyle::default()` so existing plots (or any plot whose
+    /// user hasn't touched the style menu) look exactly as before.
+    pub styles: HashMap<ChannelId, SignalStyle>,
+}
+
+/// How a scalar signal is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineStyle {
+    /// Solid line connecting bucket midpoints. Auto-dots when zoomed in
+    /// past `SCATTER_THRESHOLD` buckets.
+    #[default]
+    Line,
+    /// Staircase (sample-and-hold) connecting bucket midpoints. Auto-dots
+    /// on zoom-in (same gate as `Line`).
+    Step,
+    /// Scatter only — no connecting line. Dots always visible.
+    Points,
+    /// Solid line *and* dots, always (no zoom-density gating).
+    PointsLine,
+}
+
+/// Coarse line-width preset. Mapped to pixel widths by the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineWidth {
+    Thin,
+    #[default]
+    Medium,
+    Thick,
+}
+
+/// Per-signal render style. `envelope` defaults to true to preserve the
+/// dashed min/max band that scalar plots have always drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalStyle {
+    pub line: LineStyle,
+    pub width: LineWidth,
+    pub envelope: bool,
+}
+
+impl Default for SignalStyle {
+    fn default() -> Self {
+        Self {
+            line: LineStyle::Line,
+            width: LineWidth::Medium,
+            envelope: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +92,7 @@ impl TimeSeriesPlot {
             title: title.into(),
             scalars: Vec::new(),
             states: Vec::new(),
+            styles: HashMap::new(),
         }
     }
 
@@ -63,6 +112,20 @@ impl TimeSeriesPlot {
     pub fn remove(&mut self, id: ChannelId) {
         self.scalars.retain(|x| *x != id);
         self.states.retain(|x| *x != id);
+        self.styles.remove(&id);
+    }
+
+    /// Resolve the style for `ch`, falling back to the default when no
+    /// override has been set. Always returns a valid style — callers
+    /// shouldn't have to think about absent entries.
+    pub fn style_for(&self, ch: ChannelId) -> SignalStyle {
+        self.styles.get(&ch).copied().unwrap_or_default()
+    }
+
+    /// Mutably access the style for `ch`, inserting a default if absent.
+    /// Useful when wiring up UI widgets that read-modify-write.
+    pub fn style_for_mut(&mut self, ch: ChannelId) -> &mut SignalStyle {
+        self.styles.entry(ch).or_default()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -863,6 +926,50 @@ mod tests {
         assert_eq!(p.states, vec![20]);
         p.remove(10);
         assert!(p.scalars.is_empty());
+    }
+
+    // ---- SignalStyle / TimeSeriesPlot.styles ----
+
+    #[test]
+    fn signal_style_default_matches_legacy_render() {
+        let d = SignalStyle::default();
+        assert_eq!(d.line, LineStyle::Line);
+        assert_eq!(d.width, LineWidth::Medium);
+        assert!(d.envelope, "envelope on by default = today's look");
+    }
+
+    #[test]
+    fn style_for_returns_default_when_absent() {
+        let p = TimeSeriesPlot::new("p");
+        assert_eq!(p.style_for(42), SignalStyle::default());
+    }
+
+    #[test]
+    fn style_for_mut_inserts_default_then_overwrites() {
+        let mut p = TimeSeriesPlot::new("p");
+        {
+            let s = p.style_for_mut(7);
+            s.line = LineStyle::Step;
+            s.envelope = false;
+        }
+        let stored = p.style_for(7);
+        assert_eq!(stored.line, LineStyle::Step);
+        assert!(!stored.envelope);
+        // Width left at default.
+        assert_eq!(stored.width, LineWidth::Medium);
+    }
+
+    #[test]
+    fn removing_channel_clears_its_style() {
+        let mut p = TimeSeriesPlot::new("p");
+        let s = scalar(99, "ch");
+        p.add(&s);
+        p.style_for_mut(99).line = LineStyle::Points;
+        assert!(p.styles.contains_key(&99));
+        p.remove(99);
+        assert!(!p.styles.contains_key(&99));
+        // And style_for falls back to default again.
+        assert_eq!(p.style_for(99), SignalStyle::default());
     }
 
     // ---- PlotKind / accepts ----

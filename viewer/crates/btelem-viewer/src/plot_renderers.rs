@@ -13,7 +13,8 @@ use egui_plot::{
 };
 
 use crate::view_state::{
-    fit_label, Camera, MarkerSet, PlotKind, PlotRegistry, TimeBase, TimeSeriesPlot, XYPlot,
+    fit_label, Camera, LineStyle as SigLineStyle, LineWidth, MarkerSet, PlotKind, PlotRegistry,
+    SignalStyle, TimeBase, TimeSeriesPlot, XYPlot,
 };
 
 /// Pixels per character used to truncate state-lane labels. Matches the
@@ -174,6 +175,7 @@ fn render_scalar_section(
             name: ctx.by_id.get(ch).map(|c| c.path.clone()).unwrap_or_default(),
             colour: palette(idx),
             points: pts,
+            style: panel.style_for(*ch),
         });
     }
 
@@ -230,6 +232,31 @@ fn render_scalar_section(
         primary_drag_available,
     );
 
+    // Right-click → per-signal style menu. Snapshot legend entries before
+    // the closure so we don't double-borrow `ctx.plots` (the writes go via
+    // `ctx.plots.get_mut(...)`).
+    let legend: Vec<(ChannelId, String, Color32)> = signals
+        .iter()
+        .map(|s| (s.ch, s.name.clone(), s.colour))
+        .collect();
+    drag.context_menu(|ui| {
+        ui.set_min_width(220.0);
+        if legend.is_empty() {
+            ui.label(egui::RichText::new("(no signals)").weak());
+            return;
+        }
+        ui.label(egui::RichText::new("Signal styles").strong());
+        ui.separator();
+        for (ch, name, colour) in &legend {
+            ui.menu_button(
+                egui::RichText::new(format!("● {}", short_name(name))).color(*colour),
+                |ui| {
+                    signal_style_menu(ui, ctx, pid, *ch);
+                },
+            );
+        }
+    });
+
     if let Some(t_s) = hover_t {
         if inner.response.hovered() || drag.hovered() {
             *ctx.cursor_t = Some((t_s.max(0.0) * 1e9) as u64);
@@ -238,43 +265,126 @@ fn render_scalar_section(
     }
 }
 
+/// Per-signal style submenu. Mutates the plot via `ctx.plots`.
+fn signal_style_menu(ui: &mut egui::Ui, ctx: &mut PlotContext<'_>, pid: u64, ch: ChannelId) {
+    let Some(PlotKind::TimeSeries(panel)) = ctx.plots.get_mut(crate::view_state::PlotId(pid))
+    else {
+        return;
+    };
+    let style = panel.style_for_mut(ch);
+    ui.label(egui::RichText::new("Line").weak());
+    ui.radio_value(&mut style.line, SigLineStyle::Line, "Line");
+    ui.radio_value(&mut style.line, SigLineStyle::Step, "Step");
+    ui.radio_value(&mut style.line, SigLineStyle::Points, "Points");
+    ui.radio_value(&mut style.line, SigLineStyle::PointsLine, "Points + line");
+    ui.separator();
+    ui.label(egui::RichText::new("Width").weak());
+    ui.radio_value(&mut style.width, LineWidth::Thin, "Thin");
+    ui.radio_value(&mut style.width, LineWidth::Medium, "Medium");
+    ui.radio_value(&mut style.width, LineWidth::Thick, "Thick");
+    ui.separator();
+    ui.checkbox(&mut style.envelope, "Min/max envelope");
+}
+
 /// Internal per-signal bundle used by the scalar renderer + pair overlays.
 struct SignalData {
     ch: ChannelId,
     name: String,
     colour: Color32,
     points: Vec<(f64, f64, f64)>, // (t_s, min, max)
+    style: SignalStyle,
+}
+
+/// Coarse width preset → pixel width.
+fn width_px(w: LineWidth) -> f32 {
+    match w {
+        LineWidth::Thin => 1.0,
+        LineWidth::Medium => 1.5,
+        LineWidth::Thick => 3.0,
+    }
+}
+
+/// Expand bucket midpoints into a staircase polyline:
+/// `[(t0, v0), (t1, v0), (t1, v1), (t2, v1), …]`. Output has roughly 2× as
+/// many vertices as input (capped by `max_buckets ≈ width_px`).
+fn step_polyline(points: &[(f64, f64, f64)]) -> Vec<[f64; 2]> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(points.len() * 2);
+    let mut prev_v = (points[0].1 + points[0].2) * 0.5;
+    out.push([points[0].0, prev_v]);
+    for (t, lo, hi) in points.iter().skip(1) {
+        let v = (lo + hi) * 0.5;
+        out.push([*t, prev_v]);
+        out.push([*t, v]);
+        prev_v = v;
+    }
+    out
 }
 
 fn draw_signal(pui: &mut PlotUi, sig: &SignalData) {
-    let mids: PlotPoints = sig
-        .points
-        .iter()
-        .map(|(t, lo, hi)| [*t, (lo + hi) * 0.5])
-        .collect();
-    let mins: PlotPoints = sig.points.iter().map(|(t, lo, _)| [*t, *lo]).collect();
-    let maxs: PlotPoints = sig.points.iter().map(|(t, _, hi)| [*t, *hi]).collect();
-    let envelope = sig.colour.linear_multiply(0.6);
-    pui.line(
-        Line::new(mins)
-            .color(envelope)
-            .style(LineStyle::dashed_loose())
-            .name(format!("{} (min)", sig.name)),
+    let style = sig.style;
+    let main_w = width_px(style.width);
+
+    if style.envelope {
+        let mins: PlotPoints = sig.points.iter().map(|(t, lo, _)| [*t, *lo]).collect();
+        let maxs: PlotPoints = sig.points.iter().map(|(t, _, hi)| [*t, *hi]).collect();
+        let envelope = sig.colour.linear_multiply(0.6);
+        pui.line(
+            Line::new(mins)
+                .color(envelope)
+                .style(LineStyle::dashed_loose())
+                .name(format!("{} (min)", sig.name)),
+        );
+        pui.line(
+            Line::new(maxs)
+                .color(envelope)
+                .style(LineStyle::dashed_loose())
+                .name(format!("{} (max)", sig.name)),
+        );
+    }
+
+    // Mid-line according to style.
+    let draw_line = matches!(
+        style.line,
+        SigLineStyle::Line | SigLineStyle::Step | SigLineStyle::PointsLine
     );
-    pui.line(
-        Line::new(maxs)
-            .color(envelope)
-            .style(LineStyle::dashed_loose())
-            .name(format!("{} (max)", sig.name)),
-    );
-    pui.line(Line::new(mids).color(sig.colour).name(&sig.name));
-    if sig.points.len() < SCATTER_THRESHOLD {
+    if draw_line {
+        let mids: PlotPoints = match style.line {
+            SigLineStyle::Step => PlotPoints::from(step_polyline(&sig.points)),
+            _ => sig
+                .points
+                .iter()
+                .map(|(t, lo, hi)| [*t, (lo + hi) * 0.5])
+                .collect(),
+        };
+        pui.line(
+            Line::new(mids)
+                .color(sig.colour)
+                .width(main_w)
+                .name(&sig.name),
+        );
+    }
+
+    // Scatter dots: always for Points/PointsLine; zoom-density fallback for
+    // Line/Step (matches today's behaviour of hinting "real samples").
+    let scatter = match style.line {
+        SigLineStyle::Points | SigLineStyle::PointsLine => true,
+        SigLineStyle::Line | SigLineStyle::Step => sig.points.len() < SCATTER_THRESHOLD,
+    };
+    if scatter {
         let dots: PlotPoints = sig
             .points
             .iter()
             .map(|(t, lo, hi)| [*t, (lo + hi) * 0.5])
             .collect();
-        pui.points(Points::new(dots).color(sig.colour).radius(2.5));
+        let mut pts = Points::new(dots).color(sig.colour).radius(2.5);
+        // When Points-only, name the scatter so it shows in the legend.
+        if matches!(style.line, SigLineStyle::Points) {
+            pts = pts.name(&sig.name);
+        }
+        pui.points(pts);
     }
 }
 
