@@ -223,6 +223,10 @@ fn render_scalar_section(
     // system isn't holding it (no marker is being dragged, no marker hit
     // under cursor on press, and we're not in marker-mode placement).
     let primary_drag_available = ctx.dragging_marker.is_none() && !ctx.marker_mode;
+    let data_span_ns = ctx
+        .store
+        .time_bounds()
+        .map(|(a, b)| b.saturating_sub(a));
     handle_camera(
         ui,
         ctx.cam,
@@ -230,6 +234,7 @@ fn render_scalar_section(
         &inner.transform,
         interactive,
         primary_drag_available,
+        data_span_ns,
     );
 
     // Right-click → per-signal style menu. Snapshot legend entries before
@@ -599,6 +604,7 @@ fn render_state_lane(
 //  Camera + marker interaction
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn handle_camera(
     ui: &mut egui::Ui,
     cam: &mut Camera,
@@ -606,6 +612,7 @@ fn handle_camera(
     transform: &egui_plot::PlotTransform,
     interactive: bool,
     primary_drag_available: bool,
+    data_span_ns: Option<u64>,
 ) {
     let bounds = transform.bounds();
     let cur = (bounds.min()[0], bounds.max()[0]);
@@ -640,16 +647,11 @@ fn handle_camera(
         if scroll.abs() > 0.5 {
             let factor = (-scroll * 0.0015).exp();
             if cam.follow() {
-                // In Follow mode the data span is the most we can usefully
-                // show; clamping prevents window_ns drifting larger than
-                // valid data and creating a "scroll does nothing" zone
-                // when the user reverses direction.
-                let data_span_ns = ((cur.1 - cur.0).max(0.0) * 1e9) as u64;
-                let max_ns = if data_span_ns > 0 {
-                    Some(data_span_ns)
-                } else {
-                    None
-                };
+                // In Follow mode the *whole* data span is the most we can
+                // usefully show; clamping to the *current view* (as we did
+                // previously) accidentally pinned window_ns to itself and
+                // killed scroll-out entirely.
+                let max_ns = data_span_ns.filter(|n| *n > 0);
                 cam.zoom_window(factor, max_ns);
             } else {
                 let pivot_s = ui
