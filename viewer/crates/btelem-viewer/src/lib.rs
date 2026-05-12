@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod layout;
 pub mod plot_renderers;
 pub mod view_state;
 

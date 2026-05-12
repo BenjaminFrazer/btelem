@@ -3,11 +3,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use btelem_store::{ChannelId, ChannelInfo, ChannelKind};
+use serde::{Deserialize, Serialize};
 
 /// Stable identifier for a plot pane. Decoupled from layout (the dock
 /// stores `PlotId`s, not the plot data itself), so plots survive being
 /// moved between docks/tabs without losing state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlotId(pub u64);
 
 /// One plot pane. The two variants are the only first-class plot
@@ -33,7 +34,7 @@ pub struct TimeSeriesPlot {
 }
 
 /// How a scalar signal is drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LineStyle {
     /// Solid line connecting bucket midpoints. Auto-dots when zoomed in
     /// past `SCATTER_THRESHOLD` buckets.
@@ -49,7 +50,7 @@ pub enum LineStyle {
 }
 
 /// Coarse line-width preset. Mapped to pixel widths by the renderer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LineWidth {
     Thin,
     #[default]
@@ -59,7 +60,7 @@ pub enum LineWidth {
 
 /// Per-signal render style. `envelope` defaults to true to preserve the
 /// dashed min/max band that scalar plots have always drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalStyle {
     pub line: LineStyle,
     pub width: LineWidth,
@@ -128,6 +129,12 @@ impl TimeSeriesPlot {
         self.styles.entry(ch).or_default()
     }
 
+    /// Iterate over every explicit style override (channels left at the
+    /// default are not yielded). Used by layout capture.
+    pub fn styles_iter(&self) -> impl Iterator<Item = (ChannelId, SignalStyle)> + '_ {
+        self.styles.iter().map(|(k, v)| (*k, *v))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.scalars.is_empty() && self.states.is_empty()
     }
@@ -188,6 +195,13 @@ impl PlotRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.plots.is_empty()
+    }
+
+    /// Iterate over registered plot ids. Order is unspecified (HashMap),
+    /// but stable within a single iteration. Used by layout capture to
+    /// pick up any plots that aren't currently in the dock tree.
+    pub fn iter_ids(&self) -> impl Iterator<Item = PlotId> + '_ {
+        self.plots.keys().copied()
     }
 }
 

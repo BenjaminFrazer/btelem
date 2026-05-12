@@ -77,6 +77,18 @@ pub struct ViewerApp {
     group_counts: HashMap<String, u64>,
     group_counts_last_refresh: Option<Instant>,
 
+    // Layouts.
+    /// Display name of the most recently loaded/saved layout, if any.
+    /// Drives the "Save" menu entry (greyed when None).
+    current_layout_name: Option<String>,
+    /// When `Some`, the Save As… popup is open and the contained
+    /// string is the in-progress name buffer.
+    save_as_buffer: Option<String>,
+    /// Short transient message shown next to `status` (e.g.
+    /// "layout 'foo' loaded — 2 unknown channels skipped"). Expires
+    /// ~3s after the timestamp.
+    status_flash: Option<(Instant, String)>,
+
     // Connection settings (editable via the connection dialog).
     connection: Connection,
     connection_dialog_open: bool,
@@ -125,6 +137,9 @@ impl ViewerApp {
             rate: RateEstimator::new(2.0),
             group_counts: HashMap::new(),
             group_counts_last_refresh: None,
+            current_layout_name: None,
+            save_as_buffer: None,
+            status_flash: None,
             pending_connection: connection.clone(),
             connection,
             connection_dialog_open: false,
@@ -240,9 +255,18 @@ impl ViewerApp {
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
+        // Expire any old flash before we paint.
+        if let Some((t, _)) = self.status_flash {
+            if t.elapsed() > Duration::from_secs(3) {
+                self.status_flash = None;
+            }
+        }
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(&self.status);
+                if let Some((_, msg)) = &self.status_flash {
+                    ui.label(egui::RichText::new(msg).color(Color32::LIGHT_BLUE));
+                }
                 ui.separator();
                 if ui
                     .button("🔌 Connection…")
@@ -305,6 +329,8 @@ impl ViewerApp {
                     self.cam.reset();
                 }
                 ui.separator();
+                self.layouts_menu(ui);
+                ui.separator();
                 let rate = self.sample_rate();
                 ui.label(format!(
                     "{} channels · rev {} · {:.0} samp/s · {} markers",
@@ -321,6 +347,167 @@ impl ViewerApp {
                 }
             });
         });
+    }
+
+    /// Render the "Layouts ▾" dropdown. Self-contained so the surrounding
+    /// `top_bar` stays readable.
+    fn layouts_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("📁 Layouts", |ui| {
+            let saved = crate::layout::list().unwrap_or_default();
+            // Current layout label
+            if let Some(name) = &self.current_layout_name {
+                ui.label(egui::RichText::new(format!("current: {name}")).italics().weak());
+                ui.separator();
+            }
+            // Save (only when we know the current name)
+            let can_save = self.current_layout_name.is_some();
+            ui.add_enabled_ui(can_save, |ui| {
+                if ui.button("💾 Save").clicked() {
+                    if let Some(name) = self.current_layout_name.clone() {
+                        self.do_save_layout(&name);
+                        ui.close_menu();
+                    }
+                }
+            });
+            if ui.button("💾 Save As…").clicked() {
+                self.save_as_buffer = Some(
+                    self.current_layout_name.clone().unwrap_or_default(),
+                );
+                ui.close_menu();
+            }
+            ui.separator();
+            ui.menu_button("📂 Load", |ui| {
+                if saved.is_empty() {
+                    ui.label(egui::RichText::new("(none saved yet)").weak());
+                }
+                for name in &saved {
+                    if ui.button(name).clicked() {
+                        self.do_load_layout(name);
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button("🗑 Delete", |ui| {
+                if saved.is_empty() {
+                    ui.label(egui::RichText::new("(none saved yet)").weak());
+                }
+                for name in &saved {
+                    if ui.button(name).clicked() {
+                        self.do_delete_layout(name);
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.separator();
+            if ui.button("📁 Open layouts folder").clicked() {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(crate::layout::layouts_dir())
+                    .spawn();
+                ui.close_menu();
+            }
+        });
+    }
+
+    fn do_save_layout(&mut self, name: &str) {
+        let by_id = self.channels_by_id();
+        let snap = crate::layout::capture(name, &self.plots, &self.dock, &by_id);
+        match crate::layout::save(&snap) {
+            Ok(()) => {
+                self.current_layout_name = Some(name.to_string());
+                self.flash(format!("layout '{name}' saved"));
+            }
+            Err(e) => self.flash(format!("save failed: {e}")),
+        }
+    }
+
+    fn do_load_layout(&mut self, name: &str) {
+        let layout = match crate::layout::load(name) {
+            Ok(l) => l,
+            Err(e) => {
+                self.flash(format!("load '{name}' failed: {e}"));
+                return;
+            }
+        };
+        let channels = self.store.channels();
+        let (registry, dock, report) = crate::layout::apply(&layout, &channels);
+        self.plots = registry;
+        self.dock = dock;
+        // Pick a sensible next_plot_num so freshly-added plots don't
+        // collide with imported titles. We don't know the user's
+        // numbering, so just count past existing.
+        self.next_plot_num = self.plots.len() + 1;
+        self.current_layout_name = Some(layout.name.clone());
+        let suffix = if report.missing_channels > 0 || report.dropped_plots > 0 {
+            format!(
+                " — {} unknown channel(s){}",
+                report.missing_channels,
+                if report.dropped_plots > 0 {
+                    format!(", {} plot(s) dropped", report.dropped_plots)
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            String::new()
+        };
+        self.flash(format!("loaded '{}'{}", layout.name, suffix));
+    }
+
+    fn do_delete_layout(&mut self, name: &str) {
+        match crate::layout::delete(name) {
+            Ok(()) => {
+                if self.current_layout_name.as_deref() == Some(name) {
+                    self.current_layout_name = None;
+                }
+                self.flash(format!("deleted '{name}'"));
+            }
+            Err(e) => self.flash(format!("delete failed: {e}")),
+        }
+    }
+
+    fn flash(&mut self, msg: impl Into<String>) {
+        self.status_flash = Some((Instant::now(), msg.into()));
+    }
+
+    fn save_as_dialog(&mut self, ctx: &egui::Context) {
+        let Some(buf) = self.save_as_buffer.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut commit = false;
+        let mut cancel = false;
+        egui::Window::new("Save layout as")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label("Name:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(buf)
+                        .desired_width(280.0),
+                );
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        commit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if commit {
+            let name = self.save_as_buffer.take().unwrap_or_default();
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                self.do_save_layout(trimmed);
+            }
+        } else if !open || cancel {
+            self.save_as_buffer = None;
+        }
     }
 
     fn connection_dialog(&mut self, ctx: &egui::Context) {
@@ -658,6 +845,7 @@ impl eframe::App for ViewerApp {
         self.handle_global_keys(ctx);
         self.top_bar(ctx);
         self.connection_dialog(ctx);
+        self.save_as_dialog(ctx);
         self.tree_panel(ctx);
         self.cursor_panel(ctx);
 
