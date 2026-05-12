@@ -687,10 +687,30 @@ impl ViewerApp {
                                     };
 
                                     let id = egui::Id::new(("dragch", c.id));
-                                    let row = ui.dnd_drag_source(id, payload, |ui| {
-                                        ui.add(egui::SelectableLabel::new(selected, label))
-                                    });
-                                    let resp = row.inner;
+                                    let drag_count = match &payload {
+                                        DragPayload::Channels(v) => v.len(),
+                                        _ => 1,
+                                    };
+                                    let resp = ui
+                                        .add(egui::SelectableLabel::new(selected, label))
+                                        .interact(egui::Sense::click_and_drag())
+                                        .on_hover_cursor(egui::CursorIcon::Grab);
+                                    resp.dnd_set_drag_payload(payload);
+                                    if ctx.is_being_dragged(resp.id) {
+                                        let preview = if drag_count > 1 {
+                                            format!("📈 {drag_count} signals")
+                                        } else {
+                                            "📈 1 signal".to_string()
+                                        };
+                                        egui::show_tooltip_at_pointer(
+                                            ctx,
+                                            ui.layer_id(),
+                                            egui::Id::new("drag_preview"),
+                                            |ui| {
+                                                ui.label(preview);
+                                            },
+                                        );
+                                    }
                                     if resp.clicked() {
                                         update_selection(
                                             &mut self.tree_selection,
@@ -701,6 +721,7 @@ impl ViewerApp {
                                             shift,
                                         );
                                     }
+                                    let _ = id;
                                 }
                             });
                     }
