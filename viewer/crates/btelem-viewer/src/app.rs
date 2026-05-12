@@ -5,7 +5,7 @@
 //! search) lives in [`crate::view_state`] and is unit-tested headlessly.
 //! This file is the egui glue.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,9 +26,11 @@ const CURSOR_IDLE_MS: u128 = 500;
 
 /// Drag payload from the tree. Plain `ChannelId` would not let us
 /// distinguish "add to a plot" from "seed an XY plot".
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum DragPayload {
     Channel(ChannelId),
+    /// Multiple channels dragged in one gesture (multi-select in the tree).
+    Channels(Vec<ChannelId>),
     XYSeed(ChannelId),
 }
 
@@ -46,6 +48,12 @@ pub struct ViewerApp {
     // Tree.
     tree_query: String,
     xy_drag: XYDragAccumulator,
+    /// Selected channels in the signal tree (for shift/ctrl multi-select
+    /// + multi-drag onto plots).
+    tree_selection: HashSet<ChannelId>,
+    /// Anchor row for shift-range selection. Cleared when the channel
+    /// disappears from the store.
+    tree_anchor: Option<ChannelId>,
 
     // Camera + cursor.
     cam: Camera,
@@ -105,6 +113,8 @@ impl ViewerApp {
             next_plot_num: 2,
             tree_query: String::new(),
             xy_drag: XYDragAccumulator::default(),
+            tree_selection: HashSet::new(),
+            tree_anchor: None,
             cam: Camera::default(),
             cursor_t: None,
             cursor_last_set: None,
@@ -399,14 +409,39 @@ impl ViewerApp {
                 );
                 ui.separator();
                 ui.label(
-                    egui::RichText::new("Drag onto a plot. Shift+drag two scalars to spawn XY.")
-                        .small()
-                        .weak(),
+                    egui::RichText::new(
+                        "Drag onto a plot. Click to select, Ctrl/Shift for multi-select. \
+                         Shift+drag two scalars to spawn XY.",
+                    )
+                    .small()
+                    .weak(),
                 );
                 ui.separator();
 
                 let chs = self.store.channels();
                 let groups = group_by_struct(chs.iter());
+
+                // Visible-order list of channel ids (post-filter), used as the
+                // canonical sequence for shift-range selection and multi-drag.
+                let mut visible: Vec<ChannelId> = Vec::new();
+                for items in groups.values() {
+                    for c in items {
+                        if matches_query(&c.path, &self.tree_query) {
+                            visible.push(c.id);
+                        }
+                    }
+                }
+                // Drop selections that point at channels that no longer exist.
+                let alive: HashSet<ChannelId> =
+                    chs.iter().map(|c| c.id).collect();
+                self.tree_selection.retain(|id| alive.contains(id));
+                if let Some(a) = self.tree_anchor {
+                    if !alive.contains(&a) {
+                        self.tree_anchor = None;
+                    }
+                }
+
+                let ctrl = ui.input(|i| i.modifiers.command);
                 let shift = ui.input(|i| i.modifiers.shift);
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -436,21 +471,49 @@ impl ViewerApp {
                                         .map(|x| x.1)
                                         .unwrap_or(&c.path)
                                         .to_string();
-                                    let label = match c.kind {
-                                        ChannelKind::Scalar => format!("📈 {leaf}"),
-                                        ChannelKind::State { .. } => format!("▮ {leaf}"),
+                                    let icon = match c.kind {
+                                        ChannelKind::Scalar => "📈",
+                                        ChannelKind::State { .. } => "▮",
                                     };
-                                    let id = egui::Id::new(("dragch", c.id));
+                                    let label = format!("{icon} {leaf}");
+                                    let selected = self.tree_selection.contains(&c.id);
+
+                                    // Build the drag payload at press time.
+                                    // - shift+scalar (legacy): XY seed.
+                                    // - this row is part of a multi-selection: drag the whole set.
+                                    // - otherwise: drag just this channel.
                                     let payload = if shift
                                         && matches!(c.kind, ChannelKind::Scalar)
+                                        && self.tree_selection.len() <= 1
                                     {
                                         DragPayload::XYSeed(c.id)
+                                    } else if selected && self.tree_selection.len() > 1 {
+                                        let set = &self.tree_selection;
+                                        let ordered: Vec<ChannelId> = visible
+                                            .iter()
+                                            .copied()
+                                            .filter(|id| set.contains(id))
+                                            .collect();
+                                        DragPayload::Channels(ordered)
                                     } else {
                                         DragPayload::Channel(c.id)
                                     };
-                                    ui.dnd_drag_source(id, payload, |ui| {
-                                        ui.label(label);
+
+                                    let id = egui::Id::new(("dragch", c.id));
+                                    let row = ui.dnd_drag_source(id, payload, |ui| {
+                                        ui.add(egui::SelectableLabel::new(selected, label))
                                     });
+                                    let resp = row.inner;
+                                    if resp.clicked() {
+                                        update_selection(
+                                            &mut self.tree_selection,
+                                            &mut self.tree_anchor,
+                                            &visible,
+                                            c.id,
+                                            ctrl,
+                                            shift,
+                                        );
+                                    }
                                 }
                             });
                     }
@@ -719,12 +782,21 @@ impl<'a> TabViewer for ViewerTabs<'a> {
             .1;
 
         if let Some(payload) = dropped {
-            match *payload {
+            match (*payload).clone() {
                 DragPayload::Channel(ch) => {
                     if let (Some(info), Some(plot)) = (self.by_id.get(&ch), self.plots.get_mut(pid))
                     {
                         if plot.accepts(info) {
                             if let PlotKind::TimeSeries(p) = plot {
+                                p.add(info);
+                            }
+                        }
+                    }
+                }
+                DragPayload::Channels(chs) => {
+                    if let Some(PlotKind::TimeSeries(p)) = self.plots.get_mut(pid) {
+                        for ch in chs {
+                            if let Some(info) = self.by_id.get(&ch) {
                                 p.add(info);
                             }
                         }
@@ -754,6 +826,48 @@ impl<'a> TabViewer for ViewerTabs<'a> {
     }
 }
 
+
+/// Update the tree selection in response to a click on a row.
+///
+/// Behaviour mirrors typical file-manager / IDE conventions:
+/// - plain click: replace selection with just `clicked`, set anchor.
+/// - ctrl/cmd+click: toggle `clicked`; anchor becomes `clicked`.
+/// - shift+click: select the inclusive range from `anchor` to `clicked`
+///   (in visible order); anchor stays. With no anchor, behaves like plain.
+fn update_selection(
+    selection: &mut HashSet<ChannelId>,
+    anchor: &mut Option<ChannelId>,
+    visible: &[ChannelId],
+    clicked: ChannelId,
+    ctrl: bool,
+    shift: bool,
+) {
+    if shift {
+        let a = anchor.or(Some(clicked)).unwrap();
+        let ia = visible.iter().position(|id| *id == a);
+        let ib = visible.iter().position(|id| *id == clicked);
+        if let (Some(ia), Some(ib)) = (ia, ib) {
+            let (lo, hi) = if ia <= ib { (ia, ib) } else { (ib, ia) };
+            selection.clear();
+            selection.extend(visible[lo..=hi].iter().copied());
+            if anchor.is_none() {
+                *anchor = Some(clicked);
+            }
+            return;
+        }
+        // fallback: treat as plain click
+    }
+    if ctrl {
+        if !selection.remove(&clicked) {
+            selection.insert(clicked);
+        }
+        *anchor = Some(clicked);
+        return;
+    }
+    selection.clear();
+    selection.insert(clicked);
+    *anchor = Some(clicked);
+}
 
 /// Render a sample count as a compact string with k/M/G suffixes.
 fn fmt_count(n: u64) -> String {
@@ -787,5 +901,57 @@ mod fmt_count_tests {
         assert_eq!(fmt_count(1_500), "1.5k");
         assert_eq!(fmt_count(2_300_000), "2.3M");
         assert_eq!(fmt_count(4_500_000_000), "4.5G");
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn v() -> Vec<ChannelId> {
+        vec![10, 11, 12, 13, 14]
+    }
+
+    #[test]
+    fn plain_click_replaces_selection_and_sets_anchor() {
+        let mut sel = HashSet::from([11]);
+        let mut anc = Some(11);
+        update_selection(&mut sel, &mut anc, &v(), 13, false, false);
+        assert_eq!(sel, HashSet::from([13]));
+        assert_eq!(anc, Some(13));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_membership() {
+        let mut sel = HashSet::from([10, 12]);
+        let mut anc = Some(10);
+        update_selection(&mut sel, &mut anc, &v(), 12, true, false);
+        assert_eq!(sel, HashSet::from([10]));
+        assert_eq!(anc, Some(12));
+        update_selection(&mut sel, &mut anc, &v(), 14, true, false);
+        assert_eq!(sel, HashSet::from([10, 14]));
+        assert_eq!(anc, Some(14));
+    }
+
+    #[test]
+    fn shift_click_selects_range_in_visible_order() {
+        let mut sel = HashSet::from([11]);
+        let mut anc = Some(11);
+        update_selection(&mut sel, &mut anc, &v(), 13, false, true);
+        assert_eq!(sel, HashSet::from([11, 12, 13]));
+        // Anchor doesn't move on shift-click.
+        assert_eq!(anc, Some(11));
+        // Shift again to a row before anchor: range flips correctly.
+        update_selection(&mut sel, &mut anc, &v(), 10, false, true);
+        assert_eq!(sel, HashSet::from([10, 11]));
+    }
+
+    #[test]
+    fn shift_click_with_no_anchor_falls_back_to_single() {
+        let mut sel = HashSet::new();
+        let mut anc: Option<ChannelId> = None;
+        update_selection(&mut sel, &mut anc, &v(), 12, false, true);
+        assert_eq!(sel, HashSet::from([12]));
+        assert_eq!(anc, Some(12));
     }
 }
