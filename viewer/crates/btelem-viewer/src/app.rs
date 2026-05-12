@@ -229,6 +229,13 @@ impl ViewerApp {
     }
 
     fn handle_global_keys(&mut self, ctx: &egui::Context) {
+        // Don't fire single-letter shortcuts while a text widget (e.g. the
+        // signal-tree search box or the Save-As dialog) has keyboard focus —
+        // otherwise typing 'f' would cycle the timebase, 'm' would toggle
+        // marker mode, etc.
+        if ctx.wants_keyboard_input() {
+            return;
+        }
         ctx.input(|i| {
             if i.key_pressed(egui::Key::F) {
                 self.cam.mode = self.cam.mode.cycle();
