@@ -260,6 +260,9 @@ fn build_field(
                     (b.clone(), ch)
                 })
                 .collect();
+            if let Some(w) = word {
+                store.register_word_bits(w, bits.iter().map(|(_, c)| *c).collect());
+            }
             FieldKind::Bitfield {
                 offset: f.offset,
                 storage_bytes: f.size,
@@ -291,4 +294,66 @@ fn read_scalar(ty: FieldType, payload: &[u8], offset: u16, size: u16) -> Option<
         FieldType::F64 => f64::from_le_bytes(s.try_into().ok()?),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btelem_store::{ChannelKind, Store};
+    use btelem_wire::{BitfieldDef, FieldDef};
+
+    fn bitfield_schema() -> Schema {
+        // One schema entry "flags" with a single u32 bitfield field "f"
+        // containing two bits "a" (bit 0, width 1) and "b" (bit 3, width 2)
+        // — declaration order matters for the test below.
+        let entry = SchemaEntry {
+            id: 1,
+            name: "flags".to_owned(),
+            description: String::new(),
+            payload_size: 4,
+            fields: vec![FieldDef {
+                name: "f".to_owned(),
+                offset: 0,
+                size: 4,
+                ty: FieldType::Bitfield,
+                count: 1,
+            }],
+        };
+        let bf = BitfieldDef {
+            schema_id: 1,
+            field_index: 0,
+            bits: vec![
+                BitDef { name: "a".to_owned(), start: 0, width: 1 },
+                BitDef { name: "b".to_owned(), start: 3, width: 2 },
+            ],
+        };
+        Schema {
+            entries: vec![entry],
+            enums: vec![],
+            bitfields: vec![bf],
+        }
+    }
+
+    #[test]
+    fn bitfield_registration_records_word_to_bits_in_order() {
+        let store = MockStore::new();
+        let schema = bitfield_schema();
+        ChannelMap::build(&schema, &store).unwrap();
+
+        let chans = store.channels();
+        let by_path =
+            |p: &str| -> ChannelId { chans.iter().find(|c| c.path == p).expect(p).id };
+        let word = by_path("flags.f");
+        let bit_a = by_path("flags.f.a");
+        let bit_b = by_path("flags.f.b");
+
+        let info = chans.iter().find(|c| c.id == word).unwrap();
+        assert!(info.integer_storage);
+        assert!(matches!(info.kind, ChannelKind::Scalar));
+
+        let bits = store.bits_for_word(word).expect("mapping registered");
+        assert_eq!(bits, vec![bit_a, bit_b]);
+
+        assert!(store.bits_for_word(bit_a).is_none());
+    }
 }

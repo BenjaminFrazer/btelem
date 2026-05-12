@@ -304,6 +304,132 @@ impl PlotRegistry {
     pub fn iter_ids(&self) -> impl Iterator<Item = PlotId> + '_ {
         self.plots.keys().copied()
     }
+
+    /// Iterate over `(id, plot)` pairs. Order is unspecified.
+    pub fn iter(&self) -> impl Iterator<Item = (PlotId, &PlotKind)> + '_ {
+        self.plots.iter().map(|(k, v)| (*k, v))
+    }
+}
+
+/// Drag payload emitted by the channel tree. Carried in the egui drag
+/// state; consumed by plot drop zones (and peeked at to colour them).
+#[derive(Debug, Clone)]
+pub enum DragPayload {
+    /// Single channel.
+    Channel(ChannelId),
+    /// Multi-select drag from the tree.
+    Channels(Vec<ChannelId>),
+    /// Shift-drag of a scalar to seed an XY plot. Spawns a new plot
+    /// rather than landing on an existing one.
+    XYSeed(ChannelId),
+}
+
+/// Visual hint for a plot's drop zone while a drag is in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropTint {
+    Accept,
+    Reject,
+}
+
+/// Decide how an in-flight drag should tint a plot pane's drop zone.
+/// `None` means no tint should be drawn (no relevant payload, or the
+/// payload doesn't target existing plots — e.g. `XYSeed`).
+pub fn tint_for_drop(
+    payload: &DragPayload,
+    plot: &PlotKind,
+    by_id: &HashMap<ChannelId, ChannelInfo>,
+) -> Option<DropTint> {
+    match payload {
+        DragPayload::Channel(ch) => {
+            let info = by_id.get(ch)?;
+            Some(if plot.accepts(info) {
+                DropTint::Accept
+            } else {
+                DropTint::Reject
+            })
+        }
+        DragPayload::Channels(chs) => {
+            let any = chs
+                .iter()
+                .any(|c| by_id.get(c).is_some_and(|i| plot.accepts(i)));
+            Some(if any {
+                DropTint::Accept
+            } else {
+                DropTint::Reject
+            })
+        }
+        // XY seeds spawn new plots; existing panes neither accept nor
+        // reject them in a meaningful way — leave their drop zones plain.
+        DragPayload::XYSeed(_) => None,
+    }
+}
+
+/// Move a channel from one plot to another. `radix` is honoured only
+/// when both source and destination are LogicAnalyser panels (so the
+/// user-chosen base survives the move). Returns true if the move
+/// happened.
+pub fn try_move_channel(
+    plots: &mut PlotRegistry,
+    from: PlotId,
+    to: PlotId,
+    ch: ChannelId,
+    info: &ChannelInfo,
+    radix: Option<LabelRadix>,
+) -> bool {
+    if from == to {
+        return false;
+    }
+    if !plots.get(to).is_some_and(|k| k.accepts(info)) {
+        return false;
+    }
+    if let Some(plot) = plots.get_mut(to) {
+        match plot {
+            PlotKind::Scalar(p) => {
+                p.add(info);
+            }
+            PlotKind::StateChart(p) => {
+                p.add(info);
+            }
+            PlotKind::LogicAnalyser(p) => {
+                p.add(info);
+                if let (Some(r), Some(slot)) = (radix, p.radix_for_mut(ch)) {
+                    *slot = r;
+                }
+            }
+            PlotKind::XY(_) => {}
+        }
+    }
+    if let Some(plot) = plots.get_mut(from) {
+        match plot {
+            PlotKind::Scalar(p) => p.remove(ch),
+            PlotKind::StateChart(p) => p.remove(ch),
+            PlotKind::LogicAnalyser(p) => p.remove(ch),
+            PlotKind::XY(_) => {}
+        }
+    }
+    true
+}
+
+/// Threshold over which a state lane switches from coloured-block + label
+/// rendering to a heatmap-style colour gradient (no per-segment text).
+pub const STATE_LABEL_TEXT_LIMIT: usize = 16;
+
+/// How a state lane should be drawn given how many distinct integer
+/// values its channel has been observed to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateLaneMode {
+    Labels,
+    Heatmap,
+}
+
+/// Pure decision for `STATE_LABEL_TEXT_LIMIT`: anything strictly above
+/// the limit goes heatmap, anything at-or-below stays labelled.
+pub fn state_lane_mode(distinct: usize) -> StateLaneMode {
+    if distinct > STATE_LABEL_TEXT_LIMIT {
+        StateLaneMode::Heatmap
+    } else {
+        StateLaneMode::Labels
+    }
 }
 
 /// Time-base controller modes. Cycled by the `F` key (Follow → Max → Pan).
@@ -432,6 +558,42 @@ pub fn compute_view(cam: &Camera, data: Option<(u64, u64)>) -> Option<(u64, u64)
             }
         }
     }
+}
+
+/// Substring before the first `.`, or the whole string if no dot. Used as
+/// the "schema group" key for grouping lanes by their owning struct.
+pub fn channel_group(path: &str) -> &str {
+    match path.find('.') {
+        Some(i) => &path[..i],
+        None => path,
+    }
+}
+
+/// Substring after the first `.`, or the whole string if no dot. Used as
+/// the in-plot lane label so duplicate field names from different schemas
+/// remain unambiguous once the schema name is rendered in a gutter.
+pub fn strip_group_prefix(path: &str) -> &str {
+    match path.find('.') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
+
+/// Stable-sort lane indices by their resolved group key. Lanes with no
+/// resolvable group (e.g. `by_id` lookup failed) or an empty key go to
+/// the end. Returns `(lane_idx, group_key)` pairs in render order.
+pub fn group_order(groups: &[Option<&str>]) -> Vec<(usize, String)> {
+    let mut indexed: Vec<(usize, String)> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (i, g.unwrap_or("").to_string()))
+        .collect();
+    indexed.sort_by(|a, b| {
+        a.1.is_empty()
+            .cmp(&b.1.is_empty())
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    indexed
 }
 
 /// Group channels by the first dotted segment of their path.
@@ -1452,6 +1614,134 @@ mod tests {
         assert!(rate > 99.0 && rate < 101.0, "got {rate}");
     }
 
+    // ---- try_move_channel ----
+
+    #[test]
+    fn move_channel_between_compatible_scalar_plots() {
+        let mut r = PlotRegistry::new();
+        let s = scalar(7, "x.y");
+        let mut src = ScalarPanel::new("src");
+        src.add(&s);
+        let from = r.insert(PlotKind::Scalar(src));
+        let to = r.insert(PlotKind::Scalar(ScalarPanel::new("dst")));
+
+        assert!(try_move_channel(&mut r, from, to, s.id, &s, None));
+
+        match r.get(from).unwrap() {
+            PlotKind::Scalar(p) => assert!(p.channels.is_empty(), "source must be cleared"),
+            _ => panic!(),
+        }
+        match r.get(to).unwrap() {
+            PlotKind::Scalar(p) => assert_eq!(p.channels, vec![s.id]),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn move_channel_rejected_by_incompatible_target() {
+        let mut r = PlotRegistry::new();
+        let s = scalar(1, "x");
+        let mut src = ScalarPanel::new("src");
+        src.add(&s);
+        let from = r.insert(PlotKind::Scalar(src));
+        // StateChart doesn't accept scalars.
+        let to = r.insert(PlotKind::StateChart(StateChartPanel::new("dst")));
+        assert!(!try_move_channel(&mut r, from, to, s.id, &s, None));
+        match r.get(from).unwrap() {
+            PlotKind::Scalar(p) => assert_eq!(p.channels, vec![s.id], "source preserved"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn move_channel_logic_to_logic_keeps_radix() {
+        let mut r = PlotRegistry::new();
+        let c = scalar_int(3, "flags");
+        let mut src = LogicAnalyserPanel::new("src");
+        src.add(&c);
+        let from = r.insert(PlotKind::LogicAnalyser(src));
+        let to = r.insert(PlotKind::LogicAnalyser(LogicAnalyserPanel::new("dst")));
+        assert!(try_move_channel(
+            &mut r,
+            from,
+            to,
+            c.id,
+            &c,
+            Some(LabelRadix::Bin)
+        ));
+        match r.get(to).unwrap() {
+            PlotKind::LogicAnalyser(p) => assert_eq!(p.lanes[0].radix, LabelRadix::Bin),
+            _ => panic!(),
+        }
+    }
+
+    // ---- tint_for_drop ----
+
+    #[test]
+    fn tint_accept_for_compatible_single_channel() {
+        let s = scalar(1, "x");
+        let mut by_id = HashMap::new();
+        by_id.insert(s.id, s.clone());
+        let plot = PlotKind::Scalar(ScalarPanel::new("p"));
+        assert_eq!(
+            tint_for_drop(&DragPayload::Channel(s.id), &plot, &by_id),
+            Some(DropTint::Accept)
+        );
+    }
+
+    #[test]
+    fn tint_reject_for_incompatible_single_channel() {
+        let st = state(2, "s");
+        let mut by_id = HashMap::new();
+        by_id.insert(st.id, st.clone());
+        let plot = PlotKind::Scalar(ScalarPanel::new("p"));
+        assert_eq!(
+            tint_for_drop(&DragPayload::Channel(st.id), &plot, &by_id),
+            Some(DropTint::Reject)
+        );
+    }
+
+    #[test]
+    fn tint_multi_drag_accepts_if_any_channel_matches() {
+        let s = scalar(1, "x");
+        let st = state(2, "s");
+        let mut by_id = HashMap::new();
+        by_id.insert(s.id, s.clone());
+        by_id.insert(st.id, st.clone());
+        let plot = PlotKind::Scalar(ScalarPanel::new("p"));
+        let payload = DragPayload::Channels(vec![st.id, s.id]);
+        assert_eq!(tint_for_drop(&payload, &plot, &by_id), Some(DropTint::Accept));
+        let payload = DragPayload::Channels(vec![st.id]);
+        assert_eq!(tint_for_drop(&payload, &plot, &by_id), Some(DropTint::Reject));
+    }
+
+    #[test]
+    fn tint_xyseed_returns_none_for_existing_plot() {
+        let s = scalar(1, "x");
+        let mut by_id = HashMap::new();
+        by_id.insert(s.id, s.clone());
+        let plot = PlotKind::Scalar(ScalarPanel::new("p"));
+        assert_eq!(tint_for_drop(&DragPayload::XYSeed(s.id), &plot, &by_id), None);
+    }
+
+    // ---- state_lane_mode ----
+
+    #[test]
+    fn state_lane_mode_boundary() {
+        // Exactly at the limit stays Labels.
+        assert_eq!(state_lane_mode(STATE_LABEL_TEXT_LIMIT), StateLaneMode::Labels);
+        // One past flips to Heatmap.
+        assert_eq!(
+            state_lane_mode(STATE_LABEL_TEXT_LIMIT + 1),
+            StateLaneMode::Heatmap
+        );
+        // Sanity points either side.
+        assert_eq!(state_lane_mode(0), StateLaneMode::Labels);
+        assert_eq!(state_lane_mode(16), StateLaneMode::Labels);
+        assert_eq!(state_lane_mode(17), StateLaneMode::Heatmap);
+        assert_eq!(state_lane_mode(1000), StateLaneMode::Heatmap);
+    }
+
     #[test]
     fn rate_estimator_drops_samples_outside_window() {
         use std::time::{Duration, Instant};
@@ -1463,5 +1753,68 @@ mod tests {
         // First sample (1.2s old) is evicted; window now spans 0.5..1.2s.
         let rate = r.rate();
         assert!((rate - 214.0).abs() < 5.0, "got {rate}"); // 150 over 0.7s
+    }
+
+    // ---- channel_group / strip_group_prefix / group_order ----
+
+    #[test]
+    fn channel_group_basic() {
+        assert_eq!(channel_group("motor_1.temperature"), "motor_1");
+        assert_eq!(channel_group("flags.f.bit_a"), "flags");
+    }
+
+    #[test]
+    fn channel_group_edge_cases() {
+        assert_eq!(channel_group(""), "");
+        assert_eq!(channel_group("nodot"), "nodot");
+        assert_eq!(channel_group(".leading"), "");
+        assert_eq!(channel_group("trailing."), "trailing");
+        assert_eq!(channel_group("a.b.c.d"), "a");
+    }
+
+    #[test]
+    fn strip_group_prefix_basic() {
+        assert_eq!(strip_group_prefix("motor_1.temperature"), "temperature");
+        assert_eq!(strip_group_prefix("flags.f.bit_a"), "f.bit_a");
+    }
+
+    #[test]
+    fn strip_group_prefix_edge_cases() {
+        assert_eq!(strip_group_prefix(""), "");
+        assert_eq!(strip_group_prefix("nodot"), "nodot");
+        assert_eq!(strip_group_prefix(".leading"), "leading");
+        assert_eq!(strip_group_prefix("trailing."), "");
+        assert_eq!(strip_group_prefix("a.b.c.d"), "b.c.d");
+    }
+
+    #[test]
+    fn group_order_groups_and_keeps_stable() {
+        // Mixed schemas in non-grouped input order; expect stable grouping.
+        let chans = [
+            scalar(1, "motor_1.temperature"),
+            scalar(2, "motor_2.temperature"),
+            scalar(3, "motor_1.rpm"),
+            scalar(4, "motor_2.rpm"),
+            scalar(5, "motor_1.gear"),
+        ];
+        let groups: Vec<Option<&str>> =
+            chans.iter().map(|c| Some(channel_group(&c.path))).collect();
+        let order = group_order(&groups);
+        let idx: Vec<usize> = order.iter().map(|(i, _)| *i).collect();
+        // motor_1 lanes come first (indices 0, 2, 4 in original order),
+        // then motor_2 lanes (1, 3).
+        assert_eq!(idx, vec![0, 2, 4, 1, 3]);
+        let keys: Vec<&str> = order.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(keys, vec!["motor_1", "motor_1", "motor_1", "motor_2", "motor_2"]);
+    }
+
+    #[test]
+    fn group_order_unresolved_goes_to_end() {
+        let groups = vec![Some("b"), None, Some("a"), Some("a"), None];
+        let order = group_order(&groups);
+        let idx: Vec<usize> = order.iter().map(|(i, _)| *i).collect();
+        // "a" group first (stable: idx 2 then 3), then "b" (idx 0), then
+        // unresolved (stable: idx 1 then 4).
+        assert_eq!(idx, vec![2, 3, 0, 1, 4]);
     }
 }

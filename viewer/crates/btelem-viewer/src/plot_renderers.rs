@@ -13,8 +13,10 @@ use egui_plot::{
 };
 
 use crate::view_state::{
-    fit_label, Camera, LabelRadix, LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel,
-    MarkerSet, PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateChartPanel, TimeBase, XYPlot,
+    channel_group, fit_label, group_order, state_lane_mode, strip_group_prefix, try_move_channel,
+    Camera, LabelRadix, LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel, MarkerSet,
+    PlotId, PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateChartPanel, StateLaneMode,
+    TimeBase, XYPlot,
 };
 
 /// Pixels per character used to truncate state-lane labels. Matches the
@@ -28,10 +30,76 @@ const SCATTER_THRESHOLD: usize = 40;
 /// scalar plot and every state lane so their plot regions line up
 /// horizontally regardless of tick label content.
 const Y_AXIS_GUTTER: f32 = 48.0;
+/// Width of the per-group label column drawn to the left of the lane area
+/// when a stacked plot mixes multiple schemas. Hidden entirely when a
+/// plot only contains lanes from a single schema.
+const GROUP_GUTTER: f32 = 16.0;
+/// Cap for plot titles in the "Move to plot…" submenu.
+const MOVE_MENU_TITLE_CHARS: usize = 24;
+
+/// Build the `(target_id, fitted_title)` list for the "Move to plot…"
+/// submenu. Filters self out and only keeps plots whose `accepts(info)`
+/// holds. Returned vec is sorted by id for determinism.
+fn move_targets(
+    plots: &PlotRegistry,
+    self_id: PlotId,
+    info: &ChannelInfo,
+) -> Vec<(PlotId, String)> {
+    let mut out: Vec<(PlotId, String)> = plots
+        .iter()
+        .filter_map(|(id, plot)| {
+            if id == self_id || !plot.accepts(info) {
+                return None;
+            }
+            Some((id, fit_label(plot.title(), MOVE_MENU_TITLE_CHARS)))
+        })
+        .collect();
+    out.sort_by_key(|(id, _)| id.0);
+    out
+}
 
 // ============================================================================
 //  Public entry points
 // ============================================================================
+
+/// Collapse a stable-sorted `(lane_idx, group_key)` list into consecutive
+/// runs sharing the same key. Returns `(key, [lane_idx, …])` in order.
+fn collapse_groups(order: Vec<(usize, String)>) -> Vec<(String, Vec<usize>)> {
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+    for (idx, key) in order {
+        match out.last_mut() {
+            Some(last) if last.0 == key => last.1.push(idx),
+            _ => out.push((key, vec![idx])),
+        }
+    }
+    out
+}
+
+/// Paint the schema name vertically (90° counter-clockwise, reads
+/// bottom-to-top) centered inside `rect`. Uses a small muted monospace
+/// font; over-long text overflows but is clipped to the gutter rect.
+fn paint_group_label(ui: &egui::Ui, rect: egui::Rect, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let font_id = egui::FontId::monospace(11.0);
+    let color = Color32::from_rgba_unmultiplied(220, 220, 220, 180);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font_id, color);
+    let w = galley.size().x;
+    let h = galley.size().y;
+    // After -PI/2 rotation around `pos` (top-left of the glyph run), the
+    // text occupies x ∈ [pos.x, pos.x+h] and y ∈ [pos.y-w, pos.y]. Pick
+    // `pos` so the rotated bounds are centered on the rect's center.
+    let centre = rect.center();
+    let pos = egui::pos2(centre.x - h * 0.5, centre.y + w * 0.5);
+    let mut ts = egui::epaint::TextShape::new(pos, galley, color);
+    ts.angle = -std::f32::consts::FRAC_PI_2;
+    ui.painter()
+        .with_clip_rect(rect)
+        .add(egui::Shape::Text(ts));
+}
 
 /// Render a Scalar plot (continuous line + envelope, shared y-axis).
 pub fn render_scalar_plot(
@@ -94,14 +162,72 @@ pub fn render_state_chart(
     }
 
     const LANE_H: f32 = 24.0;
-    // Gutter mirrors the scalar plot so lanes line up when placed adjacent.
     let gutter = Y_AXIS_GUTTER;
+    let item_spacing = ui.spacing().item_spacing.y;
 
+    // Resolve each lane to its schema group; lanes without by_id entries
+    // get an empty key and sort to the end.
+    let resolved: Vec<Option<&str>> = panel
+        .lanes
+        .iter()
+        .map(|ch| ctx.by_id.get(ch).map(|i| channel_group(&i.path)))
+        .collect();
+    let order = group_order(&resolved);
+    let groups = collapse_groups(order);
+
+    // Single-schema (or no-dot) panels render exactly as before — no
+    // horizontal wrapper, no gutter rect.
+    if groups.len() <= 1 {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (lane_idx, ch) in panel.lanes.iter().enumerate() {
+                    render_state_lane(ui, ctx, pid, *ch, lane_idx, (t0, t1), LANE_H, gutter);
+                }
+            });
+        return;
+    }
+
+    let group_count = groups.len();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (lane_idx, ch) in panel.lanes.iter().enumerate() {
-                render_state_lane(ui, ctx, pid, *ch, lane_idx, (t0, t1), LANE_H, gutter);
+            for (gi, (key, indices)) in groups.iter().enumerate() {
+                let lane_count = indices.len() as f32;
+                let total_h =
+                    lane_count * LANE_H + (lane_count - 1.0).max(0.0) * item_spacing;
+                ui.horizontal(|ui| {
+                    let (gutter_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(GROUP_GUTTER, total_h),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(
+                        gutter_rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 6),
+                    );
+                    paint_group_label(ui, gutter_rect, key);
+                    ui.vertical(|ui| {
+                        for &lane_idx in indices {
+                            let ch = panel.lanes[lane_idx];
+                            render_state_lane(
+                                ui, ctx, pid, ch, lane_idx, (t0, t1), LANE_H, gutter,
+                            );
+                        }
+                    });
+                });
+                if gi + 1 < group_count {
+                    let avail_w = ui.available_width();
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(avail_w, 1.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                    );
+                }
             }
         });
 }
@@ -138,27 +264,97 @@ pub fn render_logic_analyser(
 
     let item_spacing = ui.spacing().item_spacing.y;
     let lane_count = panel.lanes.len() as f32;
-    // Equally-sized lanes filling the available pane height, clamped to
-    // a sensible band so they don't shrink to nothing on tall stacks.
-    let lane_h = ((ui.available_height() - (lane_count - 1.0).max(0.0) * item_spacing)
+
+    // Resolve each lane to its schema group; lanes without by_id entries
+    // get an empty key and sort to the end.
+    let resolved: Vec<Option<&str>> = panel
+        .lanes
+        .iter()
+        .map(|l| ctx.by_id.get(&l.ch).map(|i| channel_group(&i.path)))
+        .collect();
+    let order = group_order(&resolved);
+    let groups = collapse_groups(order);
+
+    // Per-lane height. When grouped, subtract a per-divider allowance so
+    // the visible stack still fits roughly inside `available_height()`.
+    let group_count = groups.len();
+    let divider_budget =
+        (group_count.saturating_sub(1)) as f32 * (item_spacing + 1.0);
+    let lane_h = ((ui.available_height()
+        - (lane_count - 1.0).max(0.0) * item_spacing
+        - divider_budget)
         / lane_count)
         .clamp(20.0, 60.0);
+
+    // Single-schema panels render exactly as before.
+    if groups.len() <= 1 {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (lane_idx, lane) in panel.lanes.iter().enumerate() {
+                    render_logic_lane(
+                        ui,
+                        ctx,
+                        pid,
+                        lane_idx,
+                        lane.ch,
+                        lane.radix,
+                        (t0, t1),
+                        lane_h,
+                        Y_AXIS_GUTTER,
+                    );
+                }
+            });
+        return;
+    }
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (lane_idx, lane) in panel.lanes.iter().enumerate() {
-                render_logic_lane(
-                    ui,
-                    ctx,
-                    pid,
-                    lane_idx,
-                    lane.ch,
-                    lane.radix,
-                    (t0, t1),
-                    lane_h,
-                    Y_AXIS_GUTTER,
-                );
+            for (gi, (key, indices)) in groups.iter().enumerate() {
+                let g_lane_count = indices.len() as f32;
+                let total_h =
+                    g_lane_count * lane_h + (g_lane_count - 1.0).max(0.0) * item_spacing;
+                ui.horizontal(|ui| {
+                    let (gutter_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(GROUP_GUTTER, total_h),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(
+                        gutter_rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 6),
+                    );
+                    paint_group_label(ui, gutter_rect, key);
+                    ui.vertical(|ui| {
+                        for &lane_idx in indices {
+                            let lane = panel.lanes[lane_idx];
+                            render_logic_lane(
+                                ui,
+                                ctx,
+                                pid,
+                                lane_idx,
+                                lane.ch,
+                                lane.radix,
+                                (t0, t1),
+                                lane_h,
+                                Y_AXIS_GUTTER,
+                            );
+                        }
+                    });
+                });
+                if gi + 1 < group_count {
+                    let avail_w = ui.available_width();
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(avail_w, 1.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                    );
+                }
             }
         });
 }
@@ -364,7 +560,8 @@ fn render_scalar_section(
     (inner.transform.frame().left() - inner.response.rect.left()).max(Y_AXIS_GUTTER)
 }
 
-/// Per-signal style submenu. Mutates the plot via `ctx.plots`.
+/// Per-signal style + actions submenu on a Scalar plot. Mutates the plot
+/// via `ctx.plots`.
 fn signal_style_menu(ui: &mut egui::Ui, ctx: &mut PlotContext<'_>, pid: u64, ch: ChannelId) {
     let Some(PlotKind::Scalar(panel)) = ctx.plots.get_mut(crate::view_state::PlotId(pid))
     else {
@@ -383,6 +580,29 @@ fn signal_style_menu(ui: &mut egui::Ui, ctx: &mut PlotContext<'_>, pid: u64, ch:
     ui.radio_value(&mut style.width, LineWidth::Thick, "Thick");
     ui.separator();
     ui.checkbox(&mut style.envelope, "Min/max envelope");
+    ui.separator();
+
+    // Snapshot info before re-borrowing ctx.plots for the move targets.
+    let info = ctx.by_id.get(&ch).cloned();
+    if let Some(info) = info {
+        let targets = move_targets(ctx.plots, PlotId(pid), &info);
+        ui.add_enabled_ui(!targets.is_empty(), |ui| {
+            ui.menu_button("Move to plot…", |ui| {
+                for (tid, title) in &targets {
+                    if ui.button(title).clicked() {
+                        try_move_channel(ctx.plots, PlotId(pid), *tid, ch, &info, None);
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+    }
+    if ui.button("Remove from plot").clicked() {
+        if let Some(PlotKind::Scalar(p)) = ctx.plots.get_mut(crate::view_state::PlotId(pid)) {
+            p.remove(ch);
+        }
+        ui.close_menu();
+    }
 }
 
 /// Internal per-signal bundle used by the scalar renderer + pair overlays.
@@ -605,6 +825,31 @@ fn render_state_lane(
     };
     let runs = ctx.store.query_state(ch, t0, t1);
 
+    // Decide labels-vs-heatmap from distinct values seen so far. We
+    // compute on the visible runs (cheap: bounded by viewport buckets);
+    // for typical telemetry this stabilises within a few frames of the
+    // channel reaching steady-state cardinality.
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for r in &runs {
+        seen.insert(r.value);
+    }
+    let mode = state_lane_mode(seen.len());
+    let (vmin, vmax) = if mode == StateLaneMode::Heatmap && !runs.is_empty() {
+        let mut lo = u32::MAX;
+        let mut hi = u32::MIN;
+        for r in &runs {
+            if r.value < lo {
+                lo = r.value;
+            }
+            if r.value > hi {
+                hi = r.value;
+            }
+        }
+        (lo, hi)
+    } else {
+        (0, 0)
+    };
+
     let plot = Plot::new(egui::Id::new(("lane", pid, ch)))
         .height(height)
         .show_axes([false, true])
@@ -631,18 +876,30 @@ fn render_state_lane(
                 .get(r.value as usize)
                 .cloned()
                 .unwrap_or_else(|| r.value.to_string());
-            let fill = state_colour(lane_idx, r.value);
+            let fill = match mode {
+                StateLaneMode::Labels => state_colour(lane_idx, r.value),
+                StateLaneMode::Heatmap => {
+                    let frac = if vmax > vmin {
+                        (r.value - vmin) as f32 / (vmax - vmin) as f32
+                    } else {
+                        0.5
+                    };
+                    heatmap_color(frac)
+                }
+            };
             bars.push(
                 Bar::new(mid, 1.0)
                     .width(w)
                     .name(format!("{}: {label}", info.path))
                     .fill(fill),
             );
-            let bar_px = w * px_per_sec;
-            let chars = ((bar_px / PX_PER_CHAR).floor() as i64).max(0) as usize;
-            let fitted = fit_label(&label, chars);
-            if !fitted.is_empty() {
-                texts.push((mid, fitted, contrast_text_colour(fill)));
+            if mode == StateLaneMode::Labels {
+                let bar_px = w * px_per_sec;
+                let chars = ((bar_px / PX_PER_CHAR).floor() as i64).max(0) as usize;
+                let fitted = fit_label(&label, chars);
+                if !fitted.is_empty() {
+                    texts.push((mid, fitted, contrast_text_colour(fill)));
+                }
             }
         }
         pui.bar_chart(BarChart::new(bars));
@@ -657,19 +914,53 @@ fn render_state_lane(
         pui.text(
             Text::new(
                 PlotPoint::new(xmin + pad_s, 0.5),
-                egui::RichText::new(short_name(&info.path))
+                egui::RichText::new(strip_group_prefix(&info.path))
                     .monospace()
                     .color(Color32::from_rgba_unmultiplied(255, 255, 255, 220))
                     .background_color(Color32::from_rgba_unmultiplied(0, 0, 0, 160)),
             )
             .anchor(egui::Align2::LEFT_CENTER),
         );
+        // Heatmap-mode indicator in the top-right corner.
+        if mode == StateLaneMode::Heatmap {
+            pui.text(
+                Text::new(
+                    PlotPoint::new(xmax - pad_s, 0.92),
+                    egui::RichText::new("[heatmap]")
+                        .small()
+                        .color(Color32::from_rgba_unmultiplied(220, 220, 220, 180))
+                        .background_color(Color32::from_rgba_unmultiplied(0, 0, 0, 140)),
+                )
+                .anchor(egui::Align2::RIGHT_TOP),
+            );
+        }
         render_markers(pui, ctx.markers);
     });
 
-    // Right-click context menu.
+    // Marker drag also works on the state lane. The drag overlay covers
+    // the lane rect, so we attach the context menu to it (otherwise the
+    // overlay swallows secondary clicks before they reach inner.response).
+    let drag = ui.interact(
+        inner.response.rect,
+        egui::Id::new(("lane_marker_overlay", pid, ch)),
+        egui::Sense::click_and_drag(),
+    );
     let ch_id = ch;
-    inner.response.context_menu(|ui| {
+    let info_clone = ctx.by_id.get(&ch_id).cloned();
+    drag.context_menu(|ui| {
+        if let Some(info) = &info_clone {
+            let targets = move_targets(ctx.plots, PlotId(pid), info);
+            ui.add_enabled_ui(!targets.is_empty(), |ui| {
+                ui.menu_button("Move to plot…", |ui| {
+                    for (tid, title) in &targets {
+                        if ui.button(title).clicked() {
+                            try_move_channel(ctx.plots, PlotId(pid), *tid, ch_id, info, None);
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+        }
         if ui.button("Remove from plot").clicked() {
             if let Some(PlotKind::StateChart(p)) =
                 ctx.plots.get_mut(crate::view_state::PlotId(pid))
@@ -679,14 +970,13 @@ fn render_state_lane(
             ui.close_menu();
         }
     });
-
-    // Marker drag also works on the state lane.
-    let drag = ui.interact(
-        inner.response.rect,
-        egui::Id::new(("lane_marker_overlay", pid, ch)),
-        egui::Sense::click_and_drag(),
-    );
     handle_marker_interaction(ui, ctx, &drag, &inner.transform);
+    let data_span_ns = ctx
+        .store
+        .time_bounds()
+        .map(|(a, b)| b.saturating_sub(a));
+    let cur_s = (t0 as f64 / 1e9, t1 as f64 / 1e9);
+    scroll_zoom_x(ui, ctx.cam, drag.rect, cur_s, data_span_ns);
 }
 
 /// One row in a Logic Analyser panel. Renders the channel's integer
@@ -803,7 +1093,7 @@ fn render_logic_lane(
         pui.text(
             Text::new(
                 PlotPoint::new(xmin + pad_s, 0.5),
-                egui::RichText::new(short_name(&path))
+                egui::RichText::new(strip_group_prefix(&path))
                     .monospace()
                     .color(Color32::from_rgba_unmultiplied(255, 255, 255, 220))
                     .background_color(Color32::from_rgba_unmultiplied(0, 0, 0, 160)),
@@ -813,9 +1103,37 @@ fn render_logic_lane(
         render_markers(pui, ctx.markers);
     });
 
-    // Per-lane context menu: Remove + radix submenu.
+    // Marker drag also works on logic lanes. The drag overlay sits over
+    // the lane rect, so we hang the context menu off it (otherwise the
+    // overlay swallows secondary clicks before they reach inner.response).
+    let drag = ui.interact(
+        inner.response.rect,
+        egui::Id::new(("logic_lane_marker_overlay", pid, ch)),
+        egui::Sense::click_and_drag(),
+    );
     let ch_id = ch;
-    inner.response.context_menu(|ui| {
+    let info_clone = ctx.by_id.get(&ch_id).cloned();
+    drag.context_menu(|ui| {
+        if let Some(info) = &info_clone {
+            let targets = move_targets(ctx.plots, PlotId(pid), info);
+            ui.add_enabled_ui(!targets.is_empty(), |ui| {
+                ui.menu_button("Move to plot…", |ui| {
+                    for (tid, title) in &targets {
+                        if ui.button(title).clicked() {
+                            try_move_channel(
+                                ctx.plots,
+                                PlotId(pid),
+                                *tid,
+                                ch_id,
+                                info,
+                                Some(radix),
+                            );
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+        }
         if ui.button("Remove from plot").clicked() {
             if let Some(PlotKind::LogicAnalyser(p)) =
                 ctx.plots.get_mut(crate::view_state::PlotId(pid))
@@ -847,14 +1165,13 @@ fn render_logic_lane(
             }
         });
     });
-
-    // Marker drag also works on logic lanes.
-    let drag = ui.interact(
-        inner.response.rect,
-        egui::Id::new(("logic_lane_marker_overlay", pid, ch)),
-        egui::Sense::click_and_drag(),
-    );
     handle_marker_interaction(ui, ctx, &drag, &inner.transform);
+    let data_span_ns = ctx
+        .store
+        .time_bounds()
+        .map(|(a, b)| b.saturating_sub(a));
+    let cur_s = (t0 as f64 / 1e9, t1 as f64 / 1e9);
+    scroll_zoom_x(ui, ctx.cam, drag.rect, cur_s, data_span_ns);
 }
 
 #[derive(Clone, Copy)]
@@ -952,6 +1269,49 @@ fn handle_camera(
             ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
         }
     }
+}
+
+/// Scroll-wheel time-zoom for lanes that don't have their own
+/// PlotTransform (state-chart lanes, logic-analyser lanes). Reads the
+/// current view from the camera-relevant `cur_s` (seconds), checks the
+/// pointer is in `rect`, and applies the same zoom semantics as
+/// `handle_camera` — `cam.zoom_window` when following, `cam.zoom_x`
+/// pivoted at the cursor otherwise. Consumes the scroll delta so the
+/// surrounding ScrollArea doesn't also use it.
+fn scroll_zoom_x(
+    ui: &mut egui::Ui,
+    cam: &mut Camera,
+    rect: egui::Rect,
+    cur_s: (f64, f64),
+    data_span_ns: Option<u64>,
+) {
+    let pointer_in_rect = ui
+        .input(|i| i.pointer.hover_pos())
+        .map(|p| rect.contains(p))
+        .unwrap_or(false);
+    if !pointer_in_rect {
+        return;
+    }
+    let scroll = ui.input(|i| i.smooth_scroll_delta.y) as f64;
+    if scroll.abs() <= 0.5 {
+        return;
+    }
+    let factor = (-scroll * 0.0015).exp();
+    if cam.follow() {
+        let max_ns = data_span_ns.filter(|n| *n > 0);
+        cam.zoom_window(factor, max_ns);
+    } else {
+        let pivot_s = ui
+            .input(|i| i.pointer.hover_pos())
+            .map(|p| {
+                let frac = ((p.x - rect.min.x) as f64 / rect.width().max(1.0) as f64)
+                    .clamp(0.0, 1.0);
+                cur_s.0 + frac * (cur_s.1 - cur_s.0)
+            })
+            .unwrap_or((cur_s.0 + cur_s.1) * 0.5);
+        cam.zoom_x(factor, pivot_s, cur_s);
+    }
+    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
 }
 
 fn handle_marker_interaction(
@@ -1108,6 +1468,27 @@ fn contrast_text_colour(bg: Color32) -> Color32 {
     } else {
         Color32::WHITE
     }
+}
+
+/// Hand-rolled 5-anchor "viridis-lite" gradient. Linear interpolation
+/// between consecutive anchors. Avoids pulling in a palette crate.
+fn heatmap_color(t: f32) -> Color32 {
+    const ANCHORS: [(u8, u8, u8); 5] = [
+        (68, 1, 84),     // dark purple
+        (59, 82, 139),   // blue
+        (33, 145, 140),  // teal
+        (94, 201, 98),   // green
+        (253, 231, 37),  // yellow
+    ];
+    let t = t.clamp(0.0, 1.0);
+    let n = ANCHORS.len() - 1;
+    let scaled = t * n as f32;
+    let i = (scaled.floor() as usize).min(n - 1);
+    let f = scaled - i as f32;
+    let a = ANCHORS[i];
+    let b = ANCHORS[i + 1];
+    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
 }
 
 pub fn short_name(p: &str) -> &str {

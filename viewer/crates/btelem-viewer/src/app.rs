@@ -18,22 +18,33 @@ use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 
 use crate::plot_renderers::{self, PlotContext};
 use crate::view_state::{
-    compute_view, group_by_struct, matches_query, Camera, Connection, MarkerSet, PlotId, PlotKind,
-    PlotRegistry, Protocol, RateEstimator, ScalarPanel, StateChartPanel, TimeBase,
-    XYDragAccumulator, XYPlot,
+    compute_view, group_by_struct, matches_query, tint_for_drop, Camera, Connection, DragPayload,
+    DropTint, LogicAnalyserPanel, MarkerSet, PlotId, PlotKind, PlotRegistry, Protocol,
+    RateEstimator, ScalarPanel, StateChartPanel, TimeBase, XYDragAccumulator, XYPlot,
 };
 use crate::Args;
 
 const CURSOR_IDLE_MS: u128 = 500;
 
-/// Drag payload from the tree. Plain `ChannelId` would not let us
-/// distinguish "add to a plot" from "seed an XY plot".
-#[derive(Debug, Clone)]
-enum DragPayload {
-    Channel(ChannelId),
-    /// Multiple channels dragged in one gesture (multi-select in the tree).
-    Channels(Vec<ChannelId>),
-    XYSeed(ChannelId),
+/// Add `ch` to a logic-analyser panel, expanding bitfield-word channels
+/// into one lane per bit (Saleae-style). Plain integer channels (incl.
+/// individual bit children) are added as a single lane.
+fn add_logic_lane(
+    panel: &mut LogicAnalyserPanel,
+    ch: ChannelId,
+    info: &ChannelInfo,
+    store: &MockStore,
+    by_id: &HashMap<ChannelId, ChannelInfo>,
+) {
+    if let Some(bits) = store.bits_for_word(ch) {
+        for bit in bits {
+            if let Some(bi) = by_id.get(&bit) {
+                panel.add(bi);
+            }
+        }
+    } else {
+        panel.add(info);
+    }
 }
 
 pub struct ViewerApp {
@@ -1140,8 +1151,26 @@ impl<'a> TabViewer for ViewerTabs<'a> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         let pid = *tab;
 
+        // Tint the drop zone based on whether the in-flight drag would
+        // be accepted by this plot. Subtle (~12% alpha) — a hint, not a
+        // flash. No payload, or an XY seed, leaves the frame plain.
+        let frame = {
+            let payload = DragAndDrop::payload::<DragPayload>(ui.ctx());
+            let tint = self
+                .plots
+                .get(pid)
+                .and_then(|plot| payload.as_deref().and_then(|p| tint_for_drop(p, plot, self.by_id)));
+            match tint {
+                Some(DropTint::Accept) => egui::Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(80, 160, 80, 30)),
+                Some(DropTint::Reject) => egui::Frame::none()
+                    .fill(Color32::from_rgba_unmultiplied(160, 80, 80, 30)),
+                None => egui::Frame::none(),
+            }
+        };
+
         let dropped = ui
-            .dnd_drop_zone::<DragPayload, _>(egui::Frame::none(), |ui| {
+            .dnd_drop_zone::<DragPayload, _>(frame, |ui| {
                 let kind_clone = self.plots.get(pid).cloned();
                 let Some(kind) = kind_clone else { return };
                 let mut ctx = PlotContext {
@@ -1187,7 +1216,7 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                                     p.add(info);
                                 }
                                 PlotKind::LogicAnalyser(p) => {
-                                    p.add(info);
+                                    add_logic_lane(p, ch, info, self.store, self.by_id);
                                 }
                                 PlotKind::XY(_) => {}
                             }
@@ -1215,7 +1244,7 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                         Some(PlotKind::LogicAnalyser(p)) => {
                             for ch in chs {
                                 if let Some(info) = self.by_id.get(&ch) {
-                                    p.add(info);
+                                    add_logic_lane(p, ch, info, self.store, self.by_id);
                                 }
                             }
                         }
@@ -1407,5 +1436,78 @@ mod selection_tests {
         update_selection(&mut sel, &mut anc, &v(), 12, false, true);
         assert_eq!(sel, HashSet::from([12]));
         assert_eq!(anc, Some(12));
+    }
+}
+
+#[cfg(test)]
+mod logic_drop_tests {
+    use super::*;
+    use btelem_store::Store;
+
+    fn by_id_map(store: &MockStore) -> HashMap<ChannelId, ChannelInfo> {
+        store.channels().into_iter().map(|c| (c.id, c)).collect()
+    }
+
+    #[test]
+    fn dropping_word_on_logic_analyser_expands_into_per_bit_lanes() {
+        let store = MockStore::new();
+        let word = store.add_scalar_int("flags.f");
+        let bit_a = store.add_state("flags.f.a", &["0", "1"]);
+        let bit_b = store.add_state("flags.f.b", &["0", "1", "2", "3"]);
+        store.register_word_bits(word, vec![bit_a, bit_b]);
+        let by_id = by_id_map(&store);
+
+        let mut panel = LogicAnalyserPanel::new("la");
+        let info = by_id.get(&word).unwrap().clone();
+        add_logic_lane(&mut panel, word, &info, &store, &by_id);
+
+        assert_eq!(panel.lanes.len(), 2);
+        assert_eq!(panel.lanes[0].ch, bit_a);
+        assert_eq!(panel.lanes[1].ch, bit_b);
+        assert!(!panel.lanes.iter().any(|l| l.ch == word));
+    }
+
+    #[test]
+    fn dropping_plain_int_on_logic_analyser_adds_single_lane() {
+        let store = MockStore::new();
+        let ch = store.add_scalar_int("imu.count");
+        let by_id = by_id_map(&store);
+        let mut panel = LogicAnalyserPanel::new("la");
+        let info = by_id.get(&ch).unwrap().clone();
+        add_logic_lane(&mut panel, ch, &info, &store, &by_id);
+        assert_eq!(panel.lanes.len(), 1);
+        assert_eq!(panel.lanes[0].ch, ch);
+    }
+
+    #[test]
+    fn dropping_individual_bit_child_on_logic_analyser_adds_single_lane() {
+        // Mixed dragging: bit child only — no decomposition.
+        let store = MockStore::new();
+        let word = store.add_scalar_int("flags.f");
+        let bit_a = store.add_state("flags.f.a", &["0", "1"]);
+        store.register_word_bits(word, vec![bit_a]);
+        let by_id = by_id_map(&store);
+
+        let mut panel = LogicAnalyserPanel::new("la");
+        let info = by_id.get(&bit_a).unwrap().clone();
+        add_logic_lane(&mut panel, bit_a, &info, &store, &by_id);
+        assert_eq!(panel.lanes.len(), 1);
+        assert_eq!(panel.lanes[0].ch, bit_a);
+    }
+
+    #[test]
+    fn dropping_word_on_scalar_panel_keeps_word_as_single_trace() {
+        // Regression: only LogicAnalyser drops decompose. ScalarPanel::add
+        // takes the word as-is and does not see the bits mapping at all.
+        let store = MockStore::new();
+        let word = store.add_scalar_int("flags.f");
+        let bit_a = store.add_state("flags.f.a", &["0", "1"]);
+        store.register_word_bits(word, vec![bit_a]);
+        let by_id = by_id_map(&store);
+
+        let mut panel = ScalarPanel::new("s");
+        let info = by_id.get(&word).unwrap();
+        assert!(panel.add(info));
+        assert_eq!(panel.channels, vec![word]);
     }
 }

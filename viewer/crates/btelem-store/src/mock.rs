@@ -4,6 +4,7 @@
 //! [`Store`] trait without any LOD or pyramid machinery. Intended for viewer
 //! tests and as a reference implementation of query semantics.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::{Bucket, ChannelId, ChannelInfo, ChannelKind, StateRun, Store, TimeRange, Timestamp};
@@ -14,6 +15,11 @@ struct Inner {
     scalars: Vec<Vec<(Timestamp, f64)>>, // index parallel to `channels`
     states: Vec<Vec<StateRun>>,
     revision: u64,
+    /// Bitfield-word channel id → ordered list of its per-bit state channel
+    /// ids. Populated by ingest at registration time so the viewer can
+    /// auto-decompose a word drop onto a logic-analyser plot into one lane
+    /// per bit.
+    word_to_bits: HashMap<ChannelId, Vec<ChannelId>>,
 }
 
 /// Scriptable in-memory store. Cheap to construct; `O(N)` queries.
@@ -72,6 +78,20 @@ impl MockStore {
         g.states.push(Vec::new());
         g.revision += 1;
         id
+    }
+
+    /// Register that `word` is a bitfield-word channel whose constituent
+    /// per-bit state channels are `bits` (in declaration order). Used by
+    /// the viewer to decompose a word drop into per-bit lanes on a
+    /// logic-analyser plot.
+    pub fn register_word_bits(&self, word: ChannelId, bits: Vec<ChannelId>) {
+        let mut g = self.inner.write().unwrap();
+        g.word_to_bits.insert(word, bits);
+    }
+
+    /// Bits associated with a bitfield-word channel, if any.
+    pub fn bits_for_word(&self, word: ChannelId) -> Option<Vec<ChannelId>> {
+        self.inner.read().unwrap().word_to_bits.get(&word).cloned()
     }
 
     /// Append a scalar sample. Timestamps must be non-decreasing per channel.
@@ -263,6 +283,7 @@ impl Store for MockStore {
         g.channels.clear();
         g.scalars.clear();
         g.states.clear();
+        g.word_to_bits.clear();
         g.revision = g.revision.wrapping_add(1);
     }
 }
