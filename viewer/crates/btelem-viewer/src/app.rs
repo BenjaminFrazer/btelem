@@ -64,6 +64,11 @@ pub struct ViewerApp {
     last_revision: u64,
     rate: RateEstimator,
 
+    /// Per-group total sample counts, refreshed slowly to keep the tree
+    /// panel cheap when many channels are active.
+    group_counts: HashMap<String, u64>,
+    group_counts_last_refresh: Option<Instant>,
+
     // Connection settings (editable via the connection dialog).
     connection: Connection,
     connection_dialog_open: bool,
@@ -108,6 +113,8 @@ impl ViewerApp {
             marker_mode: false,
             last_revision: 0,
             rate: RateEstimator::new(2.0),
+            group_counts: HashMap::new(),
+            group_counts_last_refresh: None,
             pending_connection: connection.clone(),
             connection,
             connection_dialog_open: false,
@@ -170,6 +177,30 @@ impl ViewerApp {
             .into_iter()
             .map(|c| (c.id, c))
             .collect()
+    }
+
+    /// Refresh `group_counts` at most once per ~1s. Group is the
+    /// first dotted segment of each channel's path (same grouping the
+    /// tree panel uses for its headers).
+    fn refresh_group_counts(&mut self) {
+        const REFRESH: Duration = Duration::from_millis(1000);
+        let now = Instant::now();
+        if let Some(last) = self.group_counts_last_refresh {
+            if now.duration_since(last) < REFRESH {
+                return;
+            }
+        }
+        self.group_counts_last_refresh = Some(now);
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for c in self.store.channels() {
+            let group = c
+                .path
+                .split_once('.')
+                .map(|(g, _)| g.to_string())
+                .unwrap_or_else(|| c.path.clone());
+            *counts.entry(group).or_default() += self.store.sample_count(c.id);
+        }
+        self.group_counts = counts;
     }
 
     fn handle_global_keys(&mut self, ctx: &egui::Context) {
@@ -384,7 +415,10 @@ impl ViewerApp {
                         if !any {
                             continue;
                         }
-                        egui::CollapsingHeader::new(head)
+                        let count = self.group_counts.get(head).copied().unwrap_or(0);
+                        let header_text = format!("{head}  ({})", fmt_count(count));
+                        egui::CollapsingHeader::new(header_text)
+                            .id_salt(("group", head))
                             .default_open(false)
                             .open(if self.tree_query.is_empty() {
                                 None
@@ -557,6 +591,7 @@ impl eframe::App for ViewerApp {
         let _ = DragAndDrop::payload::<DragPayload>(ctx);
 
         self.poll_redraw(ctx);
+        self.refresh_group_counts();
         self.handle_global_keys(ctx);
         self.top_bar(ctx);
         self.connection_dialog(ctx);
@@ -719,3 +754,38 @@ impl<'a> TabViewer for ViewerTabs<'a> {
     }
 }
 
+
+/// Render a sample count as a compact string with k/M/G suffixes.
+fn fmt_count(n: u64) -> String {
+    const K: u64 = 1_000;
+    const M: u64 = 1_000_000;
+    const G: u64 = 1_000_000_000;
+    if n < K {
+        format!("{n}")
+    } else if n < M {
+        format!("{:.1}k", n as f64 / K as f64)
+    } else if n < G {
+        format!("{:.1}M", n as f64 / M as f64)
+    } else {
+        format!("{:.1}G", n as f64 / G as f64)
+    }
+}
+
+#[cfg(test)]
+mod fmt_count_tests {
+    use super::fmt_count;
+
+    #[test]
+    fn small_values_render_plain() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(42), "42");
+        assert_eq!(fmt_count(999), "999");
+    }
+
+    #[test]
+    fn kilo_mega_giga_suffixes() {
+        assert_eq!(fmt_count(1_500), "1.5k");
+        assert_eq!(fmt_count(2_300_000), "2.3M");
+        assert_eq!(fmt_count(4_500_000_000), "4.5G");
+    }
+}

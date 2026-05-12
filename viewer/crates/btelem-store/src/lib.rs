@@ -112,4 +112,10 @@ pub trait Store: Send + Sync {
     /// * State channels: `value as f64` of the run containing `t`.
     /// * Out-of-range or unknown channel: `None`.
     fn sample_at(&self, ch: ChannelId, t: Timestamp) -> Option<f64>;
+
+    /// Total number of raw samples received for `ch` since the store was
+    /// created (or last cleared). For scalar channels this is the number of
+    /// pushed samples; for state channels it's the number of distinct runs.
+    /// Returns 0 for unknown channels. Cheap (O(1)).
+    fn sample_count(&self, ch: ChannelId) -> u64;
 }

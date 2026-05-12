@@ -900,8 +900,10 @@ mod tests {
 
     #[test]
     fn zoom_window_clamps_to_data_span_when_supplied() {
-        let mut cam = Camera::default();
-        cam.window_ns = 5_000_000_000; // 5s
+        let mut cam = Camera {
+            window_ns: 5_000_000_000, // 5s
+            ..Camera::default()
+        };
         // Data only covers 2s — zooming out past that should be capped.
         cam.zoom_window(100.0, Some(2_000_000_000));
         assert_eq!(cam.window_ns, 2_000_000_000);

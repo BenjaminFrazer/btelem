@@ -233,6 +233,25 @@ impl Store for MockStore {
             }
         }
     }
+
+    fn sample_count(&self, ch: ChannelId) -> u64 {
+        let g = self.inner.read().unwrap();
+        let Some(info) = g.channels.get(ch as usize) else {
+            return 0;
+        };
+        match info.kind {
+            ChannelKind::Scalar => g
+                .scalars
+                .get(ch as usize)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0),
+            ChannelKind::State { .. } => g
+                .states
+                .get(ch as usize)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,5 +353,28 @@ mod tests {
         assert_eq!(s.sample_at(ch, 25), Some(0.0));
         assert_eq!(s.sample_at(ch, 75), Some(1.0));
         assert_eq!(s.sample_at(ch, 200), None);
+    }
+
+    #[test]
+    fn sample_count_tracks_pushes() {
+        let s = MockStore::new();
+        let sc = s.add_scalar("x");
+        let st = s.add_state("fsm", &["a", "b"]);
+        assert_eq!(s.sample_count(sc), 0);
+        assert_eq!(s.sample_count(st), 0);
+        for i in 0..7u64 {
+            s.push_scalar(sc, i * 10, i as f64);
+        }
+        s.push_state(st, 0, 0);
+        s.push_state(st, 50, 1);
+        s.push_state(st, 100, 0);
+        assert_eq!(s.sample_count(sc), 7);
+        assert_eq!(s.sample_count(st), 3);
+    }
+
+    #[test]
+    fn sample_count_unknown_channel_returns_zero() {
+        let s = MockStore::new();
+        assert_eq!(s.sample_count(99), 0);
     }
 }
