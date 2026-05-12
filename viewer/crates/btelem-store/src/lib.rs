@@ -36,6 +36,10 @@ pub struct ChannelInfo {
     /// Dotted path used by the viewer tree, e.g. `"imu.accel_x"`.
     pub path: String,
     pub kind: ChannelKind,
+    /// True iff the underlying storage is an integer type (incl. enums,
+    /// bools, bitfield bits, bitfield words, small ints). Floats and
+    /// non-numeric storage are false. Drives logic-analyser acceptance.
+    pub integer_storage: bool,
 }
 
 /// What a channel contains. Numeric storage is uniformly `f64`.

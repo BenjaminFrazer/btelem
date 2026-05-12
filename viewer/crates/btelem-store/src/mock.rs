@@ -27,14 +27,29 @@ impl MockStore {
         Self::default()
     }
 
-    /// Register a scalar channel with the given path.
+    /// Register a scalar channel with the given path. Use this for
+    /// float-typed storage; integer-storage scalars should go through
+    /// [`Self::add_scalar_int`] so the logic-analyser accepts them.
     pub fn add_scalar(&self, path: impl Into<String>) -> ChannelId {
+        self.add_scalar_with(path, false)
+    }
+
+    /// Register a scalar channel whose underlying storage is an integer
+    /// type (u8/u16/.../i64, bitfield word). Behaves like
+    /// [`Self::add_scalar`] for query purposes but sets
+    /// `integer_storage = true` on the [`ChannelInfo`].
+    pub fn add_scalar_int(&self, path: impl Into<String>) -> ChannelId {
+        self.add_scalar_with(path, true)
+    }
+
+    fn add_scalar_with(&self, path: impl Into<String>, integer_storage: bool) -> ChannelId {
         let mut g = self.inner.write().unwrap();
         let id = g.channels.len() as ChannelId;
         g.channels.push(ChannelInfo {
             id,
             path: path.into(),
             kind: ChannelKind::Scalar,
+            integer_storage,
         });
         g.scalars.push(Vec::new());
         g.states.push(Vec::new());
@@ -42,7 +57,8 @@ impl MockStore {
         id
     }
 
-    /// Register a state channel with the given labels.
+    /// Register a state channel with the given labels. State channels are
+    /// always integer-storage.
     pub fn add_state(&self, path: impl Into<String>, labels: &[&str]) -> ChannelId {
         let mut g = self.inner.write().unwrap();
         let id = g.channels.len() as ChannelId;
@@ -51,6 +67,7 @@ impl MockStore {
             id,
             path: path.into(),
             kind: ChannelKind::State { labels },
+            integer_storage: true,
         });
         g.scalars.push(Vec::new());
         g.states.push(Vec::new());

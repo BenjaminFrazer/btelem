@@ -1,0 +1,13 @@
+[package]
+name = "btelem-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+btelem-wire = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

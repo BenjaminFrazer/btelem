@@ -41,6 +41,10 @@ enum FieldKind {
     Bitfield {
         offset: u16,
         storage_bytes: u16,
+        /// Scalar channel for the whole word (integer storage). `None`
+        /// when `storage_bytes` is not a supported width (1/2/4/8); in
+        /// that case only the per-bit lanes are dispatched.
+        word: Option<ChannelId>,
         bits: Vec<(BitDef, ChannelId)>,
     },
     Ignored,
@@ -97,14 +101,20 @@ impl ChannelMap {
                 FieldKind::Bitfield {
                     offset,
                     storage_bytes,
+                    word,
                     bits,
                 } => {
                     let off = *offset as usize;
                     let n = *storage_bytes as usize;
                     if off + n <= payload.len() {
+                        // Read the storage word once; bits are masked from
+                        // this value rather than re-reading the payload.
                         let mut raw = 0u64;
                         for (i, b) in payload[off..off + n].iter().enumerate() {
                             raw |= (*b as u64) << (i * 8);
+                        }
+                        if let Some(ch) = word {
+                            store.push_scalar(*ch, t, raw as f64);
                         }
                         for (bit, ch) in bits {
                             let mask = ((1u64 << bit.width) - 1) << bit.start;
@@ -160,6 +170,24 @@ fn build_field(
             | FieldType::F32
             | FieldType::F64
     );
+    let is_integer = matches!(
+        f.ty,
+        FieldType::U8
+            | FieldType::U16
+            | FieldType::U32
+            | FieldType::U64
+            | FieldType::I8
+            | FieldType::I16
+            | FieldType::I32
+            | FieldType::I64
+    );
+    let add = |p: String| {
+        if is_integer {
+            store.add_scalar_int(p)
+        } else {
+            store.add_scalar(p)
+        }
+    };
     if is_numeric {
         let elem_size = if f.count > 0 {
             f.size / f.count as u16
@@ -167,7 +195,7 @@ fn build_field(
             f.size
         };
         if f.count == 1 {
-            let ch = store.add_scalar(path(""));
+            let ch = add(path(""));
             return FieldKind::Scalar {
                 ch,
                 ty: f.ty,
@@ -176,7 +204,7 @@ fn build_field(
             };
         }
         let channels: Vec<ChannelId> = (0..f.count as usize)
-            .map(|i| store.add_scalar(path(&format!("[{i}]"))))
+            .map(|i| add(path(&format!("[{i}]"))))
             .collect();
         return FieldKind::ScalarArray {
             ty: f.ty,
@@ -211,6 +239,16 @@ fn build_field(
             let Some(bf) = schema.bitfield(schema_id, field_index) else {
                 return FieldKind::Ignored;
             };
+            let word = match f.size {
+                1 | 2 | 4 | 8 => Some(store.add_scalar_int(path(""))),
+                other => {
+                    eprintln!(
+                        "btelem-ingest: bitfield {}.{} has unsupported storage width {} bytes; skipping word channel",
+                        entry_name, f.name, other
+                    );
+                    None
+                }
+            };
             let bits: Vec<(BitDef, ChannelId)> = bf
                 .bits
                 .iter()
@@ -225,6 +263,7 @@ fn build_field(
             FieldKind::Bitfield {
                 offset: f.offset,
                 storage_bytes: f.size,
+                word,
                 bits,
             }
         }
@@ -252,4 +291,158 @@ fn read_scalar(ty: FieldType, payload: &[u8], offset: u16, size: u16) -> Option<
         FieldType::F64 => f64::from_le_bytes(s.try_into().ok()?),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btelem_store::{ChannelInfo, ChannelKind, Store};
+    use btelem_wire::{BitDef, BitfieldDef, FieldDef, FieldType, Schema, SchemaEntry};
+
+    fn bf_schema() -> Schema {
+        Schema {
+            entries: vec![SchemaEntry {
+                id: 1,
+                name: "sys".into(),
+                description: String::new(),
+                payload_size: 4,
+                fields: vec![FieldDef {
+                    name: "flags".into(),
+                    offset: 0,
+                    size: 4,
+                    ty: FieldType::Bitfield,
+                    count: 1,
+                }],
+            }],
+            enums: Vec::new(),
+            bitfields: vec![BitfieldDef {
+                schema_id: 1,
+                field_index: 0,
+                bits: vec![
+                    BitDef {
+                        name: "ready".into(),
+                        start: 0,
+                        width: 1,
+                    },
+                    BitDef {
+                        name: "mode".into(),
+                        start: 1,
+                        width: 2,
+                    },
+                    BitDef {
+                        name: "err".into(),
+                        start: 3,
+                        width: 1,
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn find_ch<'a>(channels: &'a [ChannelInfo], path: &str) -> &'a ChannelInfo {
+        channels
+            .iter()
+            .find(|c| c.path == path)
+            .unwrap_or_else(|| panic!("channel {path} not registered"))
+    }
+
+    #[test]
+    fn bitfield_registers_word_and_bits() {
+        let schema = bf_schema();
+        let store = MockStore::new();
+        let map = ChannelMap::build(&schema, &store).unwrap();
+
+        let channels = store.channels();
+        let word = find_ch(&channels, "sys.flags");
+        assert!(matches!(word.kind, ChannelKind::Scalar));
+        assert!(word.integer_storage, "bitfield word must be integer-storage");
+
+        let ready = find_ch(&channels, "sys.flags.ready");
+        let mode = find_ch(&channels, "sys.flags.mode");
+        let err = find_ch(&channels, "sys.flags.err");
+        assert!(matches!(ready.kind, ChannelKind::State { .. }));
+        assert!(matches!(mode.kind, ChannelKind::State { .. }));
+        assert!(matches!(err.kind, ChannelKind::State { .. }));
+
+        // word = 0b1011 = 11: ready=1, mode=01=1, err=1
+        let payload = 0b1011u32.to_le_bytes();
+        map.dispatch(1, 100, &payload, &store);
+        assert_eq!(store.sample_at(word.id, 100), Some(11.0));
+        assert_eq!(store.sample_at(ready.id, 100), Some(1.0));
+        assert_eq!(store.sample_at(mode.id, 100), Some(1.0));
+        assert_eq!(store.sample_at(err.id, 100), Some(1.0));
+
+        // word = 0b0100 = 4: ready=0, mode=10=2, err=0
+        let payload = 0b0100u32.to_le_bytes();
+        map.dispatch(1, 200, &payload, &store);
+        assert_eq!(store.sample_at(word.id, 200), Some(4.0));
+        assert_eq!(store.sample_at(ready.id, 200), Some(0.0));
+        assert_eq!(store.sample_at(mode.id, 200), Some(2.0));
+        assert_eq!(store.sample_at(err.id, 200), Some(0.0));
+    }
+
+    #[test]
+    fn bitfield_word_consistent_with_bits() {
+        // The dispatch path reads the storage word exactly once and derives
+        // every bit channel from it (see FieldKind::Bitfield branch). This
+        // test asserts the invariant `word == reassembled(bits)` for several
+        // payloads; an accidental re-read of the payload per bit would be
+        // visually invisible here but still wrong.
+        let schema = bf_schema();
+        let store = MockStore::new();
+        let map = ChannelMap::build(&schema, &store).unwrap();
+        let channels = store.channels();
+        let word = find_ch(&channels, "sys.flags").id;
+        let ready = find_ch(&channels, "sys.flags.ready").id;
+        let mode = find_ch(&channels, "sys.flags.mode").id;
+        let err = find_ch(&channels, "sys.flags.err").id;
+
+        for (t, raw) in [(10u64, 0u32), (20, 0b0111), (30, 0b1011), (40, 0b1110)] {
+            map.dispatch(1, t, &raw.to_le_bytes(), &store);
+            let w = store.sample_at(word, t).unwrap() as u32;
+            let r = store.sample_at(ready, t).unwrap() as u32;
+            let m = store.sample_at(mode, t).unwrap() as u32;
+            let e = store.sample_at(err, t).unwrap() as u32;
+            assert_eq!(w, raw, "word channel must mirror raw storage");
+            assert_eq!(r | (m << 1) | (e << 3), raw, "bits must reconstruct word");
+        }
+    }
+
+    #[test]
+    fn bitfield_unsupported_width_skips_word_keeps_bits() {
+        // 3-byte storage is not 1/2/4/8 — word is skipped but bits still register.
+        let schema = Schema {
+            entries: vec![SchemaEntry {
+                id: 2,
+                name: "weird".into(),
+                description: String::new(),
+                payload_size: 3,
+                fields: vec![FieldDef {
+                    name: "f".into(),
+                    offset: 0,
+                    size: 3,
+                    ty: FieldType::Bitfield,
+                    count: 1,
+                }],
+            }],
+            enums: Vec::new(),
+            bitfields: vec![BitfieldDef {
+                schema_id: 2,
+                field_index: 0,
+                bits: vec![BitDef {
+                    name: "b0".into(),
+                    start: 0,
+                    width: 1,
+                }],
+            }],
+        };
+        let store = MockStore::new();
+        let _map = ChannelMap::build(&schema, &store).unwrap();
+        let channels = store.channels();
+        assert!(channels.iter().any(|c| c.path == "weird.f.b0"));
+        assert!(
+            !channels.iter().any(|c| c.path == "weird.f"),
+            "word channel must be skipped for unsupported widths"
+        );
+    }
 }

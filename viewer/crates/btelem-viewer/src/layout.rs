@@ -416,6 +416,7 @@ mod tests {
             id,
             path: path.into(),
             kind: ChannelKind::Scalar,
+            integer_storage: false,
         }
     }
 
@@ -426,6 +427,7 @@ mod tests {
             kind: ChannelKind::State {
                 labels: vec!["a".to_string(), "b".to_string()].into(),
             },
+            integer_storage: true,
         }
     }
 

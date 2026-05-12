@@ -792,10 +792,12 @@ mod tests {
     use std::sync::Arc;
 
     fn ch(id: u32, path: &str, kind: ChannelKind) -> ChannelInfo {
+        let integer_storage = matches!(kind, ChannelKind::State { .. });
         ChannelInfo {
             id,
             path: path.to_string(),
             kind,
+            integer_storage,
         }
     }
     fn scalar(id: u32, path: &str) -> ChannelInfo {
