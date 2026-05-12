@@ -13,10 +13,10 @@ use egui_plot::{
 };
 
 use crate::view_state::{
-    channel_group, fit_label, group_order, state_lane_mode, strip_group_prefix, try_move_channel,
-    Camera, LabelRadix, LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel, MarkerSet,
-    PlotId, PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateChartPanel, StateLaneMode,
-    TimeBase, XYPlot,
+    channel_group, channel_has_labels, fit_label, group_order, state_lane_mode,
+    strip_group_prefix, try_move_channel, Camera, LabelRadix, LaneMode,
+    LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel, LogicLane, MarkerSet, PlotId,
+    PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateLaneMode, TimeBase, XYPlot,
 };
 
 /// Pixels per character used to truncate state-lane labels. Matches the
@@ -128,113 +128,9 @@ pub fn render_scalar_plot(
     let _ = render_scalar_section(ui, ctx, pid, panel, (t0, t1), height);
 }
 
-/// Render a StateChart plot (stacked coloured lanes — one per state channel).
-/// The panel's vertical footprint is `lanes * lane_h`; if lanes don't fit a
-/// scroll area is used so each lane keeps its fixed height.
-pub fn render_state_chart(
-    ui: &mut egui::Ui,
-    ctx: &mut PlotContext<'_>,
-    pid: u64,
-    panel: &StateChartPanel,
-) {
-    let Some((t0, t1)) = ctx.view else {
-        ui.centered_and_justified(|ui| ui.label("waiting for data…"));
-        return;
-    };
-
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(&panel.title).strong());
-        ui.label(
-            egui::RichText::new(format!("[{}]", ctx.cam.mode.label()))
-                .small()
-                .weak(),
-        );
-    });
-
-    if panel.lanes.is_empty() {
-        ui.centered_and_justified(|ui| {
-            ui.label(
-                egui::RichText::new("drop state channels here")
-                    .weak(),
-            );
-        });
-        return;
-    }
-
-    const LANE_H: f32 = 24.0;
-    let gutter = Y_AXIS_GUTTER;
-    let item_spacing = ui.spacing().item_spacing.y;
-
-    // Resolve each lane to its schema group; lanes without by_id entries
-    // get an empty key and sort to the end.
-    let resolved: Vec<Option<&str>> = panel
-        .lanes
-        .iter()
-        .map(|ch| ctx.by_id.get(ch).map(|i| channel_group(&i.path)))
-        .collect();
-    let order = group_order(&resolved);
-    let groups = collapse_groups(order);
-
-    // Single-schema (or no-dot) panels render exactly as before — no
-    // horizontal wrapper, no gutter rect.
-    if groups.len() <= 1 {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for (lane_idx, ch) in panel.lanes.iter().enumerate() {
-                    render_state_lane(ui, ctx, pid, *ch, lane_idx, (t0, t1), LANE_H, gutter);
-                }
-            });
-        return;
-    }
-
-    let group_count = groups.len();
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for (gi, (key, indices)) in groups.iter().enumerate() {
-                let lane_count = indices.len() as f32;
-                let total_h =
-                    lane_count * LANE_H + (lane_count - 1.0).max(0.0) * item_spacing;
-                ui.horizontal(|ui| {
-                    let (gutter_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(GROUP_GUTTER, total_h),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().rect_filled(
-                        gutter_rect,
-                        0.0,
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 6),
-                    );
-                    paint_group_label(ui, gutter_rect, key);
-                    ui.vertical(|ui| {
-                        for &lane_idx in indices {
-                            let ch = panel.lanes[lane_idx];
-                            render_state_lane(
-                                ui, ctx, pid, ch, lane_idx, (t0, t1), LANE_H, gutter,
-                            );
-                        }
-                    });
-                });
-                if gi + 1 < group_count {
-                    let avail_w = ui.available_width();
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(avail_w, 1.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().rect_filled(
-                        rect,
-                        0.0,
-                        Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-                    );
-                }
-            }
-        });
-}
-
-/// Render a Logic Analyser panel: stacked equally-sized stairs lanes,
-/// one per integer-storage channel. Wide enough steps get a numeric
-/// label formatted per the lane's `radix` (Hex / Dec / Bin).
+/// Render a Logic Analyser panel: stacked equally-sized lanes. Each lane
+/// is rendered either as a state chart (coloured blocks with labels) or
+/// as a stairs trace (numeric step plot) depending on `lane.mode`.
 pub fn render_logic_analyser(
     ui: &mut egui::Ui,
     ctx: &mut PlotContext<'_>,
@@ -257,7 +153,7 @@ pub fn render_logic_analyser(
 
     if panel.lanes.is_empty() {
         ui.centered_and_justified(|ui| {
-            ui.label(egui::RichText::new("drop integer channels here").weak());
+            ui.label(egui::RichText::new("drop state or integer channels here").weak());
         });
         return;
     }
@@ -277,6 +173,8 @@ pub fn render_logic_analyser(
 
     // Per-lane height. When grouped, subtract a per-divider allowance so
     // the visible stack still fits roughly inside `available_height()`.
+    // Single height used for both State and Stairs lanes — keeps mixed
+    // plots tidy.
     let group_count = groups.len();
     let divider_budget =
         (group_count.saturating_sub(1)) as f32 * (item_spacing + 1.0);
@@ -292,16 +190,8 @@ pub fn render_logic_analyser(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (lane_idx, lane) in panel.lanes.iter().enumerate() {
-                    render_logic_lane(
-                        ui,
-                        ctx,
-                        pid,
-                        lane_idx,
-                        lane.ch,
-                        lane.radix,
-                        (t0, t1),
-                        lane_h,
-                        Y_AXIS_GUTTER,
+                    render_lane_dispatch(
+                        ui, ctx, pid, lane_idx, *lane, (t0, t1), lane_h, Y_AXIS_GUTTER,
                     );
                 }
             });
@@ -329,16 +219,8 @@ pub fn render_logic_analyser(
                     ui.vertical(|ui| {
                         for &lane_idx in indices {
                             let lane = panel.lanes[lane_idx];
-                            render_logic_lane(
-                                ui,
-                                ctx,
-                                pid,
-                                lane_idx,
-                                lane.ch,
-                                lane.radix,
-                                (t0, t1),
-                                lane_h,
-                                Y_AXIS_GUTTER,
+                            render_lane_dispatch(
+                                ui, ctx, pid, lane_idx, lane, (t0, t1), lane_h, Y_AXIS_GUTTER,
                             );
                         }
                     });
@@ -357,6 +239,30 @@ pub fn render_logic_analyser(
                 }
             }
         });
+}
+
+/// Route a lane to the appropriate renderer based on its `mode`.
+#[allow(clippy::too_many_arguments)]
+fn render_lane_dispatch(
+    ui: &mut egui::Ui,
+    ctx: &mut PlotContext<'_>,
+    pid: u64,
+    lane_idx: usize,
+    lane: LogicLane,
+    (t0, t1): (u64, u64),
+    height: f32,
+    gutter: f32,
+) {
+    match lane.mode {
+        LaneMode::Named => {
+            render_state_lane(ui, ctx, pid, lane.ch, lane_idx, (t0, t1), height, gutter);
+        }
+        LaneMode::Numeric => {
+            render_logic_lane(
+                ui, ctx, pid, lane_idx, lane.ch, lane.radix, (t0, t1), height, gutter,
+            );
+        }
+    }
 }
 
 /// Render an XY plot (parametric scalar X vs scalar Y).
@@ -962,8 +868,30 @@ fn render_state_lane(
                 });
             });
         }
+        ui.menu_button("Render as", |ui| {
+            let mut new_mode: Option<LaneMode> = None;
+            let has_labels = info_clone.as_ref().is_some_and(channel_has_labels);
+            ui.add_enabled_ui(has_labels, |ui| {
+                if ui.radio(true, "Named (labels)").clicked() {
+                    new_mode = Some(LaneMode::Named);
+                }
+            });
+            if ui.radio(false, "Numeric (heatmap)").clicked() {
+                new_mode = Some(LaneMode::Numeric);
+            }
+            if let Some(m) = new_mode {
+                if let Some(PlotKind::LogicAnalyser(p)) =
+                    ctx.plots.get_mut(crate::view_state::PlotId(pid))
+                {
+                    if let Some(slot) = p.mode_for_mut(ch_id) {
+                        *slot = m;
+                    }
+                }
+                ui.close_menu();
+            }
+        });
         if ui.button("Remove from plot").clicked() {
-            if let Some(PlotKind::StateChart(p)) =
+            if let Some(PlotKind::LogicAnalyser(p)) =
                 ctx.plots.get_mut(crate::view_state::PlotId(pid))
             {
                 p.remove(ch_id);
@@ -988,7 +916,7 @@ fn render_logic_lane(
     ui: &mut egui::Ui,
     ctx: &mut PlotContext<'_>,
     pid: u64,
-    lane_idx: usize,
+    _lane_idx: usize,
     ch: ChannelId,
     radix: LabelRadix,
     (t0, t1): (u64, u64),
@@ -1054,7 +982,13 @@ fn render_logic_lane(
         let xmax = (t1 as f64) / 1e9;
         pui.set_plot_bounds(PlotBounds::from_min_max([xmin, 0.0], [xmax, 1.0]));
         let px_per_sec = pui.transform().dpos_dvalue_x();
-        let fill = palette(lane_idx);
+        // Heatmap coloring keyed off the value's position within the
+        // visible (vmin..vmax) range. Falls back to mid-gradient when
+        // only one distinct value is present.
+        let (vmin, vmax) = runs.iter().fold((i64::MAX, i64::MIN), |(lo, hi), r| {
+            (lo.min(r.value), hi.max(r.value))
+        });
+        let span = (vmax - vmin).max(0) as f32;
         let mut bars: Vec<Bar> = Vec::with_capacity(runs.len());
         let mut texts: Vec<(f64, String, Color32)> = Vec::with_capacity(runs.len());
         for r in &runs {
@@ -1065,6 +999,12 @@ fn render_logic_lane(
             }
             let mid = (s + e) / 2.0;
             let w = (e - s).max(1e-9);
+            let frac = if span > 0.0 {
+                ((r.value - vmin) as f32) / span
+            } else {
+                0.5
+            };
+            let fill = heatmap_color(frac);
             bars.push(
                 Bar::new(mid, 1.0)
                     .width(w)
@@ -1143,6 +1083,28 @@ fn render_logic_lane(
             }
             ui.close_menu();
         }
+        ui.menu_button("Render as", |ui| {
+            let mut new_mode: Option<LaneMode> = None;
+            let has_labels = info_clone.as_ref().is_some_and(channel_has_labels);
+            ui.add_enabled_ui(has_labels, |ui| {
+                if ui.radio(false, "Named (labels)").clicked() {
+                    new_mode = Some(LaneMode::Named);
+                }
+            });
+            if ui.radio(true, "Numeric (heatmap)").clicked() {
+                new_mode = Some(LaneMode::Numeric);
+            }
+            if let Some(m) = new_mode {
+                if let Some(PlotKind::LogicAnalyser(p)) =
+                    ctx.plots.get_mut(crate::view_state::PlotId(pid))
+                {
+                    if let Some(slot) = p.mode_for_mut(ch_id) {
+                        *slot = m;
+                    }
+                }
+                ui.close_menu();
+            }
+        });
         ui.menu_button("Radix", |ui| {
             let mut new_radix: Option<LabelRadix> = None;
             if ui.radio(radix == LabelRadix::Hex, "Hex (0xFF)").clicked() {

@@ -20,7 +20,7 @@ use crate::plot_renderers::{self, PlotContext};
 use crate::view_state::{
     compute_view, group_by_struct, matches_query, tint_for_drop, Camera, Connection, DragPayload,
     DropTint, LogicAnalyserPanel, MarkerSet, PlotId, PlotKind, PlotRegistry, Protocol,
-    RateEstimator, ScalarPanel, StateChartPanel, TimeBase, XYDragAccumulator, XYPlot,
+    RateEstimator, ScalarPanel, TimeBase, XYDragAccumulator, XYPlot,
 };
 use crate::Args;
 
@@ -113,14 +113,15 @@ pub struct ViewerApp {
     confirm_clear_open: bool,
 }
 
-/// Build a fresh dock with one Scalar plot and one StateChart plot placed
-/// side-by-side. Also seeds `plots` with the two corresponding entries.
+/// Build a fresh dock with one Scalar plot and one Logic Analyser plot
+/// placed side-by-side. Also seeds `plots` with the two corresponding
+/// entries.
 fn make_default_dock(plots: &mut PlotRegistry) -> DockState<PlotId> {
     let scalar_id = plots.insert(PlotKind::Scalar(ScalarPanel::new("scalar 1")));
-    let state_id = plots.insert(PlotKind::StateChart(StateChartPanel::new("states 2")));
+    let logic_id = plots.insert(PlotKind::LogicAnalyser(LogicAnalyserPanel::new("logic 2")));
     let mut dock = DockState::new(vec![scalar_id]);
     dock.main_surface_mut()
-        .split_right(NodeIndex::root(), 0.5, vec![state_id]);
+        .split_right(NodeIndex::root(), 0.5, vec![logic_id]);
     dock
 }
 
@@ -482,14 +483,6 @@ impl ViewerApp {
                     let id = self
                         .plots
                         .insert(PlotKind::Scalar(ScalarPanel::new(title)));
-                    self.dock.push_to_focused_leaf(id);
-                }
-                if ui.button("+ State Chart").clicked() {
-                    let title = format!("states {}", self.next_plot_num);
-                    self.next_plot_num += 1;
-                    let id = self
-                        .plots
-                        .insert(PlotKind::StateChart(StateChartPanel::new(title)));
                     self.dock.push_to_focused_leaf(id);
                 }
                 if ui.button("+ Logic Analyser").clicked() {
@@ -937,11 +930,6 @@ impl ViewerApp {
                                 self.cursor_row(ui, &by_id, *ch, t);
                             }
                         }
-                        PlotKind::StateChart(p) => {
-                            for ch in p.lanes.iter() {
-                                self.cursor_row(ui, &by_id, *ch, t);
-                            }
-                        }
                         PlotKind::LogicAnalyser(p) => {
                             for lane in p.lanes.iter() {
                                 self.cursor_row(ui, &by_id, lane.ch, t);
@@ -1197,9 +1185,6 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     PlotKind::Scalar(panel) => {
                         plot_renderers::render_scalar_plot(ui, &mut ctx, pid.0, &panel);
                     }
-                    PlotKind::StateChart(panel) => {
-                        plot_renderers::render_state_chart(ui, &mut ctx, pid.0, &panel);
-                    }
                     PlotKind::LogicAnalyser(panel) => {
                         plot_renderers::render_logic_analyser(ui, &mut ctx, pid.0, &panel);
                     }
@@ -1220,9 +1205,6 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                                 PlotKind::Scalar(p) => {
                                     p.add(info);
                                 }
-                                PlotKind::StateChart(p) => {
-                                    p.add(info);
-                                }
                                 PlotKind::LogicAnalyser(p) => {
                                     add_logic_lane(p, ch, info, self.store, self.by_id);
                                 }
@@ -1236,13 +1218,6 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     // anything the target panel doesn't accept.
                     match self.plots.get_mut(pid) {
                         Some(PlotKind::Scalar(p)) => {
-                            for ch in chs {
-                                if let Some(info) = self.by_id.get(&ch) {
-                                    p.add(info);
-                                }
-                            }
-                        }
-                        Some(PlotKind::StateChart(p)) => {
                             for ch in chs {
                                 if let Some(info) = self.by_id.get(&ch) {
                                     p.add(info);

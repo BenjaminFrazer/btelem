@@ -21,15 +21,15 @@ use btelem_store::{ChannelId, ChannelInfo, ChannelKind};
 use serde::{Deserialize, Serialize};
 
 use crate::view_state::{
-    LabelRadix, LogicAnalyserPanel, PlotId, PlotKind, PlotRegistry, ScalarPanel,
-    SignalStyle, StateChartPanel, XYPlot,
+    default_lane_mode, LabelRadix, LaneMode, LogicAnalyserPanel, PlotId, PlotKind, PlotRegistry,
+    ScalarPanel, SignalStyle, XYPlot,
 };
 
 /// Bumped when the on-disk JSON shape changes in a non-backwards-
-/// compatible way. Loaders refuse anything they don't recognise (with the
-/// exception of the legacy `time_series` plot spec, which is migrated
-/// into `scalar` + `state_chart` plots on load).
-pub const SCHEMA_VERSION: u32 = 2;
+/// compatible way. Loaders refuse anything they don't recognise (with
+/// the exception of legacy `time_series` and `state_chart` plot specs,
+/// which are migrated into `scalar` + `logic_analyser` plots on load).
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// In-memory representation of a layout file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,8 +49,9 @@ pub struct Layout {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlotSpec {
     /// Legacy combined plot (pre-v2). Always migrated on load: scalars
-    /// become a `Scalar` plot and states become an adjacent `StateChart`
-    /// plot. Never produced by `capture` — kept only for migration.
+    /// become a `Scalar` plot and states become an adjacent
+    /// `LogicAnalyser` plot. Never produced by `capture` — kept only for
+    /// migration.
     TimeSeries {
         title: String,
         scalars: Vec<String>,
@@ -64,6 +65,9 @@ pub enum PlotSpec {
         #[serde(default)]
         styles: HashMap<String, SignalStyle>,
     },
+    /// Legacy state-chart plot (v2). Always migrated on load into a
+    /// `LogicAnalyser` plot with every lane defaulted to `LaneMode::Named`.
+    /// Never produced by `capture` — kept only for migration.
     StateChart {
         title: String,
         lanes: Vec<String>,
@@ -88,6 +92,15 @@ pub struct LogicLaneSpec {
     pub ch_path: String,
     #[serde(default)]
     pub radix: LabelRadix,
+    /// v3+ field. v2 layouts predate per-lane mode and were always
+    /// numeric stairs, so default to `Numeric` on deserialise — not
+    /// `LaneMode`'s own default (`Named`).
+    #[serde(default = "lane_mode_numeric_default")]
+    pub mode: LaneMode,
+}
+
+fn lane_mode_numeric_default() -> LaneMode {
+    LaneMode::Numeric
 }
 
 /// Outcome of applying a layout to a live `Store`.
@@ -276,17 +289,6 @@ fn spec_from_kind(
                 styles,
             }
         }
-        PlotKind::StateChart(p) => {
-            let lanes = p
-                .lanes
-                .iter()
-                .filter_map(|id| by_id.get(id).map(|c| c.path.clone()))
-                .collect::<Vec<_>>();
-            PlotSpec::StateChart {
-                title: p.title.clone(),
-                lanes,
-            }
-        }
         PlotKind::LogicAnalyser(p) => {
             let lanes = p
                 .lanes
@@ -295,6 +297,7 @@ fn spec_from_kind(
                     by_id.get(&l.ch).map(|c| LogicLaneSpec {
                         ch_path: c.path.clone(),
                         radix: l.radix,
+                        mode: l.mode,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -328,10 +331,11 @@ fn spec_from_kind(
 /// dropped silently but counted in the returned `ApplyReport`.
 ///
 /// Legacy `TimeSeries` specs (v1 files) are migrated into one `Scalar`
-/// plot plus one adjacent `StateChart` plot. The dock tab originally
-/// pointing at the combined plot is rewritten to the scalar plot; the
-/// state-chart plot is appended into the same leaf so the two end up
-/// adjacent.
+/// plot plus one adjacent `LogicAnalyser` plot (state-mode lanes). The
+/// dock tab originally pointing at the combined plot is rewritten to the
+/// scalar plot; the logic-analyser plot is appended into the same leaf
+/// so the two end up adjacent. Legacy `StateChart` specs (v2 files) are
+/// migrated into LogicAnalyser plots with every lane in `LaneMode::Named`.
 pub fn apply(
     layout: &Layout,
     channels: &[ChannelInfo],
@@ -343,7 +347,7 @@ pub fn apply(
     let mut registry = PlotRegistry::new();
     // Primary plot id per input spec — used for dock-index remapping.
     let mut new_ids: Vec<Option<PlotId>> = Vec::with_capacity(layout.plots.len());
-    // Companion plots produced by migration (legacy TimeSeries → StateChart),
+    // Companion plots produced by migration (legacy TimeSeries → LogicAnalyser),
     // alongside their primary counterpart. Appended into the same dock leaf
     // after the dock skeleton is built.
     let mut companions: Vec<(PlotId, PlotId)> = Vec::new();
@@ -378,10 +382,10 @@ pub fn apply(
                 }
                 let scalar_id = registry.insert(PlotKind::Scalar(sp));
 
-                // And a StateChart panel from the legacy `states` half,
-                // only if it actually had any states.
+                // And a LogicAnalyser panel (with state-mode lanes) from
+                // the legacy `states` half, only if it actually had any.
                 if !states.is_empty() {
-                    let mut chart = StateChartPanel::new(format!("{title} (states)"));
+                    let mut chart = LogicAnalyserPanel::new(format!("{title} (states)"));
                     let mut had_any = false;
                     for path in states {
                         if let Some(info) = by_path.get(path.as_str()) {
@@ -396,7 +400,7 @@ pub fn apply(
                         }
                     }
                     if had_any {
-                        let state_id = registry.insert(PlotKind::StateChart(chart));
+                        let state_id = registry.insert(PlotKind::LogicAnalyser(chart));
                         companions.push((scalar_id, state_id));
                     }
                 }
@@ -428,11 +432,13 @@ pub fn apply(
                 new_ids.push(Some(id));
             }
             PlotSpec::StateChart { title, lanes } => {
-                let mut p = StateChartPanel::new(title);
+                // Legacy v2 spec. Migrate into a LogicAnalyser panel
+                // with every lane forced to State mode.
+                let mut p = LogicAnalyserPanel::new(title);
                 for path in lanes {
                     if let Some(info) = by_path.get(path.as_str()) {
                         if matches!(info.kind, ChannelKind::State { .. }) {
-                            p.add(info);
+                            p.add(info); // default mode for State == LaneMode::Named
                         } else {
                             report.missing_channels += 1;
                         }
@@ -440,23 +446,38 @@ pub fn apply(
                         report.missing_channels += 1;
                     }
                 }
-                let id = registry.insert(PlotKind::StateChart(p));
+                let id = registry.insert(PlotKind::LogicAnalyser(p));
                 new_ids.push(Some(id));
             }
             PlotSpec::LogicAnalyser { title, lanes } => {
                 let mut p = LogicAnalyserPanel::new(title);
                 for ls in lanes {
                     if let Some(info) = by_path.get(ls.ch_path.as_str()) {
-                        if info.integer_storage {
-                            // Use the panel's add() so dedup logic runs,
-                            // then overwrite the radix back to the saved
-                            // value (add() defaults to Hex).
-                            if p.add(info) {
-                                if let Some(r) = p.radix_for_mut(info.id) {
-                                    *r = ls.radix;
-                                }
+                        // Accept the saved channel if the live channel
+                        // can be a logic-analyser lane today. add() also
+                        // dedupes; we then overwrite radix + mode back
+                        // to the saved values.
+                        let acceptable = matches!(info.kind, ChannelKind::State { .. })
+                            || info.integer_storage;
+                        if acceptable && p.add(info) {
+                            if let Some(r) = p.radix_for_mut(info.id) {
+                                *r = ls.radix;
                             }
-                        } else {
+                            if let Some(m) = p.mode_for_mut(info.id) {
+                                // Sanity: a saved Named lane requires
+                                // enum labels. If the live channel
+                                // lacks them (e.g. raw integer scalar),
+                                // fall back to the kind-appropriate
+                                // default.
+                                *m = if ls.mode == LaneMode::Named
+                                    && !matches!(info.kind, ChannelKind::State { .. })
+                                {
+                                    default_lane_mode(&info.kind, info.integer_storage)
+                                } else {
+                                    ls.mode
+                                };
+                            }
+                        } else if !acceptable {
                             report.missing_channels += 1;
                         }
                     } else {
@@ -601,6 +622,15 @@ mod tests {
         }
     }
 
+    fn ch_scalar_int(id: ChannelId, path: &str) -> ChannelInfo {
+        ChannelInfo {
+            id,
+            path: path.into(),
+            kind: ChannelKind::Scalar,
+            integer_storage: true,
+        }
+    }
+
     #[test]
     fn slug_is_filename_safe() {
         assert_eq!(slug("My Layout / v2"), "my-layout-v2");
@@ -632,9 +662,9 @@ mod tests {
         };
         let scalar_pid = reg.insert(PlotKind::Scalar(sp));
 
-        let mut chart = StateChartPanel::new("fsm");
-        chart.add(&chs[2]);
-        let state_pid = reg.insert(PlotKind::StateChart(chart));
+        let mut chart = LogicAnalyserPanel::new("fsm");
+        chart.add(&chs[2]); // state channel → defaults to LaneMode::Named
+        let state_pid = reg.insert(PlotKind::LogicAnalyser(chart));
 
         let dock = egui_dock::DockState::new(vec![scalar_pid, state_pid]);
 
@@ -652,7 +682,7 @@ mod tests {
         let (reg2, _dock2, report) = apply(&snap2, &chs);
         assert_eq!(report, ApplyReport::default());
 
-        // Find the scalar and the state chart back.
+        // Find the scalar and the logic analyser back.
         let mut got_scalar = false;
         let mut got_state = false;
         for id in reg2.iter_ids() {
@@ -670,12 +700,13 @@ mod tests {
                     );
                     got_scalar = true;
                 }
-                PlotKind::StateChart(p) => {
-                    assert_eq!(p.lanes, vec![2]);
+                PlotKind::LogicAnalyser(p) => {
+                    assert_eq!(p.lanes.len(), 1);
+                    assert_eq!(p.lanes[0].ch, 2);
+                    assert_eq!(p.lanes[0].mode, LaneMode::Named);
                     got_state = true;
                 }
                 PlotKind::XY(_) => panic!("unexpected XY"),
-                PlotKind::LogicAnalyser(_) => panic!("unexpected LogicAnalyser"),
             }
         }
         assert!(got_scalar && got_state);
@@ -694,9 +725,13 @@ mod tests {
                     channels: vec!["imu.accel.x".into(), "imu.accel.z".into()],
                     styles: HashMap::new(),
                 },
-                PlotSpec::StateChart {
-                    title: "sc".into(),
-                    lanes: vec!["nope.state".into()],
+                PlotSpec::LogicAnalyser {
+                    title: "la".into(),
+                    lanes: vec![LogicLaneSpec {
+                        ch_path: "nope.state".into(),
+                        radix: LabelRadix::Hex,
+                        mode: LaneMode::Named,
+                    }],
                 },
                 PlotSpec::Xy {
                     title: "xy".into(),
@@ -710,17 +745,18 @@ mod tests {
         // accel.z (scalar missing) + nope.state + missing.y
         assert_eq!(report.missing_channels, 3);
         assert_eq!(report.dropped_plots, 1); // the xy
-        // Scalar + StateChart kept (StateChart kept even though empty —
-        // dropping empty ones isn't part of this code path today).
+        // Scalar + LogicAnalyser kept (empty LogicAnalyser kept — dropping
+        // empty ones isn't part of this code path today).
         assert_eq!(reg.iter_ids().count(), 2);
     }
 
     #[test]
-    fn legacy_timeseries_layout_migrates_to_scalar_and_state_chart() {
+    fn legacy_timeseries_layout_migrates_to_scalar_and_logic_analyser() {
         // Fixture: a v1 layout JSON containing a single combined TimeSeries
         // plot with two scalars and one state. After load+apply we expect
         // exactly one Scalar plot (carrying the two scalars + a style
-        // override) and one StateChart plot (carrying the state lane).
+        // override) and one LogicAnalyser plot whose state lane defaulted
+        // to `LaneMode::Named`.
         let v1_json = serde_json::json!({
             "version": 1,
             "name": "legacy",
@@ -764,13 +800,14 @@ mod tests {
                     assert!(!p.style_for(0).envelope);
                     got_scalar = true;
                 }
-                PlotKind::StateChart(p) => {
+                PlotKind::LogicAnalyser(p) => {
                     assert!(p.title.contains("combined"));
-                    assert_eq!(p.lanes, vec![2]);
+                    assert_eq!(p.lanes.len(), 1);
+                    assert_eq!(p.lanes[0].ch, 2);
+                    assert_eq!(p.lanes[0].mode, LaneMode::Named);
                     got_state = true;
                 }
                 PlotKind::XY(_) => panic!("unexpected XY"),
-                PlotKind::LogicAnalyser(_) => panic!("unexpected LogicAnalyser"),
             }
         }
         assert!(got_scalar, "scalar half should have been produced");
@@ -795,5 +832,97 @@ mod tests {
         assert_eq!(reg.iter_ids().count(), 1);
         let only = reg.iter_ids().next().unwrap();
         assert!(matches!(reg.get(only), Some(PlotKind::Scalar(_))));
+    }
+
+    #[test]
+    fn v3_mixed_mode_lanes_round_trip() {
+        // A LogicAnalyser panel with one State-mode lane and one
+        // Stairs-mode lane must survive serialize → deserialize → apply.
+        let chs = vec![ch_state(0, "fsm.mode"), ch_scalar_int(1, "flags")];
+        let by_id: HashMap<ChannelId, ChannelInfo> =
+            chs.iter().map(|c| (c.id, c.clone())).collect();
+        let mut reg = PlotRegistry::new();
+        let mut la = LogicAnalyserPanel::new("mixed");
+        la.add(&chs[0]); // state mode
+        la.add(&chs[1]); // stairs mode
+        // Tweak the integer lane's radix so we can assert it survives.
+        *la.radix_for_mut(1).unwrap() = LabelRadix::Bin;
+        let pid = reg.insert(PlotKind::LogicAnalyser(la));
+        let dock = egui_dock::DockState::new(vec![pid]);
+
+        let snap = capture("mixed", &reg, &dock, &by_id);
+        assert_eq!(snap.version, SCHEMA_VERSION);
+        let json = serde_json::to_vec(&snap).unwrap();
+        let snap2: Layout = serde_json::from_slice(&json).unwrap();
+        assert_eq!(snap2.plots, snap.plots);
+
+        let (reg2, _dock2, _) = apply(&snap2, &chs);
+        let pid2 = reg2.iter_ids().next().unwrap();
+        match reg2.get(pid2).unwrap() {
+            PlotKind::LogicAnalyser(p) => {
+                assert_eq!(p.lanes.len(), 2);
+                let by_ch: HashMap<ChannelId, &crate::view_state::LogicLane> =
+                    p.lanes.iter().map(|l| (l.ch, l)).collect();
+                assert_eq!(by_ch[&0].mode, LaneMode::Named);
+                assert_eq!(by_ch[&1].mode, LaneMode::Numeric);
+                assert_eq!(by_ch[&1].radix, LabelRadix::Bin);
+            }
+            _ => panic!("expected LogicAnalyser"),
+        }
+    }
+
+    #[test]
+    fn v2_layout_migrates_logic_analyser_to_stairs_and_state_chart_to_state() {
+        // Fixture: a v2 layout JSON containing a LogicAnalyser plot (no
+        // `mode` field on the lanes — they pre-date per-lane mode) and a
+        // StateChart plot. After load + apply we expect both to land in
+        // LogicAnalyser panels: the former with all lanes in Stairs mode,
+        // the latter with all lanes in State mode.
+        let v2_json = serde_json::json!({
+            "version": 2,
+            "name": "legacy-v2",
+            "dock": null,
+            "plots": [
+                {
+                    "kind": "logic_analyser",
+                    "title": "flags",
+                    "lanes": [
+                        { "ch_path": "flags", "radix": "Hex" }
+                    ]
+                },
+                {
+                    "kind": "state_chart",
+                    "title": "fsm",
+                    "lanes": ["fsm.mode"]
+                }
+            ]
+        });
+        let layout: Layout = serde_json::from_value(v2_json).expect("v2 layout parses");
+        assert_eq!(layout.version, 2);
+
+        let chs = vec![ch_scalar_int(0, "flags"), ch_state(1, "fsm.mode")];
+        let (reg, _dock, report) = apply(&layout, &chs);
+        assert_eq!(report.missing_channels, 0);
+        assert_eq!(report.dropped_plots, 0);
+
+        let mut got_stairs = false;
+        let mut got_state = false;
+        for id in reg.iter_ids() {
+            match reg.get(id).unwrap() {
+                PlotKind::LogicAnalyser(p) if p.title == "flags" => {
+                    assert_eq!(p.lanes.len(), 1);
+                    assert_eq!(p.lanes[0].mode, LaneMode::Numeric);
+                    got_stairs = true;
+                }
+                PlotKind::LogicAnalyser(p) if p.title == "fsm" => {
+                    assert_eq!(p.lanes.len(), 1);
+                    assert_eq!(p.lanes[0].mode, LaneMode::Named);
+                    got_state = true;
+                }
+                _ => panic!("unexpected plot kind in migration result"),
+            }
+        }
+        assert!(got_stairs, "v2 logic_analyser should migrate to Stairs lanes");
+        assert!(got_state, "v2 state_chart should migrate to State lanes");
     }
 }

@@ -12,17 +12,15 @@ use serde::{Deserialize, Serialize};
 pub struct PlotId(pub u64);
 
 /// One plot pane. Time-domain primitives are typed: scalar lines and
-/// state lanes live in separate panels (a panel only accepts one kind).
+/// state/integer lanes live in separate panel kinds.
 #[derive(Debug, Clone)]
 pub enum PlotKind {
     /// Continuous line + envelope, shared y-axis. Accepts only scalars.
     Scalar(ScalarPanel),
-    /// Stacked coloured lanes, one per state channel. Panel height grows
-    /// with lane count.
-    StateChart(StateChartPanel),
-    /// Stacked equally-sized stairs lanes, one per integer-storage
-    /// channel. Each lane shows the integer value as a step plot with
-    /// numeric labels inside wide steps.
+    /// Stacked lanes — each lane is rendered either as a state chart
+    /// (coloured blocks with labels) or as a logic-analyser stairs trace
+    /// (integer value step plot with hex/dec/bin labels). Accepts state
+    /// channels and integer-storage scalars.
     LogicAnalyser(LogicAnalyserPanel),
     /// Parametric scalar X vs scalar Y over time.
     XY(XYPlot),
@@ -37,12 +35,6 @@ pub struct ScalarPanel {
     pub styles: HashMap<ChannelId, SignalStyle>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct StateChartPanel {
-    pub title: String,
-    pub lanes: Vec<ChannelId>,
-}
-
 /// Radix used to format the value text rendered inside each step of a
 /// logic-analyser lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -53,9 +45,40 @@ pub enum LabelRadix {
     Bin,
 }
 
+/// Per-lane render mode in a `LogicAnalyserPanel`.
+///
+/// - `Named`: coloured blocks with text labels from the channel's enum
+///   labels. Only meaningful for `ChannelKind::State` channels.
+/// - `Numeric`: heatmap-coloured blocks with the integer value rendered
+///   via the lane's `LabelRadix` (hex/dec/bin). Always available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneMode {
+    #[default]
+    #[serde(alias = "state")]
+    Named,
+    #[serde(alias = "stairs")]
+    Numeric,
+}
+
+impl LaneMode {
+    /// True if this mode requires the channel to carry enum labels.
+    pub fn requires_labels(self) -> bool {
+        matches!(self, LaneMode::Named)
+    }
+}
+
+/// True if `ch` can be rendered in `LaneMode::Named` (i.e. it carries
+/// enum labels). Integer scalars and bit-decomposed channels lack a
+/// label table and so are Numeric-only.
+pub fn channel_has_labels(ch: &ChannelInfo) -> bool {
+    matches!(ch.kind, ChannelKind::State { .. })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LogicLane {
     pub ch: ChannelId,
+    pub mode: LaneMode,
     pub radix: LabelRadix,
 }
 
@@ -167,36 +190,6 @@ impl ScalarPanel {
     }
 }
 
-impl StateChartPanel {
-    pub fn new(title: impl Into<String>) -> Self {
-        Self {
-            title: title.into(),
-            lanes: Vec::new(),
-        }
-    }
-
-    /// Add a state channel as a new lane if not already present. Returns
-    /// true if added. Non-state channels are silently rejected.
-    pub fn add(&mut self, ch: &ChannelInfo) -> bool {
-        if !matches!(ch.kind, ChannelKind::State { .. }) {
-            return false;
-        }
-        if self.lanes.contains(&ch.id) {
-            return false;
-        }
-        self.lanes.push(ch.id);
-        true
-    }
-
-    pub fn remove(&mut self, id: ChannelId) {
-        self.lanes.retain(|x| *x != id);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lanes.is_empty()
-    }
-}
-
 impl LogicAnalyserPanel {
     pub fn new(title: impl Into<String>) -> Self {
         Self {
@@ -205,11 +198,12 @@ impl LogicAnalyserPanel {
         }
     }
 
-    /// Add an integer-storage channel as a new lane (default radix: hex).
-    /// Returns true if added. Non-integer channels are silently rejected;
-    /// duplicates are rejected too.
+    /// Add a lane for `ch`. State channels and integer-storage scalars
+    /// are accepted; everything else (float scalars, etc.) is silently
+    /// rejected. Default mode follows `default_lane_mode`. Duplicates
+    /// are rejected.
     pub fn add(&mut self, ch: &ChannelInfo) -> bool {
-        if !ch.integer_storage {
+        if !accepts_logic(ch) {
             return false;
         }
         if self.lanes.iter().any(|l| l.ch == ch.id) {
@@ -217,6 +211,7 @@ impl LogicAnalyserPanel {
         }
         self.lanes.push(LogicLane {
             ch: ch.id,
+            mode: default_lane_mode(&ch.kind, ch.integer_storage),
             radix: LabelRadix::Hex,
         });
         true
@@ -232,8 +227,28 @@ impl LogicAnalyserPanel {
         self.lanes.iter_mut().find(|l| l.ch == id).map(|l| &mut l.radix)
     }
 
+    /// Mutably access the render mode for `ch`, returning `None` if the
+    /// channel isn't a lane in this panel.
+    pub fn mode_for_mut(&mut self, id: ChannelId) -> Option<&mut LaneMode> {
+        self.lanes.iter_mut().find(|l| l.ch == id).map(|l| &mut l.mode)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lanes.is_empty()
+    }
+}
+
+/// True if `ch` can be added as a lane to a `LogicAnalyserPanel`.
+fn accepts_logic(ch: &ChannelInfo) -> bool {
+    matches!(ch.kind, ChannelKind::State { .. }) || ch.integer_storage
+}
+
+/// Default per-lane render mode for a fresh add. State channels render
+/// with named labels; integer scalars render numerically.
+pub fn default_lane_mode(kind: &ChannelKind, _integer_storage: bool) -> LaneMode {
+    match kind {
+        ChannelKind::State { .. } => LaneMode::Named,
+        ChannelKind::Scalar => LaneMode::Numeric,
     }
 }
 
@@ -241,7 +256,6 @@ impl PlotKind {
     pub fn title(&self) -> &str {
         match self {
             PlotKind::Scalar(p) => &p.title,
-            PlotKind::StateChart(p) => &p.title,
             PlotKind::LogicAnalyser(p) => &p.title,
             PlotKind::XY(p) => &p.title,
         }
@@ -251,8 +265,7 @@ impl PlotKind {
     pub fn accepts(&self, ch: &ChannelInfo) -> bool {
         match self {
             PlotKind::Scalar(_) => matches!(ch.kind, ChannelKind::Scalar),
-            PlotKind::StateChart(_) => matches!(ch.kind, ChannelKind::State { .. }),
-            PlotKind::LogicAnalyser(_) => ch.integer_storage,
+            PlotKind::LogicAnalyser(_) => accepts_logic(ch),
             PlotKind::XY(_) => matches!(ch.kind, ChannelKind::Scalar),
         }
     }
@@ -387,9 +400,6 @@ pub fn try_move_channel(
             PlotKind::Scalar(p) => {
                 p.add(info);
             }
-            PlotKind::StateChart(p) => {
-                p.add(info);
-            }
             PlotKind::LogicAnalyser(p) => {
                 p.add(info);
                 if let (Some(r), Some(slot)) = (radix, p.radix_for_mut(ch)) {
@@ -402,7 +412,6 @@ pub fn try_move_channel(
     if let Some(plot) = plots.get_mut(from) {
         match plot {
             PlotKind::Scalar(p) => p.remove(ch),
-            PlotKind::StateChart(p) => p.remove(ch),
             PlotKind::LogicAnalyser(p) => p.remove(ch),
             PlotKind::XY(_) => {}
         }
@@ -1221,7 +1230,7 @@ mod tests {
         assert!(!matches_query("foo", "bar"));
     }
 
-    // ---- ScalarPanel / StateChartPanel ----
+    // ---- ScalarPanel ----
 
     #[test]
     fn scalar_panel_dedupes_and_rejects_states() {
@@ -1234,19 +1243,6 @@ mod tests {
         assert_eq!(p.channels, vec![10]);
         p.remove(10);
         assert!(p.channels.is_empty());
-    }
-
-    #[test]
-    fn state_chart_panel_dedupes_and_rejects_scalars() {
-        let mut p = StateChartPanel::new("p1");
-        let s = scalar(10, "x.y");
-        let st = state(20, "x.s");
-        assert!(p.add(&st));
-        assert!(!p.add(&st));
-        assert!(!p.add(&s), "scalar must be rejected by StateChartPanel");
-        assert_eq!(p.lanes, vec![20]);
-        p.remove(20);
-        assert!(p.lanes.is_empty());
     }
 
     // ---- SignalStyle / ScalarPanel.styles ----
@@ -1302,13 +1298,6 @@ mod tests {
     }
 
     #[test]
-    fn state_chart_only_accepts_states() {
-        let p = PlotKind::StateChart(StateChartPanel::new("sc"));
-        assert!(p.accepts(&state(2, "a.s")));
-        assert!(!p.accepts(&scalar(1, "a.b")));
-    }
-
-    #[test]
     fn xy_only_accepts_scalars() {
         let xy = PlotKind::XY(XYPlot {
             title: "xy".into(),
@@ -1324,7 +1313,7 @@ mod tests {
     // ---- LogicAnalyserPanel ----
 
     #[test]
-    fn logic_analyser_accepts_integers_only() {
+    fn logic_analyser_accepts_integers_and_states() {
         let p = PlotKind::LogicAnalyser(LogicAnalyserPanel::new("la"));
         // integer-storage scalar (u32 etc.) is accepted
         assert!(p.accepts(&scalar_int(1, "flags")));
@@ -1335,13 +1324,30 @@ mod tests {
     }
 
     #[test]
+    fn logic_analyser_add_state_defaults_to_named_mode() {
+        let mut p = LogicAnalyserPanel::new("la");
+        let st = state(2, "fsm");
+        assert!(p.add(&st));
+        assert_eq!(p.lanes.len(), 1);
+        assert_eq!(p.lanes[0].mode, LaneMode::Named);
+    }
+
+    #[test]
+    fn logic_analyser_add_integer_scalar_defaults_to_numeric() {
+        let mut p = LogicAnalyserPanel::new("la");
+        let c = scalar_int(7, "flags");
+        assert!(p.add(&c));
+        assert_eq!(p.lanes[0].mode, LaneMode::Numeric);
+        assert_eq!(p.lanes[0].radix, LabelRadix::Hex);
+    }
+
+    #[test]
     fn logic_analyser_add_rejects_duplicates() {
         let mut p = LogicAnalyserPanel::new("la");
         let c = scalar_int(7, "flags");
         assert!(p.add(&c));
         assert!(!p.add(&c), "duplicate must be rejected");
         assert_eq!(p.lanes.len(), 1);
-        assert_eq!(p.lanes[0].radix, LabelRadix::Hex);
     }
 
     #[test]
@@ -1372,6 +1378,17 @@ mod tests {
         *p.radix_for_mut(1).unwrap() = LabelRadix::Bin;
         assert_eq!(p.lanes[0].radix, LabelRadix::Bin);
         assert!(p.radix_for_mut(99).is_none());
+    }
+
+    #[test]
+    fn logic_analyser_mode_for_mut_toggles() {
+        let mut p = LogicAnalyserPanel::new("la");
+        let st = state(5, "fsm");
+        p.add(&st);
+        assert_eq!(p.lanes[0].mode, LaneMode::Named);
+        *p.mode_for_mut(5).unwrap() = LaneMode::Numeric;
+        assert_eq!(p.lanes[0].mode, LaneMode::Numeric);
+        assert!(p.mode_for_mut(99).is_none());
     }
 
     // ---- PlotRegistry ----
@@ -1644,8 +1661,8 @@ mod tests {
         let mut src = ScalarPanel::new("src");
         src.add(&s);
         let from = r.insert(PlotKind::Scalar(src));
-        // StateChart doesn't accept scalars.
-        let to = r.insert(PlotKind::StateChart(StateChartPanel::new("dst")));
+        // LogicAnalyser doesn't accept float-storage scalars.
+        let to = r.insert(PlotKind::LogicAnalyser(LogicAnalyserPanel::new("dst")));
         assert!(!try_move_channel(&mut r, from, to, s.id, &s, None));
         match r.get(from).unwrap() {
             PlotKind::Scalar(p) => assert_eq!(p.channels, vec![s.id], "source preserved"),
