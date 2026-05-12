@@ -632,7 +632,17 @@ fn handle_camera(
         if scroll.abs() > 0.5 {
             let factor = (-scroll * 0.0015).exp();
             if cam.follow() {
-                cam.zoom_window(factor);
+                // In Follow mode the data span is the most we can usefully
+                // show; clamping prevents window_ns drifting larger than
+                // valid data and creating a "scroll does nothing" zone
+                // when the user reverses direction.
+                let data_span_ns = ((cur.1 - cur.0).max(0.0) * 1e9) as u64;
+                let max_ns = if data_span_ns > 0 {
+                    Some(data_span_ns)
+                } else {
+                    None
+                };
+                cam.zoom_window(factor, max_ns);
             } else {
                 let pivot_s = ui
                     .input(|i| i.pointer.hover_pos())

@@ -172,8 +172,21 @@ struct btelem_schema_entry {
       (uint16_t)sizeof(((stype *)0)->member), \
       BTELEM_BITFIELD, 1, NULL, &btelem_bfdef_##bf_name }
 
-/* Declare a complete schema entry (creates the schema_entry const) */
+/* Declare a complete schema entry (creates the schema_entry const).
+ *
+ * Compile-time guards:
+ *   - field_count must not exceed BTELEM_MAX_FIELDS (wire format is fixed
+ *     at BTELEM_MAX_FIELDS field slots per entry).
+ *   - payload_size must not exceed BTELEM_MAX_PAYLOAD (ring entry size).
+ */
 #define BTELEM_SCHEMA_ENTRY(tag, _id, _name, _desc, stype, _fields) \
+    _Static_assert(sizeof(_fields) / sizeof(_fields[0]) <= BTELEM_MAX_FIELDS, \
+        "btelem schema '" #tag "' has more fields than BTELEM_MAX_FIELDS; " \
+        "either reduce field count, group members into an array/sub-struct, " \
+        "or raise BTELEM_MAX_FIELDS in btelem_types.h (must match Python and " \
+        "Rust viewer)"); \
+    _Static_assert(sizeof(stype) <= BTELEM_MAX_PAYLOAD, \
+        "btelem schema '" #tag "' payload exceeds BTELEM_MAX_PAYLOAD"); \
     static const struct btelem_schema_entry btelem_schema_##tag = { \
         .id           = (_id), \
         .name         = (_name), \

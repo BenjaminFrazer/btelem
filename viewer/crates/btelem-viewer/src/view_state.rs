@@ -282,9 +282,17 @@ impl Camera {
         self.free_bounds_s = Some((centre - half, centre + half));
     }
 
-    /// Zoom the follow-mode window by `factor`. Clamped to a sensible range.
-    pub fn zoom_window(&mut self, factor: f64) {
-        let new = (self.window_ns as f64 * factor).clamp(1e6, 3.6e12) as u64;
+    /// Zoom the follow-mode window by `factor`. Clamped to a sensible
+    /// minimum and (when supplied) to `max_ns` — typically the available
+    /// data span in nanoseconds, so the user can't zoom out past valid
+    /// data and then have to "burn through" the slack before zoom-in
+    /// becomes visible again.
+    pub fn zoom_window(&mut self, factor: f64, max_ns: Option<u64>) {
+        let abs_max = 3.6e12_f64;
+        let upper = max_ns
+            .map(|m| (m as f64).clamp(1e6, abs_max))
+            .unwrap_or(abs_max);
+        let new = (self.window_ns as f64 * factor).clamp(1e6, upper) as u64;
         self.window_ns = new.max(1);
     }
 }
@@ -882,12 +890,27 @@ mod tests {
     #[test]
     fn zoom_window_changes_size_and_clamps() {
         let mut cam = Camera::default(); // 10s
-        cam.zoom_window(2.0);
+        cam.zoom_window(2.0, None);
         assert_eq!(cam.window_ns, 20_000_000_000);
-        cam.zoom_window(0.0); // would underflow
+        cam.zoom_window(0.0, None); // would underflow
         assert!(cam.window_ns >= 1_000_000); // 1ms floor
-        cam.zoom_window(1e30); // would overflow
+        cam.zoom_window(1e30, None); // would overflow
         assert!(cam.window_ns <= 3_600_000_000_000); // 1h ceiling
+    }
+
+    #[test]
+    fn zoom_window_clamps_to_data_span_when_supplied() {
+        let mut cam = Camera::default();
+        cam.window_ns = 5_000_000_000; // 5s
+        // Data only covers 2s — zooming out past that should be capped.
+        cam.zoom_window(100.0, Some(2_000_000_000));
+        assert_eq!(cam.window_ns, 2_000_000_000);
+        // And further zoom-out doesn't grow past the cap.
+        cam.zoom_window(2.0, Some(2_000_000_000));
+        assert_eq!(cam.window_ns, 2_000_000_000);
+        // Zoom-in still works (factor < 1).
+        cam.zoom_window(0.5, Some(2_000_000_000));
+        assert_eq!(cam.window_ns, 1_000_000_000);
     }
 
     // ---- grouping / search ----
