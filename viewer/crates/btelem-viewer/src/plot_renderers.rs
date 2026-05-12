@@ -68,10 +68,10 @@ pub fn render_timeseries(
     let scalar_h = (ui.available_height() - lanes_total - item_spacing).max(80.0);
     let _ = header_h; // header is already consumed from available_height
 
-    render_scalar_section(ui, ctx, pid, panel, (t0, t1), scalar_h);
+    let gutter = render_scalar_section(ui, ctx, pid, panel, (t0, t1), scalar_h);
 
     for (lane_idx, ch) in panel.states.iter().enumerate() {
-        render_state_lane(ui, ctx, pid, *ch, lane_idx, (t0, t1), lane_h);
+        render_state_lane(ui, ctx, pid, *ch, lane_idx, (t0, t1), lane_h, gutter);
     }
 }
 
@@ -146,7 +146,7 @@ fn render_scalar_section(
     panel: &TimeSeriesPlot,
     (t0, t1): (u64, u64),
     height: f32,
-) {
+) -> f32 {
     let width_px = ui.available_width().max(64.0);
     let max_buckets = (width_px as usize).max(64);
 
@@ -263,6 +263,12 @@ fn render_scalar_section(
             *ctx.cursor_last_set = Some(std::time::Instant::now());
         }
     }
+
+    // Actual left-side gutter (axis labels + ticks) used by this plot. We
+    // hand it to the state lanes below so their x-axis starts at the same
+    // pixel, even when the y-axis grew past Y_AXIS_GUTTER to fit large
+    // numeric labels.
+    (inner.transform.frame().left() - inner.response.rect.left()).max(Y_AXIS_GUTTER)
 }
 
 /// Per-signal style submenu. Mutates the plot via `ctx.plots`.
@@ -486,6 +492,7 @@ fn render_pair_overlays(
 //  State lane
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn render_state_lane(
     ui: &mut egui::Ui,
     ctx: &mut PlotContext<'_>,
@@ -494,6 +501,7 @@ fn render_state_lane(
     lane_idx: usize,
     (t0, t1): (u64, u64),
     height: f32,
+    gutter: f32,
 ) {
     let Some(info) = ctx.by_id.get(&ch) else {
         return;
@@ -507,7 +515,7 @@ fn render_state_lane(
     let plot = Plot::new(egui::Id::new(("lane", pid, ch)))
         .height(height)
         .show_axes([false, true])
-        .y_axis_min_width(Y_AXIS_GUTTER)
+        .y_axis_min_width(gutter)
         .y_axis_formatter(|_, _| String::new())
         .show_grid(false)
         .allow_drag(false)
