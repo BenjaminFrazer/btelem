@@ -397,6 +397,12 @@ fn render_scalar_section(
             draw_signal(pui, sig);
         }
         render_pair_overlays(pui, ctx.markers, ctx.store, &signals);
+        if signals.is_empty() {
+            // No traces — show Δt between paired markers near the
+            // top of the visible y range so it doesn't get clipped.
+            let y = ylo + (yhi - ylo) * 0.92;
+            render_pair_dt_only(pui, ctx.markers, y);
+        }
         render_markers(pui, ctx.markers);
         if let Some(p) = pui.pointer_coordinate() {
             hover_t = Some(p.x);
@@ -637,6 +643,37 @@ pub fn render_markers(pui: &mut PlotUi, markers: &MarkerSet) {
 const PAIR_POS: Color32 = Color32::from_rgb(120, 180, 255); // light blue
 const PAIR_NEG: Color32 = Color32::from_rgb(255, 130, 130); // light red
 
+/// Draw a Δt label between each paired marker pair, with a thin
+/// horizontal tie-line at the given y in plot-coordinate space. Used
+/// on plots that lack signal-aware overlays (logic/state lanes, or
+/// scalar plots with no traces). `y` should be inside the current
+/// plot bounds; the label is anchored centred-bottom on the line.
+fn render_pair_dt_only(pui: &mut PlotUi, markers: &MarkerSet, y: f64) {
+    let label_bg = Color32::from_rgba_unmultiplied(0, 0, 0, 180);
+    for (a, b) in markers.placement_pairs() {
+        let xa = (a.t_ns as f64) / 1e9;
+        let xb = (b.t_ns as f64) / 1e9;
+        let dt = xb - xa;
+        let col = if dt >= 0.0 { PAIR_POS } else { PAIR_NEG };
+        pui.line(
+            Line::new(PlotPoints::from(vec![[xa, y], [xb, y]]))
+                .color(col)
+                .width(1.5),
+        );
+        let mid = (xa + xb) * 0.5;
+        pui.text(
+            Text::new(
+                PlotPoint::new(mid, y),
+                egui::RichText::new(format!("Δt={dt:+.4}s"))
+                    .monospace()
+                    .background_color(label_bg)
+                    .color(col),
+            )
+            .anchor(egui::Align2::CENTER_BOTTOM),
+        );
+    }
+}
+
 /// For each pair, draw an L-shape (horizontal Δt + vertical Δy) per signal
 /// connecting the (t, value) intersection points, with dx/dy labels. Lines
 /// are solid; light blue when (second − first) is positive, light red when
@@ -841,6 +878,7 @@ fn render_state_lane(
                 .anchor(egui::Align2::RIGHT_TOP),
             );
         }
+        render_pair_dt_only(pui, ctx.markers, 0.85);
         render_markers(pui, ctx.markers);
     });
 
@@ -1041,6 +1079,7 @@ fn render_logic_lane(
             )
             .anchor(egui::Align2::LEFT_CENTER),
         );
+        render_pair_dt_only(pui, ctx.markers, 0.85);
         render_markers(pui, ctx.markers);
     });
 
