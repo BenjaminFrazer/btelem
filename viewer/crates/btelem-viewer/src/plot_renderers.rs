@@ -650,17 +650,18 @@ fn draw_signal(pui: &mut PlotUi, sig: &SignalData) {
         let mins: PlotPoints = sig.points.iter().map(|(t, lo, _)| [*t, *lo]).collect();
         let maxs: PlotPoints = sig.points.iter().map(|(t, _, hi)| [*t, *hi]).collect();
         let envelope = sig.colour.linear_multiply(0.6);
+        // No .name() — envelope bands share the signal's identity and
+        // would otherwise clutter the legend with "(min)" / "(max)"
+        // duplicates.
         pui.line(
             Line::new(mins)
                 .color(envelope)
-                .style(LineStyle::dashed_loose())
-                .name(format!("{} (min)", sig.name)),
+                .style(LineStyle::dashed_loose()),
         );
         pui.line(
             Line::new(maxs)
                 .color(envelope)
-                .style(LineStyle::dashed_loose())
-                .name(format!("{} (max)", sig.name)),
+                .style(LineStyle::dashed_loose()),
         );
     }
 

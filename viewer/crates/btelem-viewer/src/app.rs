@@ -492,6 +492,14 @@ impl ViewerApp {
                         .insert(PlotKind::StateChart(StateChartPanel::new(title)));
                     self.dock.push_to_focused_leaf(id);
                 }
+                if ui.button("+ Logic Analyser").clicked() {
+                    let title = format!("logic {}", self.next_plot_num);
+                    self.next_plot_num += 1;
+                    let id = self
+                        .plots
+                        .insert(PlotKind::LogicAnalyser(LogicAnalyserPanel::new(title)));
+                    self.dock.push_to_focused_leaf(id);
+                }
                 let marker_btn =
                     egui::SelectableLabel::new(self.marker_mode, "⌖ marker mode (m)");
                 if ui
