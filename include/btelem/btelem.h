@@ -76,6 +76,15 @@ int btelem_register(struct btelem_ctx *ctx, const struct btelem_schema_entry *en
  *   BTELEM_LOG(ctx, MY_DATA, d);
  */
 #define BTELEM_LOG(ctx, tag, data) \
+    BTELEM_LOG_ID(ctx, BTELEM_ID_##tag, data)
+
+/**
+ * Log a telemetry entry with a runtime-computed schema ID.  Use this when
+ * one struct layout is shared across multiple schema IDs (e.g. one ID per
+ * stream instance).  The ID must refer to a schema previously registered
+ * via btelem_register().
+ */
+#define BTELEM_LOG_ID(ctx, id_expr, data) \
     do { \
         _Static_assert(sizeof(data) <= BTELEM_MAX_PAYLOAD, \
                        "btelem: payload exceeds BTELEM_MAX_PAYLOAD"); \
@@ -84,7 +93,7 @@ int btelem_register(struct btelem_ctx *ctx, const struct btelem_schema_entry *en
         struct btelem_entry *_btlm_e = &_btlm_r->entries[_btlm_slot & _btlm_r->mask]; \
         btelem_atomic_store_rel((btelem_atomic_u64 *)&_btlm_e->seq, 0); \
         _btlm_e->timestamp = BTELEM_TIMESTAMP(); \
-        _btlm_e->id = BTELEM_ID_##tag; \
+        _btlm_e->id = (uint16_t)(id_expr); \
         _btlm_e->payload_size = (uint16_t)sizeof(data); \
         memcpy(_btlm_e->payload, &(data), sizeof(data)); \
         btelem_atomic_store_rel((btelem_atomic_u64 *)&_btlm_e->seq, _btlm_slot + 1); \
