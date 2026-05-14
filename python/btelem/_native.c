@@ -24,7 +24,7 @@
 /* Viewer needs room for any schema the server sends; override the
    conservative embedded default (64) before btelem_types.h sees it. */
 #ifndef BTELEM_MAX_SCHEMA_ENTRIES
-#define BTELEM_MAX_SCHEMA_ENTRIES 256
+#define BTELEM_MAX_SCHEMA_ENTRIES 512
 #endif
 #include "btelem/btelem_types.h"
 
