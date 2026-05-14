@@ -767,7 +767,17 @@ fn render_state_lane(
         ChannelKind::State { labels } => labels.clone(),
         _ => return,
     };
-    let runs = ctx.store.query_state(ch, t0, t1);
+    let mut runs = ctx.store.query_state(ch, t0, t1);
+    // The last run from a state channel always has t_end == its last
+    // observation timestamp (push_state only extends on the *next*
+    // sample). Treat that final run as held to the end of the
+    // visible window so the current state remains drawn instead of
+    // collapsing to a 1-ns sliver.
+    if let Some(last) = runs.last_mut() {
+        if last.t_end < t1 {
+            last.t_end = t1;
+        }
+    }
 
     // Decide labels-vs-heatmap from distinct values seen so far. We
     // compute on the visible runs (cheap: bounded by viewport buckets);
@@ -967,7 +977,7 @@ fn render_logic_lane(
     let path = info.path.clone();
 
     // Collect "runs" of held integer values, regardless of channel kind.
-    let runs: Vec<LogicRun> = match &info.kind {
+    let mut runs: Vec<LogicRun> = match &info.kind {
         ChannelKind::State { .. } => ctx
             .store
             .query_state(ch, t0, t1)
@@ -1004,6 +1014,15 @@ fn render_logic_lane(
             out
         }
     };
+    // Hold the trailing state run out to the right edge — see comment
+    // in render_state_lane. (Scalar branch already does this above.)
+    if matches!(info.kind, ChannelKind::State { .. }) {
+        if let Some(last) = runs.last_mut() {
+            if last.t_end < t1 {
+                last.t_end = t1;
+            }
+        }
+    }
 
     let plot = Plot::new(egui::Id::new(("logic_lane", pid, ch)))
         .height(height)
