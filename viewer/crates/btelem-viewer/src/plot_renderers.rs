@@ -161,6 +161,22 @@ pub fn render_logic_analyser(
     let item_spacing = ui.spacing().item_spacing.y;
     let lane_count = panel.lanes.len() as f32;
 
+    // Pre-empt scroll-wheel events at panel level. Without this the
+    // surrounding ScrollArea below consumes the wheel delta before the
+    // per-lane scroll_zoom_x calls can read it, breaking zoom on
+    // logic/state lanes. The panel rect covers all lanes, so the lane
+    // calls become no-ops (delta zeroed) — they're left in place so a
+    // standalone lane outside this panel still works.
+    let panel_rect = ui.available_rect_before_wrap();
+    let data_span_ns = ctx.store.time_bounds().map(|(a, b)| b.saturating_sub(a));
+    scroll_zoom_x(
+        ui,
+        ctx.cam,
+        panel_rect,
+        ((t0 as f64) / 1e9, (t1 as f64) / 1e9),
+        data_span_ns,
+    );
+
     // Resolve each lane to its schema group; lanes without by_id entries
     // get an empty key and sort to the end.
     let resolved: Vec<Option<&str>> = panel

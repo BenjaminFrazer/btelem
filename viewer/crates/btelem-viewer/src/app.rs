@@ -69,10 +69,14 @@ pub struct ViewerApp {
     /// disappears from the store.
     tree_anchor: Option<ChannelId>,
 
-    // Camera + cursor.
+    /// Camera + cursor.
     cam: Camera,
     cursor_t: Option<u64>,
     cursor_last_set: Option<Instant>,
+    /// Timestamp of the most recent unaccompanied 'g' keypress; used to
+    /// detect the vim-style `gg` two-stroke sequence (zoom to all
+    /// data). Expires after ~700ms.
+    pending_g_at: Option<Instant>,
 
     // Markers.
     markers: MarkerSet,
@@ -164,6 +168,7 @@ impl ViewerApp {
             cam: Camera::default(),
             cursor_t: None,
             cursor_last_set: None,
+            pending_g_at: None,
             markers: MarkerSet::new(),
             dragging_marker: None,
             marker_mode: false,
@@ -395,16 +400,45 @@ impl ViewerApp {
     fn handle_global_keys(&mut self, ctx: &egui::Context) {
         // Don't fire single-letter shortcuts while a text widget (e.g. the
         // signal-tree search box or the Save-As dialog) has keyboard focus —
-        // otherwise typing 'f' would cycle the timebase, 'm' would toggle
+        // otherwise typing 'f' would toggle the timebase, 'm' would toggle
         // marker mode, etc.
         if ctx.wants_keyboard_input() {
             return;
         }
+        // Expire any stale half-sequence so a long delay between two g's
+        // doesn't trigger gg.
+        if let Some(t) = self.pending_g_at {
+            if t.elapsed() > Duration::from_millis(700) {
+                self.pending_g_at = None;
+            }
+        }
+        let data = self.store.time_bounds();
+        let view = compute_view(&self.cam, data);
         ctx.input(|i| {
             if i.key_pressed(egui::Key::F) {
-                self.cam.mode = self.cam.mode.cycle();
+                self.cam.mode = self.cam.mode.toggle();
                 if self.cam.mode == TimeBase::Follow {
                     self.cam.free_bounds_s = None;
+                }
+            }
+            if i.key_pressed(egui::Key::G) {
+                if i.modifiers.shift {
+                    // 'G' — zoom right in by 5x, pivoted on the cursor
+                    // (if set) else the centre of the current view.
+                    if let Some((t0, t1)) = view {
+                        let cur = ((t0 as f64) / 1e9, (t1 as f64) / 1e9);
+                        let pivot = self
+                            .cursor_t
+                            .map(|t| (t as f64) / 1e9)
+                            .unwrap_or((cur.0 + cur.1) * 0.5);
+                        self.cam.zoom_in_at(0.2, pivot, cur);
+                    }
+                    self.pending_g_at = None;
+                } else if self.pending_g_at.take().is_some() {
+                    // Second 'g' within the window — zoom to all data.
+                    self.cam.view_all(data);
+                } else {
+                    self.pending_g_at = Some(Instant::now());
                 }
             }
             if i.key_pressed(egui::Key::Home) {
@@ -421,6 +455,7 @@ impl ViewerApp {
             if i.key_pressed(egui::Key::Escape) {
                 self.xy_drag.cancel();
                 self.marker_mode = false;
+                self.pending_g_at = None;
             }
         });
     }
@@ -449,7 +484,7 @@ impl ViewerApp {
                 }
                 ui.separator();
                 ui.label("timebase:");
-                for mode in [TimeBase::Follow, TimeBase::Max, TimeBase::Pan] {
+                for mode in [TimeBase::Follow, TimeBase::Pan] {
                     let resp = ui.selectable_label(self.cam.mode == mode, mode.label());
                     if resp.clicked() && self.cam.mode != mode {
                         let prev = self.cam.mode;
@@ -460,7 +495,9 @@ impl ViewerApp {
                         let _ = prev;
                     }
                 }
-                ui.label("(f)").on_hover_text("press F to cycle");
+                ui.label("(f)").on_hover_text(
+                    "F toggles follow/pan · gg zooms to all data · G zooms in",
+                );
                 if self.cam.mode == TimeBase::Follow {
                     ui.label("window:");
                     let mut secs = (self.cam.window_ns as f64) / 1e9;

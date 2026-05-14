@@ -452,7 +452,6 @@ pub fn state_lane_mode(distinct: usize) -> StateLaneMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeBase {
     Follow,
-    Max,
     Pan,
 }
 
@@ -460,16 +459,15 @@ impl TimeBase {
     pub fn label(self) -> &'static str {
         match self {
             TimeBase::Follow => "follow",
-            TimeBase::Max => "max",
             TimeBase::Pan => "pan",
         }
     }
 
-    /// Cycle Follow → Max → Pan → Follow.
-    pub fn cycle(self) -> Self {
+    /// Toggle Follow ↔ Pan. The old three-mode cycle (with Max) was
+    /// replaced by a dedicated `view_all` action — see `Camera`.
+    pub fn toggle(self) -> Self {
         match self {
-            TimeBase::Follow => TimeBase::Max,
-            TimeBase::Max => TimeBase::Pan,
+            TimeBase::Follow => TimeBase::Pan,
             TimeBase::Pan => TimeBase::Follow,
         }
     }
@@ -522,6 +520,24 @@ impl Camera {
         self.free_bounds_s = None;
     }
 
+    /// Snap the view to encompass all available data. Switches to Pan
+    /// mode. No-op if `data` is `None`.
+    pub fn view_all(&mut self, data: Option<(u64, u64)>) {
+        if let Some((lo, hi)) = data {
+            self.mode = TimeBase::Pan;
+            let s_lo = (lo as f64) / 1e9;
+            let s_hi = ((hi as f64) / 1e9).max(s_lo + 1e-9);
+            self.free_bounds_s = Some((s_lo, s_hi));
+        }
+    }
+
+    /// Zoom in by `factor` (factor < 1.0 narrows the window) pivoted at
+    /// `pivot_s`. Switches to Pan mode. Use as a one-shot "zoom right
+    /// in" action — repeated calls keep narrowing.
+    pub fn zoom_in_at(&mut self, factor: f64, pivot_s: f64, fallback_bounds: (f64, f64)) {
+        self.zoom_x(factor, pivot_s, fallback_bounds);
+    }
+
     /// Centre the view on `t_ns` while preserving the current visible
     /// span. Always switches to Pan mode.
     pub fn jump_to(&mut self, t_ns: u64, fallback_bounds: (f64, f64)) {
@@ -562,7 +578,6 @@ pub fn compute_view(cam: &Camera, data: Option<(u64, u64)>) -> Option<(u64, u64)
             let _ = earliest;
             Some((left, right))
         }
-        TimeBase::Max => Some((earliest, latest.max(earliest + 1))),
         TimeBase::Pan => {
             if let Some((a, b)) = cam.free_bounds_s {
                 let lo = (a.max(0.0) * 1e9) as u64;
@@ -1135,21 +1150,17 @@ mod tests {
     }
 
     #[test]
-    fn max_mode_shows_all_data() {
-        let cam = Camera {
-            mode: TimeBase::Max,
-            window_ns: 1,
-            free_bounds_s: Some((1.0, 2.0)), // ignored in Max
-        };
-        let v = compute_view(&cam, Some((42, 4242)));
-        assert_eq!(v, Some((42, 4242)));
+    fn view_all_switches_to_pan_and_spans_data() {
+        let mut cam = Camera::default();
+        cam.view_all(Some((1_000_000_000, 5_000_000_000)));
+        assert_eq!(cam.mode, TimeBase::Pan);
+        assert_eq!(cam.free_bounds_s, Some((1.0, 5.0)));
     }
 
     #[test]
-    fn timebase_cycles() {
-        assert_eq!(TimeBase::Follow.cycle(), TimeBase::Max);
-        assert_eq!(TimeBase::Max.cycle(), TimeBase::Pan);
-        assert_eq!(TimeBase::Pan.cycle(), TimeBase::Follow);
+    fn timebase_toggles() {
+        assert_eq!(TimeBase::Follow.toggle(), TimeBase::Pan);
+        assert_eq!(TimeBase::Pan.toggle(), TimeBase::Follow);
     }
 
     #[test]
