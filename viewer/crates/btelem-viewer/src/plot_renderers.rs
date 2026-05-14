@@ -1285,12 +1285,14 @@ fn handle_camera(
         if scroll.abs() > 0.5 {
             let factor = (-scroll * 0.0015).exp();
             if cam.follow() {
-                // In Follow mode the *whole* data span is the most we can
-                // usefully show; clamping to the *current view* (as we did
-                // previously) accidentally pinned window_ns to itself and
-                // killed scroll-out entirely.
-                let max_ns = data_span_ns.filter(|n| *n > 0);
-                cam.zoom_window(factor, max_ns);
+                // Don't cap to data span: the data span can be tiny or
+                // zero (e.g. state channels whose most recent run has
+                // t_end == t_start until the next sample arrives), which
+                // would pin the follow window at the data-span floor and
+                // make zoom-out feel broken. Let the absolute bounds in
+                // `zoom_window` (1ms..1h) do the clamping.
+                let _ = data_span_ns;
+                cam.zoom_window(factor, None);
             } else {
                 let pivot_s = ui
                     .input(|i| i.pointer.hover_pos())
@@ -1335,8 +1337,11 @@ fn scroll_zoom_x(
     }
     let factor = (-scroll * 0.0015).exp();
     if cam.follow() {
-        let max_ns = data_span_ns.filter(|n| *n > 0);
-        cam.zoom_window(factor, max_ns);
+        // See handle_camera: data span can be tiny for state-only data,
+        // which would pin the follow window at that span. Rely on
+        // zoom_window's absolute clamp instead.
+        let _ = data_span_ns;
+        cam.zoom_window(factor, None);
     } else {
         let pivot_s = ui
             .input(|i| i.pointer.hover_pos())
