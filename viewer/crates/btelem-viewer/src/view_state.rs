@@ -552,8 +552,14 @@ pub fn compute_view(cam: &Camera, data: Option<(u64, u64)>) -> Option<(u64, u64)
     let (earliest, latest) = data?;
     match cam.mode {
         TimeBase::Follow => {
-            let left = latest.saturating_sub(cam.window_ns).max(earliest);
+            // Always show a full window_ns slice ending at the most
+            // recent sample. We intentionally do NOT clamp the left
+            // edge to `earliest` — if data is shorter than the window
+            // the user sees blank space to the left, which is more
+            // useful than collapsing the axis onto a tiny data span.
+            let left = latest.saturating_sub(cam.window_ns);
             let right = latest.max(left + 1);
+            let _ = earliest;
             Some((left, right))
         }
         TimeBase::Max => Some((earliest, latest.max(earliest + 1))),
@@ -1104,13 +1110,17 @@ mod tests {
     }
 
     #[test]
-    fn follow_clamps_to_earliest_when_window_exceeds_history() {
+    fn follow_shows_full_window_even_when_data_is_short() {
+        // Window is wider than history — left edge should go to 0
+        // (window_ns > latest, saturating_sub) so the user sees blank
+        // space before the data starts rather than the axis
+        // collapsing onto the data span.
         let cam = Camera {
             mode: TimeBase::Follow,
             window_ns: 1_000_000_000_000,
             free_bounds_s: None,
         };
-        assert_eq!(compute_view(&cam, Some((1, 50))), Some((1, 50)));
+        assert_eq!(compute_view(&cam, Some((1, 50))), Some((0, 50)));
     }
 
     #[test]
