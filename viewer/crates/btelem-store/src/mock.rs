@@ -221,9 +221,27 @@ impl Store for MockStore {
         let Some(runs) = g.states.get(ch as usize) else {
             return Vec::new();
         };
+        let last_idx = runs.len().saturating_sub(1);
         runs.iter()
-            .copied()
-            .filter(|r| r.t_end > t0 && r.t_start < t1)
+            .enumerate()
+            .filter_map(|(i, r)| {
+                // The trailing run always has t_end == its first
+                // observation timestamp (push_state only extends on
+                // the next sample). For querying we treat that run
+                // as held to u64::MAX so a window past it still
+                // returns the current state — otherwise zooming
+                // past the last transition shows nothing.
+                let effective_end = if i == last_idx { u64::MAX } else { r.t_end };
+                if effective_end > t0 && r.t_start < t1 {
+                    Some(StateRun {
+                        t_start: r.t_start,
+                        t_end: effective_end,
+                        value: r.value,
+                    })
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
