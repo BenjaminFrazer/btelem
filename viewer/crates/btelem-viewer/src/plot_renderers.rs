@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use btelem_store::{ChannelId, ChannelInfo, ChannelKind, MockStore, Store};
+use btelem_store::{ChannelId, ChannelInfo, ChannelKind, MockStore, StateRun, Store};
 use eframe::egui::{self, Color32};
 use egui_plot::{
     Bar, BarChart, Line, LineStyle, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, PlotUi,
@@ -784,6 +784,19 @@ fn render_state_lane(
         _ => return,
     };
     let mut runs = ctx.store.query_state(ch, t0, t1);
+    // Fallback: if the store reports nothing in [t0,t1) but the channel
+    // does have a held value (e.g. user zoomed/panned past the last
+    // event), synthesise a single full-width run so the lane keeps
+    // showing the current state instead of blanking out.
+    if runs.is_empty() {
+        if let Some(v) = ctx.store.sample_at(ch, t0) {
+            runs.push(StateRun {
+                t_start: t0,
+                t_end: t1,
+                value: v as u32,
+            });
+        }
+    }
     // The last run from a state channel always has t_end == its last
     // observation timestamp (push_state only extends on the *next*
     // sample). Treat that final run as held to the end of the
@@ -1033,6 +1046,17 @@ fn render_logic_lane(
     // Hold the trailing state run out to the right edge — see comment
     // in render_state_lane. (Scalar branch already does this above.)
     if matches!(info.kind, ChannelKind::State { .. }) {
+        if runs.is_empty() {
+            // Same fallback as render_state_lane: window past the last
+            // event but the channel is still holding a value.
+            if let Some(v) = ctx.store.sample_at(ch, t0) {
+                runs.push(LogicRun {
+                    t_start: t0,
+                    t_end: t1,
+                    value: v as i64,
+                });
+            }
+        }
         if let Some(last) = runs.last_mut() {
             if last.t_end < t1 {
                 last.t_end = t1;

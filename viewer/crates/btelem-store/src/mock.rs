@@ -270,9 +270,21 @@ impl Store for MockStore {
             }
             ChannelKind::State { .. } => {
                 let runs = &g.states[ch as usize];
-                runs.iter()
-                    .find(|r| r.t_start <= t && t < r.t_end)
-                    .map(|r| r.value as f64)
+                if runs.is_empty() {
+                    return None;
+                }
+                // Match query_state semantics: the trailing run is held
+                // forward (t_end on the last run is just its first
+                // observation). Walk normal runs first, then fall back
+                // to the trailing run for any t at or after its start.
+                let last_idx = runs.len() - 1;
+                for (i, r) in runs.iter().enumerate() {
+                    let effective_end = if i == last_idx { u64::MAX } else { r.t_end };
+                    if r.t_start <= t && t < effective_end {
+                        return Some(r.value as f64);
+                    }
+                }
+                None
             }
         }
     }
@@ -384,6 +396,23 @@ mod tests {
     }
 
     #[test]
+    fn query_state_window_past_last_event_returns_held_run() {
+        // Reproduces a viewer bug: zooming/panning past the latest
+        // state observation must still report the channel's current
+        // value. push_state leaves the trailing run with t_end == its
+        // first observation timestamp; query_state has to compensate
+        // by treating that run as held to infinity.
+        let s = MockStore::new();
+        let ch = s.add_state("fsm", &["a", "b"]);
+        s.push_state(ch, 0, 0);
+        s.push_state(ch, 100, 1);
+        let runs = s.query_state(ch, 200, 300);
+        assert_eq!(runs.len(), 1, "trailing run must be visible past last event");
+        assert_eq!(runs[0].value, 1);
+        assert!(runs[0].t_end >= 300, "t_end must cover the query window");
+    }
+
+    #[test]
     fn sample_at_interpolates_scalar() {
         let s = MockStore::new();
         let ch = s.add_scalar("x");
@@ -404,7 +433,10 @@ mod tests {
         s.push_state(ch, 100, 0);
         assert_eq!(s.sample_at(ch, 25), Some(0.0));
         assert_eq!(s.sample_at(ch, 75), Some(1.0));
-        assert_eq!(s.sample_at(ch, 200), None);
+        // Past the last observation: the trailing run is held forward
+        // (matches query_state semantics), so we keep reporting the
+        // most recent value rather than None.
+        assert_eq!(s.sample_at(ch, 200), Some(0.0));
     }
 
     #[test]
