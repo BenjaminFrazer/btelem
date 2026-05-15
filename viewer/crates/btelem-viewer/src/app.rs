@@ -6,6 +6,7 @@
 //! This file is the egui glue.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -295,15 +296,74 @@ impl ViewerApp {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
         self.status = format!("loaded {} ({dispatched_pkts} packets)", file_name);
+
+        // Auto-apply a sidecar layout, if one exists next to the .btlm.
+        // Failures are non-fatal: the user still gets the data even if
+        // the layout is missing / unreadable / version-incompatible.
+        let layout_note = self.try_apply_sidecar_layout(&path);
+
+        let mut bits: Vec<String> = Vec::new();
+        bits.push(format!(
+            "loaded {dispatched_pkts} packets / {dispatched_entries} entries"
+        ));
         if skipped > 0 {
-            self.flash(format!(
-                "loaded {dispatched_pkts} packets / {dispatched_entries} entries · {skipped} bad packets skipped",
-            ));
-        } else {
-            self.flash(format!(
-                "loaded {dispatched_pkts} packets / {dispatched_entries} entries",
+            bits.push(format!("{skipped} bad packets skipped"));
+        }
+        if let Some(note) = layout_note {
+            bits.push(note);
+        }
+        self.flash(bits.join(" · "));
+    }
+
+    /// Look for `<btlm>.layout.json` and apply it. Returns a short
+    /// human-readable status note on success, `None` if no sidecar was
+    /// found, and a `Some(err…)` message on failure (so the caller can
+    /// still flash a single combined message).
+    fn try_apply_sidecar_layout(&mut self, btlm_path: &Path) -> Option<String> {
+        let sidecar = layout_sidecar_path(btlm_path);
+        if !sidecar.exists() {
+            return None;
+        }
+        let bytes = match std::fs::read(&sidecar) {
+            Ok(b) => b,
+            Err(e) => return Some(format!("layout sidecar read failed: {e}")),
+        };
+        let layout: crate::layout::Layout = match serde_json::from_slice(&bytes) {
+            Ok(l) => l,
+            Err(e) => return Some(format!("layout sidecar parse failed: {e}")),
+        };
+        if !matches!(layout.version, 1 | 3 | crate::layout::SCHEMA_VERSION) {
+            return Some(format!(
+                "layout sidecar version {} unsupported",
+                layout.version
             ));
         }
+        let channels = self.store.channels();
+        let (registry, dock, report) = crate::layout::apply(&layout, &channels);
+        self.plots = registry;
+        self.dock = dock;
+        self.next_plot_num = self.plots.len() + 1;
+        self.current_layout_name = Some(layout.name.clone());
+        self.markers.restore(
+            layout
+                .markers
+                .iter()
+                .map(|m| (m.t_ns, m.label.clone(), m.color, m.chain)),
+        );
+        let suffix = if report.missing_channels > 0 || report.dropped_plots > 0 {
+            format!(
+                " ({} unknown channel(s){})",
+                report.missing_channels,
+                if report.dropped_plots > 0 {
+                    format!(", {} plot(s) dropped", report.dropped_plots)
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            String::new()
+        };
+        Some(format!("layout '{}' applied{suffix}", layout.name))
     }
 
     /// Open a native save dialog and write the current ring as a .btlm.
@@ -324,13 +384,47 @@ impl ViewerApp {
             path.set_extension("btlm");
         }
         match self.capture.save_btlm(&path) {
-            Ok(r) => self.flash(format!(
-                "saved {} packets ({}) to {}",
-                r.packets,
-                fmt_bytes(r.bytes),
-                path.display()
-            )),
+            Ok(r) => {
+                let sidecar_note = self.write_sidecar_layout(&path);
+                let main = format!(
+                    "saved {} packets ({}) to {}",
+                    r.packets,
+                    fmt_bytes(r.bytes),
+                    path.display()
+                );
+                self.flash(match sidecar_note {
+                    Some(note) => format!("{main} · {note}"),
+                    None => main,
+                });
+            }
             Err(e) => self.flash(format!("save failed: {e}")),
+        }
+    }
+
+    /// Write the current layout + markers next to the just-saved .btlm
+    /// as `<path>.layout.json`. Returns a short status note (success or
+    /// failure) so the caller can fold it into the main save message.
+    fn write_sidecar_layout(&self, btlm_path: &Path) -> Option<String> {
+        let by_id = self.channels_by_id();
+        let name = self
+            .current_layout_name
+            .clone()
+            .or_else(|| {
+                btlm_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "capture".to_string());
+        let snap =
+            crate::layout::capture(&name, &self.plots, &self.dock, &by_id, &self.markers);
+        let bytes = match serde_json::to_vec_pretty(&snap) {
+            Ok(b) => b,
+            Err(e) => return Some(format!("layout sidecar serialise failed: {e}")),
+        };
+        let sidecar = layout_sidecar_path(btlm_path);
+        match std::fs::write(&sidecar, bytes) {
+            Ok(()) => Some(format!("layout saved to {}", sidecar.display())),
+            Err(e) => Some(format!("layout sidecar write failed: {e}")),
         }
     }
 
@@ -1450,6 +1544,15 @@ fn fmt_bytes(n: u64) -> String {
     } else {
         format!("{:.2} GiB", n as f64 / G as f64)
     }
+}
+
+/// Path of the layout sidecar JSON co-located with a `.btlm`.
+/// `foo.btlm` → `foo.layout.json`; other inputs get `.layout.json`
+/// appended to the stem.
+fn layout_sidecar_path(btlm_path: &Path) -> PathBuf {
+    let mut p = btlm_path.to_path_buf();
+    p.set_extension("layout.json");
+    p
 }
 
 fn fmt_capture_stats(s: &CaptureStats) -> String {
