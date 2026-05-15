@@ -1040,6 +1040,22 @@ fn render_logic_lane(
             if let Some(last) = out.last_mut() {
                 last.t_end = t1;
             }
+            // Fallback when the visible window starts after the last
+            // recorded sample (zoom/pan past data): query_scalar returns
+            // no buckets so we'd render nothing. Hold the most recent
+            // value forward across the whole window so the lane keeps
+            // showing the channel's last known state.
+            if out.is_empty() {
+                if let Some((_, latest)) = ctx.store.time_bounds() {
+                    if let Some(v) = ctx.store.sample_at(ch, latest) {
+                        out.push(LogicRun {
+                            t_start: t0,
+                            t_end: t1,
+                            value: v as i64,
+                        });
+                    }
+                }
+            }
             out
         }
     };
