@@ -13,7 +13,7 @@ use egui_plot::{
 };
 
 use crate::view_state::{
-    channel_group, channel_has_labels, fit_label, group_order, state_lane_mode,
+    channel_group, channel_has_labels, fit_label, group_then_name_order, state_lane_mode,
     strip_group_prefix, try_move_channel, Camera, LabelRadix, LaneMode,
     LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel, LogicLane, MarkerSet, PlotId,
     PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateLaneMode, TimeBase, XYPlot,
@@ -177,14 +177,21 @@ pub fn render_logic_analyser(
         data_span_ns,
     );
 
-    // Resolve each lane to its schema group; lanes without by_id entries
-    // get an empty key and sort to the end.
-    let resolved: Vec<Option<&str>> = panel
+    // Resolve each lane to its schema group + full path. Lanes without
+    // by_id entries get empty strings and sort to the end. Within each
+    // group, sort by full path so lane order is deterministic regardless
+    // of the order they were dragged in.
+    let resolved: Vec<(Option<&str>, &str)> = panel
         .lanes
         .iter()
-        .map(|l| ctx.by_id.get(&l.ch).map(|i| channel_group(&i.path)))
+        .map(|l| {
+            ctx.by_id
+                .get(&l.ch)
+                .map(|i| (Some(channel_group(&i.path)), i.path.as_str()))
+                .unwrap_or((None, ""))
+        })
         .collect();
-    let order = group_order(&resolved);
+    let order = group_then_name_order(&resolved);
     let groups = collapse_groups(order);
 
     // Per-lane height. When grouped, subtract a per-divider allowance so
@@ -200,14 +207,20 @@ pub fn render_logic_analyser(
         / lane_count)
         .clamp(20.0, 60.0);
 
-    // Single-schema panels render exactly as before.
+    // Single-schema panels: still iterate the sorted order so lanes
+    // appear in deterministic name order regardless of drag order.
     if groups.len() <= 1 {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (lane_idx, lane) in panel.lanes.iter().enumerate() {
+                let indices: &[usize] = groups
+                    .first()
+                    .map(|(_, idxs)| idxs.as_slice())
+                    .unwrap_or(&[]);
+                for &lane_idx in indices {
+                    let lane = panel.lanes[lane_idx];
                     render_lane_dispatch(
-                        ui, ctx, pid, lane_idx, *lane, (t0, t1), lane_h, Y_AXIS_GUTTER,
+                        ui, ctx, pid, lane_idx, lane, (t0, t1), lane_h, Y_AXIS_GUTTER,
                     );
                 }
             });

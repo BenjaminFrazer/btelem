@@ -626,6 +626,29 @@ pub fn group_order(groups: &[Option<&str>]) -> Vec<(usize, String)> {
     indexed
 }
 
+/// Like `group_order` but also sorts by the lane's full channel path
+/// within each group. Returns `(lane_idx, group_key)` pairs in render
+/// order; the full path is used only as a sort key and dropped.
+/// Unresolved lanes (`None`) go to the end with an empty group key.
+pub fn group_then_name_order(
+    resolved: &[(Option<&str>, &str)],
+) -> Vec<(usize, String)> {
+    let mut indexed: Vec<(usize, String, String)> = resolved
+        .iter()
+        .enumerate()
+        .map(|(i, (g, p))| {
+            (i, g.unwrap_or("").to_string(), p.to_string())
+        })
+        .collect();
+    indexed.sort_by(|a, b| {
+        a.1.is_empty()
+            .cmp(&b.1.is_empty())
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    indexed.into_iter().map(|(i, g, _)| (i, g)).collect()
+}
+
 /// Group channels by the first dotted segment of their path.
 pub fn group_by_struct<'a, I>(channels: I) -> BTreeMap<String, Vec<&'a ChannelInfo>>
 where
@@ -1884,5 +1907,36 @@ mod tests {
         // "a" group first (stable: idx 2 then 3), then "b" (idx 0), then
         // unresolved (stable: idx 1 then 4).
         assert_eq!(idx, vec![2, 3, 0, 1, 4]);
+    }
+
+    #[test]
+    fn group_then_name_order_sorts_by_path_within_group() {
+        // Drag order intentionally interleaved; expect sort by group,
+        // then by full path within group.
+        let resolved = vec![
+            (Some("motor_1"), "motor_1.rpm"),
+            (Some("motor_2"), "motor_2.temperature"),
+            (Some("motor_1"), "motor_1.gear"),
+            (Some("motor_1"), "motor_1.temperature"),
+            (Some("motor_2"), "motor_2.rpm"),
+        ];
+        let order = group_then_name_order(&resolved);
+        let idx: Vec<usize> = order.iter().map(|(i, _)| *i).collect();
+        // motor_1: gear (2), rpm (0), temperature (3); motor_2: rpm (4), temperature (1).
+        assert_eq!(idx, vec![2, 0, 3, 4, 1]);
+    }
+
+    #[test]
+    fn group_then_name_order_unresolved_goes_to_end() {
+        let resolved = vec![
+            (Some("b"), "b.x"),
+            (None, ""),
+            (Some("a"), "a.z"),
+            (Some("a"), "a.y"),
+        ];
+        let order = group_then_name_order(&resolved);
+        let idx: Vec<usize> = order.iter().map(|(i, _)| *i).collect();
+        // a.y (3), a.z (2), b.x (0), unresolved (1).
+        assert_eq!(idx, vec![3, 2, 0, 1]);
     }
 }
