@@ -126,4 +126,28 @@ pub trait Store: Send + Sync {
     /// Drop every channel and sample. Bumps the revision once so consumers
     /// invalidate their caches.
     fn clear(&self);
+
+    /// Global min/max value of `ch` across all samples ever ingested
+    /// (not constrained to any viewport). Used to lock heatmap colour
+    /// mapping so the gradient doesn't shift when zooming.
+    ///
+    /// For scalar channels: the actual numeric min/max. For state
+    /// channels: the min/max of the held integer value (cast to f64).
+    /// Returns `None` for unknown / empty channels.
+    fn value_bounds(&self, ch: ChannelId) -> Option<(f64, f64)> {
+        let (t0, t1) = self.time_bounds()?;
+        let t1 = t1.saturating_add(1);
+        let bs = self.query_scalar(ch, t0, t1, 1);
+        if let Some(b) = bs.first() {
+            return Some((b.min, b.max));
+        }
+        let runs = self.query_state(ch, t0, t1);
+        if runs.is_empty() {
+            return None;
+        }
+        let (lo, hi) = runs.iter().fold((u32::MAX, u32::MIN), |(lo, hi), r| {
+            (lo.min(r.value), hi.max(r.value))
+        });
+        Some((lo as f64, hi as f64))
+    }
 }

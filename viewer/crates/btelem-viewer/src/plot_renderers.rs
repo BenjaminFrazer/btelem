@@ -831,18 +831,26 @@ fn render_state_lane(
         seen.insert(r.value);
     }
     let mode = state_lane_mode(seen.len());
+    // Heatmap range: prefer the channel's global value bounds so the
+    // gradient stays stable across zooms. Fall back to viewport-derived
+    // bounds if the store can't supply them.
     let (vmin, vmax) = if mode == StateLaneMode::Heatmap && !runs.is_empty() {
-        let mut lo = u32::MAX;
-        let mut hi = u32::MIN;
-        for r in &runs {
-            if r.value < lo {
-                lo = r.value;
-            }
-            if r.value > hi {
-                hi = r.value;
-            }
-        }
-        (lo, hi)
+        ctx.store
+            .value_bounds(ch)
+            .map(|(lo, hi)| (lo as u32, hi as u32))
+            .unwrap_or_else(|| {
+                let mut lo = u32::MAX;
+                let mut hi = u32::MIN;
+                for r in &runs {
+                    if r.value < lo {
+                        lo = r.value;
+                    }
+                    if r.value > hi {
+                        hi = r.value;
+                    }
+                }
+                (lo, hi)
+            })
     } else {
         (0, 0)
     };
@@ -1144,11 +1152,19 @@ fn render_logic_lane(
         pui.set_plot_bounds(PlotBounds::from_min_max([xmin, 0.0], [xmax, 1.0]));
         let px_per_sec = pui.transform().dpos_dvalue_x();
         // Heatmap coloring keyed off the value's position within the
-        // visible (vmin..vmax) range. Falls back to mid-gradient when
-        // only one distinct value is present.
-        let (vmin, vmax) = runs.iter().fold((i64::MAX, i64::MIN), |(lo, hi), r| {
-            (lo.min(r.value), hi.max(r.value))
-        });
+        // channel's *global* (vmin..vmax) range. Using viewport-only
+        // bounds caused the gradient to shift while zooming. Falls back
+        // to viewport bounds if the store has no value_bounds, and to
+        // mid-gradient when only one distinct value exists.
+        let (vmin, vmax) = ctx
+            .store
+            .value_bounds(ch)
+            .map(|(lo, hi)| (lo as i64, hi as i64))
+            .unwrap_or_else(|| {
+                runs.iter().fold((i64::MAX, i64::MIN), |(lo, hi), r| {
+                    (lo.min(r.value), hi.max(r.value))
+                })
+            });
         let span = (vmax - vmin).max(0) as f32;
         let mut bars: Vec<Bar> = Vec::with_capacity(runs.len());
         let mut texts: Vec<(f64, String, Color32)> = Vec::with_capacity(runs.len());
