@@ -104,6 +104,9 @@ pub struct ViewerApp {
     /// When `Some`, the Save As… popup is open and the contained
     /// string is the in-progress name buffer.
     save_as_buffer: Option<String>,
+    /// When `Some`, a "delete layout?" confirm dialog is open for the
+    /// named layout. Cleared on either confirm or cancel.
+    delete_confirm: Option<String>,
     /// Short transient message shown next to `status` (e.g.
     /// "layout 'foo' loaded — 2 unknown channels skipped"). Expires
     /// ~3s after the timestamp.
@@ -180,6 +183,7 @@ impl ViewerApp {
             group_counts_last_refresh: None,
             current_layout_name: None,
             save_as_buffer: None,
+            delete_confirm: None,
             status_flash: None,
             pending_connection: connection.clone(),
             connection,
@@ -781,7 +785,7 @@ impl ViewerApp {
                 }
                 for name in &saved {
                     if ui.button(name).clicked() {
-                        self.do_delete_layout(name);
+                        self.delete_confirm = Some(name.clone());
                         ui.close_menu();
                     }
                 }
@@ -901,6 +905,47 @@ impl ViewerApp {
             }
         } else if !open || cancel {
             self.save_as_buffer = None;
+        }
+    }
+
+    fn delete_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.delete_confirm.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Delete layout?")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!("Permanently delete layout '{name}'?"));
+                ui.label(
+                    egui::RichText::new("This cannot be undone.")
+                        .weak(),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("Delete").color(Color32::LIGHT_RED),
+                        ))
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.delete_confirm = None;
+            self.do_delete_layout(&name);
+        } else if !open || cancel {
+            self.delete_confirm = None;
         }
     }
 
@@ -1266,6 +1311,7 @@ impl eframe::App for ViewerApp {
         self.top_bar(ctx);
         self.connection_dialog(ctx);
         self.save_as_dialog(ctx);
+        self.delete_confirm_dialog(ctx);
         self.confirm_clear_dialog(ctx);
         self.tree_panel(ctx);
         self.cursor_panel(ctx);
