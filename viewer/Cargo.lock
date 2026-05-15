@@ -474,6 +474,7 @@ dependencies = [
  "btelem-capture",
  "btelem-ingest",
  "btelem-store",
+ "btelem-wire",
  "clap",
  "dirs",
  "eframe",

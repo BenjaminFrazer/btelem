@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use btelem_capture::{Capture, CaptureStats};
-use btelem_ingest::{SourceHandle, TcpSource};
+use btelem_capture::{read_btlm, Capture, CaptureStats};
+use btelem_ingest::{ChannelMap, SourceHandle, TcpSource};
 use btelem_store::{ChannelId, ChannelInfo, ChannelKind, MockStore, Store};
+use btelem_wire::{decode_packet, Schema};
 use eframe::egui;
 use egui::{Color32, DragAndDrop};
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
@@ -234,6 +235,77 @@ impl ViewerApp {
         self.flash("capture cleared");
     }
 
+    /// Open a native file dialog, load a `.btlm` capture, drop any live
+    /// source, replay every packet into the store. The capture ring is
+    /// repopulated too so the user can re-save (e.g. as a different
+    /// name) or layer markers/plots on top of the historic data.
+    fn do_open_capture(&mut self) {
+        let pick = rfd::FileDialog::new()
+            .add_filter("btelem capture", &["btlm"])
+            .pick_file();
+        let Some(path) = pick else {
+            return;
+        };
+        let loaded = match read_btlm(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                self.flash(format!("open failed: {e}"));
+                return;
+            }
+        };
+        let schema = match Schema::decode(&loaded.schema) {
+            Ok(s) => s,
+            Err(e) => {
+                self.flash(format!("open failed: schema decode: {e}"));
+                return;
+            }
+        };
+        // Tear down live ingest first so it can't race the store reset.
+        self._handle = None;
+        self.store.clear();
+        self.capture.clear();
+        self.last_revision = 0;
+        self.rate = RateEstimator::new(2.0);
+        let map = match ChannelMap::build(&schema, &self.store) {
+            Ok(m) => m,
+            Err(e) => {
+                self.flash(format!("open failed: channel map: {e}"));
+                return;
+            }
+        };
+        self.capture.set_schema(loaded.schema.clone());
+        let mut dispatched_pkts: u64 = 0;
+        let mut dispatched_entries: u64 = 0;
+        let mut skipped: u64 = 0;
+        for pkt in &loaded.packets {
+            match decode_packet(pkt) {
+                Ok(p) => {
+                    for e in &p.entries {
+                        map.dispatch(e.id, e.timestamp, e.payload, &self.store);
+                        dispatched_entries += 1;
+                    }
+                    let _ = self.capture.push_packet(pkt.clone());
+                    dispatched_pkts += 1;
+                }
+                Err(_) => skipped += 1,
+            }
+        }
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        self.status = format!("loaded {} ({dispatched_pkts} packets)", file_name);
+        if skipped > 0 {
+            self.flash(format!(
+                "loaded {dispatched_pkts} packets / {dispatched_entries} entries · {skipped} bad packets skipped",
+            ));
+        } else {
+            self.flash(format!(
+                "loaded {dispatched_pkts} packets / {dispatched_entries} entries",
+            ));
+        }
+    }
+
     /// Open a native save dialog and write the current ring as a .btlm.
     fn do_save_capture(&mut self) {
         if !self.capture.has_data() {
@@ -279,6 +351,10 @@ impl ViewerApp {
                     ui.close_menu();
                 }
             });
+            if ui.button("📂 Open…").clicked() {
+                self.do_open_capture();
+                ui.close_menu();
+            }
             ui.add_enabled_ui(has_data || stats.has_schema, |ui| {
                 if ui.button("🗑 Clear…").clicked() {
                     self.confirm_clear_open = true;

@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -50,6 +50,12 @@ pub enum CaptureError {
     NoSchema,
     #[error("packet too short ({0} bytes) to contain a header")]
     BadPacket(usize),
+    #[error("not a .btlm file (bad magic)")]
+    BadMagic,
+    #[error("unsupported .btlm version: {0}")]
+    UnsupportedVersion(u16),
+    #[error("truncated .btlm file")]
+    Truncated,
 }
 
 /// Per-packet metadata extracted at push time. Kept alongside the bytes so
@@ -244,6 +250,90 @@ pub struct SaveReport {
     pub packets: u64,
     pub bytes: u64,
     pub schema_bytes: u64,
+}
+
+/// In-memory snapshot of a `.btlm` file produced by [`read_btlm`].
+///
+/// `packets` are the raw packet bodies in file order, ready to feed
+/// straight back through `btelem_wire::decode_packet`.
+#[derive(Debug, Clone)]
+pub struct LoadedCapture {
+    pub schema: Vec<u8>,
+    pub packets: Vec<Vec<u8>>,
+}
+
+/// Read a `.btlm` file from disk. Validates the magic + version, then
+/// uses the trailer index to slice out each packet. Returns the schema
+/// blob and packet bytes; the caller is responsible for decoding /
+/// dispatching them.
+pub fn read_btlm(path: &Path) -> Result<LoadedCapture, CaptureError> {
+    let file = File::open(path)?;
+    let mut r = BufReader::new(file);
+
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(CaptureError::BadMagic);
+    }
+    let mut ver = [0u8; 2];
+    r.read_exact(&mut ver)?;
+    let version = u16::from_le_bytes(ver);
+    if version != VERSION {
+        return Err(CaptureError::UnsupportedVersion(version));
+    }
+    let mut slen = [0u8; 4];
+    r.read_exact(&mut slen)?;
+    let schema_len = u32::from_le_bytes(slen) as usize;
+    let mut schema = vec![0u8; schema_len];
+    r.read_exact(&mut schema)?;
+
+    // Walk the trailer index for per-packet offsets/lengths. The index
+    // footer is exactly 16 bytes at end of file: index_offset u64,
+    // count u32, magic u32.
+    let total = r.seek(SeekFrom::End(0))?;
+    if total < 16 {
+        return Err(CaptureError::Truncated);
+    }
+    r.seek(SeekFrom::End(-16))?;
+    let mut footer = [0u8; 16];
+    r.read_exact(&mut footer)?;
+    let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let count = u32::from_le_bytes(footer[8..12].try_into().unwrap()) as usize;
+    let magic_le = u32::from_le_bytes(footer[12..16].try_into().unwrap());
+    if magic_le != INDEX_MAGIC {
+        return Err(CaptureError::BadMagic);
+    }
+
+    // Each index entry is 28 bytes (offset u64 + ts_min u64 + ts_max u64 + entries u32).
+    let mut entries: Vec<u64> = Vec::with_capacity(count);
+    r.seek(SeekFrom::Start(index_offset))?;
+    for _ in 0..count {
+        let mut buf = [0u8; 28];
+        r.read_exact(&mut buf)?;
+        let off = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        entries.push(off);
+    }
+    // Compute each packet's length from its successor's offset (or the
+    // index offset for the last one).
+    let mut packets: Vec<Vec<u8>> = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = entries[i];
+        let end = if i + 1 < count {
+            entries[i + 1]
+        } else {
+            index_offset
+        };
+        if end < start {
+            return Err(CaptureError::Truncated);
+        }
+        let len = (end - start) as usize;
+        r.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf)?;
+        packets.push(buf);
+    }
+
+    Ok(LoadedCapture { schema, packets })
 }
 
 /// UTC-flavoured suggested filename: `btelem-YYYYMMDD-HHMMSS.btlm`.
@@ -504,5 +594,45 @@ mod tests {
         assert!(!cap.set_schema(b"A".to_vec()));
         assert!(!cap.set_schema(b"A".to_vec())); // identical
         assert!(cap.set_schema(b"B".to_vec())); // diff
+    }
+
+    #[test]
+    fn read_btlm_round_trips_save_btlm() {
+        let cap = Capture::default();
+        let schema_blob = vec![0xAAu8; 40];
+        cap.set_schema(schema_blob.clone());
+        let p1 = build_packet(&[(1, 100, &[1u8; 4])]);
+        let p2 = build_packet(&[(2, 200, b"hello!!!"), (3, 250, &[0u8; 2])]);
+        cap.push_packet(p1.clone()).unwrap();
+        cap.push_packet(p2.clone()).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("btelem-read-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rt.btlm");
+        cap.save_btlm(&path).unwrap();
+
+        let loaded = read_btlm(&path).unwrap();
+        assert_eq!(loaded.schema, schema_blob);
+        assert_eq!(loaded.packets.len(), 2);
+        assert_eq!(loaded.packets[0], p1);
+        assert_eq!(loaded.packets[1], p2);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn read_btlm_rejects_bad_magic() {
+        let dir =
+            std::env::temp_dir().join(format!("btelem-bad-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.btlm");
+        std::fs::write(&path, b"NOPE\x01\x00\x00\x00\x00\x00").unwrap();
+        match read_btlm(&path) {
+            Err(CaptureError::BadMagic) => {}
+            other => panic!("expected BadMagic, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
