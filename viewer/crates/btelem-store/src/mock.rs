@@ -216,6 +216,35 @@ impl Store for MockStore {
         out
     }
 
+    fn query_raw(
+        &self,
+        ch: ChannelId,
+        t0: Timestamp,
+        t1: Timestamp,
+        max_samples: usize,
+    ) -> Vec<(Timestamp, f64)> {
+        if max_samples == 0 || t1 <= t0 {
+            return Vec::new();
+        }
+        let g = self.inner.read().unwrap();
+        let Some(samples) = g.scalars.get(ch as usize) else {
+            return Vec::new();
+        };
+        // Pull raw samples in window. If we'd exceed max_samples,
+        // stride-sample. Bucket aggregation is *not* applied — colour
+        // mapping needs zoom-stable per-sample values.
+        let in_range: Vec<(Timestamp, f64)> = samples
+            .iter()
+            .copied()
+            .filter(|(t, _)| *t >= t0 && *t < t1)
+            .collect();
+        if in_range.len() <= max_samples {
+            return in_range;
+        }
+        let stride = in_range.len().div_ceil(max_samples).max(1);
+        in_range.into_iter().step_by(stride).collect()
+    }
+
     fn query_state(&self, ch: ChannelId, t0: Timestamp, t1: Timestamp) -> Vec<StateRun> {
         let g = self.inner.read().unwrap();
         let Some(runs) = g.states.get(ch as usize) else {

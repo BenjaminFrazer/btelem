@@ -1041,22 +1041,27 @@ fn render_logic_lane(
             })
             .collect(),
         ChannelKind::Scalar => {
-            let max_buckets = (ui.available_width() as usize).max(64);
-            let bs = ctx.store.query_scalar(ch, t0, t1, max_buckets);
-            let mut out: Vec<LogicRun> = Vec::with_capacity(bs.len());
-            for b in &bs {
-                let v = b.max as i64;
+            // Cap raw samples at a generous multiple of pixel width so
+            // very dense channels still bound the work, but boundaries
+            // between value runs come from actual sample timestamps —
+            // not bucket grid alignment — so colour/value doesn't
+            // flicker as the user zooms.
+            let max_samples = ((ui.available_width() as usize).max(64)) * 8;
+            let samples = ctx.store.query_raw(ch, t0, t1, max_samples);
+            let mut out: Vec<LogicRun> = Vec::with_capacity(samples.len());
+            for (t, v_f) in &samples {
+                let v = *v_f as i64;
                 if let Some(last) = out.last_mut() {
                     if last.value == v {
-                        last.t_end = b.t;
+                        last.t_end = *t;
                         continue;
                     } else {
-                        last.t_end = b.t;
+                        last.t_end = *t;
                     }
                 }
                 out.push(LogicRun {
-                    t_start: b.t,
-                    t_end: b.t,
+                    t_start: *t,
+                    t_end: *t,
                     value: v,
                 });
             }

@@ -127,6 +127,27 @@ pub trait Store: Send + Sync {
     /// invalidate their caches.
     fn clear(&self);
 
+    /// Raw (un-bucketed) samples of `ch` in `[t0, t1)`, capped at
+    /// `max_samples`. Used by the logic-analyser stairs renderer to
+    /// build value-transition runs without bucket-induced jitter.
+    ///
+    /// Default impl reuses `query_scalar` with `max_samples` buckets
+    /// and reports `(t, max)`. This is *not* strictly raw — if the
+    /// store down-samples it may aggregate — so concrete stores
+    /// should override for stability under zoom.
+    fn query_raw(
+        &self,
+        ch: ChannelId,
+        t0: Timestamp,
+        t1: Timestamp,
+        max_samples: usize,
+    ) -> Vec<(Timestamp, f64)> {
+        self.query_scalar(ch, t0, t1, max_samples)
+            .into_iter()
+            .map(|b| (b.t, b.max))
+            .collect()
+    }
+
     /// Global min/max value of `ch` across all samples ever ingested
     /// (not constrained to any viewport). Used to lock heatmap colour
     /// mapping so the gradient doesn't shift when zooming.
