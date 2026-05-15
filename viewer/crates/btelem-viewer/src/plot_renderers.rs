@@ -982,6 +982,8 @@ fn render_state_lane(
         .time_bounds()
         .map(|(a, b)| b.saturating_sub(a));
     let cur_s = (t0 as f64 / 1e9, t1 as f64 / 1e9);
+    let primary_drag_available = ctx.dragging_marker.is_none() && !ctx.marker_mode;
+    drag_pan_x(ctx.cam, &drag, cur_s, primary_drag_available);
     scroll_zoom_x(ui, ctx.cam, drag.rect, cur_s, data_span_ns);
 }
 
@@ -1248,6 +1250,8 @@ fn render_logic_lane(
         .time_bounds()
         .map(|(a, b)| b.saturating_sub(a));
     let cur_s = (t0 as f64 / 1e9, t1 as f64 / 1e9);
+    let primary_drag_available = ctx.dragging_marker.is_none() && !ctx.marker_mode;
+    drag_pan_x(ctx.cam, &drag, cur_s, primary_drag_available);
     scroll_zoom_x(ui, ctx.cam, drag.rect, cur_s, data_span_ns);
 }
 
@@ -1357,6 +1361,32 @@ fn handle_camera(
 /// `handle_camera` — `cam.zoom_window` when following, `cam.zoom_x`
 /// pivoted at the cursor otherwise. Consumes the scroll delta so the
 /// surrounding ScrollArea doesn't also use it.
+/// Drag-pan helper for lane plots. Mirrors handle_camera's pan logic
+/// but takes a Response directly (lanes use a manual overlay rather
+/// than `Plot`'s built-in interactivity). Skip when no drag, or when
+/// marker interactions want the primary button.
+fn drag_pan_x(
+    cam: &mut Camera,
+    response: &egui::Response,
+    cur_s: (f64, f64),
+    primary_drag_available: bool,
+) {
+    if cam.mode != TimeBase::Pan {
+        return;
+    }
+    let dragged = response.dragged_by(egui::PointerButton::Middle)
+        || (primary_drag_available && response.dragged_by(egui::PointerButton::Primary));
+    if !dragged {
+        return;
+    }
+    let dx = response.drag_delta().x as f64;
+    if dx.abs() == 0.0 {
+        return;
+    }
+    let scale = (cur_s.1 - cur_s.0) / response.rect.width().max(1.0) as f64;
+    cam.pan_x(-dx * scale, cur_s);
+}
+
 fn scroll_zoom_x(
     ui: &mut egui::Ui,
     cam: &mut Camera,
