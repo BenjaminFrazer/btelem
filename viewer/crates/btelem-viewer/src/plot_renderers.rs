@@ -931,7 +931,6 @@ fn render_state_lane(
                 .anchor(egui::Align2::RIGHT_TOP),
             );
         }
-        render_pair_dt_only(pui, ctx.markers, 0.85);
         render_markers(pui, ctx.markers);
     });
 
@@ -1056,6 +1055,39 @@ fn render_logic_lane(
             if let Some(last) = out.last_mut() {
                 last.t_end = t1;
             }
+            // Fix the leading-edge gap: query_scalar's first bucket sits
+            // at the timestamp of the first sample inside [t0, t1), so
+            // anything in [t0, first.t_start) renders as background
+            // ("black box on the left"). Extend the first run back to
+            // t0 — if there's a held value from before the window, use
+            // that, otherwise hold the first bucket's value back.
+            if let Some(first_start) = out.first().map(|r| r.t_start) {
+                if first_start > t0 {
+                    let first_value = out.first().map(|r| r.value).unwrap_or(0);
+                    let held = ctx.store.sample_at(ch, t0).map(|v| v as i64);
+                    match held {
+                        Some(v) if v != first_value => {
+                            // Different held value before the first
+                            // bucket — prepend a leading run.
+                            out.insert(
+                                0,
+                                LogicRun {
+                                    t_start: t0,
+                                    t_end: first_start,
+                                    value: v,
+                                },
+                            );
+                        }
+                        _ => {
+                            // Same value (or unknown) — just stretch
+                            // the first run back.
+                            if let Some(first) = out.first_mut() {
+                                first.t_start = t0;
+                            }
+                        }
+                    }
+                }
+            }
             // Fallback when the visible window starts after the last
             // recorded sample (zoom/pan past data): query_scalar returns
             // no buckets so we'd render nothing. Hold the most recent
@@ -1170,7 +1202,6 @@ fn render_logic_lane(
             )
             .anchor(egui::Align2::LEFT_CENTER),
         );
-        render_pair_dt_only(pui, ctx.markers, 0.85);
         render_markers(pui, ctx.markers);
     });
 
