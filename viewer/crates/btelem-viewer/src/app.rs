@@ -704,7 +704,7 @@ impl ViewerApp {
 
     fn do_save_layout(&mut self, name: &str) {
         let by_id = self.channels_by_id();
-        let snap = crate::layout::capture(name, &self.plots, &self.dock, &by_id);
+        let snap = crate::layout::capture(name, &self.plots, &self.dock, &by_id, &self.markers);
         match crate::layout::save(&snap) {
             Ok(()) => {
                 self.current_layout_name = Some(name.to_string());
@@ -731,6 +731,12 @@ impl ViewerApp {
         // numbering, so just count past existing.
         self.next_plot_num = self.plots.len() + 1;
         self.current_layout_name = Some(layout.name.clone());
+        self.markers.restore(
+            layout
+                .markers
+                .iter()
+                .map(|m| (m.t_ns, m.label.clone(), m.color, m.chain)),
+        );
         let suffix = if report.missing_channels > 0 || report.dropped_plots > 0 {
             format!(
                 " — {} unknown channel(s){}",

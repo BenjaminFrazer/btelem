@@ -21,15 +21,16 @@ use btelem_store::{ChannelId, ChannelInfo, ChannelKind};
 use serde::{Deserialize, Serialize};
 
 use crate::view_state::{
-    default_lane_mode, LabelRadix, LaneMode, LogicAnalyserPanel, PlotId, PlotKind, PlotRegistry,
-    ScalarPanel, SignalStyle, XYPlot,
+    default_lane_mode, LabelRadix, LaneMode, LogicAnalyserPanel, MarkerSet, PlotId, PlotKind,
+    PlotRegistry, ScalarPanel, SignalStyle, XYPlot,
 };
 
 /// Bumped when the on-disk JSON shape changes in a non-backwards-
 /// compatible way. Loaders refuse anything they don't recognise (with
 /// the exception of legacy `time_series` and `state_chart` plot specs,
-/// which are migrated into `scalar` + `logic_analyser` plots on load).
-pub const SCHEMA_VERSION: u32 = 3;
+/// which are migrated into `scalar` + `logic_analyser` plots on load,
+/// and v3 files which simply lack `markers`).
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// In-memory representation of a layout file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +44,21 @@ pub struct Layout {
     /// parses far enough to be reported).
     pub dock: serde_json::Value,
     pub plots: Vec<PlotSpec>,
+    /// User-placed marker annotations (v4+). Optional so v3 layouts
+    /// still parse — they simply load with no markers.
+    #[serde(default)]
+    pub markers: Vec<MarkerSpec>,
+}
+
+/// Serialised marker. Chains are encoded as integer ids; markers
+/// sharing an id belong to the same chain. `None` means a free marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MarkerSpec {
+    pub t_ns: u64,
+    pub label: String,
+    pub color: [u8; 3],
+    #[serde(default)]
+    pub chain: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -166,7 +182,7 @@ pub fn list() -> io::Result<Vec<String>> {
         }
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(layout) = serde_json::from_slice::<Layout>(&bytes) {
-                if layout.version == SCHEMA_VERSION || layout.version == 1 {
+                if matches!(layout.version, 1 | 3 | SCHEMA_VERSION) {
                     names.push(layout.name);
                 }
             }
@@ -180,10 +196,10 @@ pub fn load(name: &str) -> io::Result<Layout> {
     let bytes = fs::read(path_for(name))?;
     let layout: Layout = serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    // Accept v1 files (legacy `TimeSeries` plots) and migrate them on
-    // load; reject anything else. No backwards-compat guarantee — see
-    // the module docs.
-    if layout.version != SCHEMA_VERSION && layout.version != 1 {
+    // Accept v1 (legacy `TimeSeries`) and v3 (no markers) layout files
+    // and migrate them on load; reject anything else. No backwards-
+    // compat guarantee — see the module docs.
+    if !matches!(layout.version, 1 | 3 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -223,6 +239,7 @@ pub fn capture(
     plots: &PlotRegistry,
     dock: &egui_dock::DockState<PlotId>,
     by_id: &HashMap<ChannelId, ChannelInfo>,
+    markers: &MarkerSet,
 ) -> Layout {
     // Stable order: capture each plot exactly once, in the order they
     // first appear in the dock. Anything in the registry but not in the
@@ -263,6 +280,16 @@ pub fn capture(
         name: name.to_string(),
         dock: serde_json::to_value(&dock_usize).unwrap_or(serde_json::Value::Null),
         plots: specs,
+        markers: markers
+            .markers
+            .iter()
+            .map(|m| MarkerSpec {
+                t_ns: m.t_ns,
+                label: m.label.clone(),
+                color: m.color,
+                chain: m.chain,
+            })
+            .collect(),
     }
 }
 
@@ -668,7 +695,7 @@ mod tests {
 
         let dock = egui_dock::DockState::new(vec![scalar_pid, state_pid]);
 
-        let snap = capture("imu overview", &reg, &dock, &by_id);
+        let snap = capture("imu overview", &reg, &dock, &by_id, &MarkerSet::new());
         assert_eq!(snap.name, "imu overview");
         assert_eq!(snap.plots.len(), 2);
         assert_eq!(snap.version, SCHEMA_VERSION);
@@ -740,6 +767,7 @@ mod tests {
                     trail_ns: None,
                 },
             ],
+            markers: vec![],
         };
         let (reg, _dock, report) = apply(&snap, &chs);
         // accel.z (scalar missing) + nope.state + missing.y
@@ -826,6 +854,7 @@ mod tests {
                 states: vec![],
                 styles: HashMap::new(),
             }],
+            markers: vec![],
         };
         let chs = vec![ch_scalar(0, "a.x")];
         let (reg, _dock, _) = apply(&layout, &chs);
@@ -850,7 +879,7 @@ mod tests {
         let pid = reg.insert(PlotKind::LogicAnalyser(la));
         let dock = egui_dock::DockState::new(vec![pid]);
 
-        let snap = capture("mixed", &reg, &dock, &by_id);
+        let snap = capture("mixed", &reg, &dock, &by_id, &MarkerSet::new());
         assert_eq!(snap.version, SCHEMA_VERSION);
         let json = serde_json::to_vec(&snap).unwrap();
         let snap2: Layout = serde_json::from_slice(&json).unwrap();
@@ -924,5 +953,54 @@ mod tests {
         }
         assert!(got_stairs, "v2 logic_analyser should migrate to Stairs lanes");
         assert!(got_state, "v2 state_chart should migrate to State lanes");
+    }
+
+    #[test]
+    fn markers_round_trip_through_layout() {
+        let mut ms = MarkerSet::new();
+        let a = ms.add(1_000, [255, 0, 0]);
+        let b = ms.add(2_000, [0, 255, 0]);
+        ms.pair(a, b);
+        ms.add(3_000, [0, 0, 255]);
+
+        let reg = PlotRegistry::new();
+        let dock: egui_dock::DockState<PlotId> = egui_dock::DockState::new(vec![]);
+        let by_id: HashMap<ChannelId, ChannelInfo> = HashMap::new();
+        let snap = capture("markers", &reg, &dock, &by_id, &ms);
+        assert_eq!(snap.markers.len(), 3);
+        assert_eq!(snap.markers[0].chain, snap.markers[1].chain);
+        assert!(snap.markers[0].chain.is_some());
+        assert!(snap.markers[2].chain.is_none());
+
+        // JSON round-trip.
+        let json = serde_json::to_vec(&snap).unwrap();
+        let snap2: Layout = serde_json::from_slice(&json).unwrap();
+        assert_eq!(snap2.markers, snap.markers);
+
+        // Restore into a fresh set.
+        let mut ms2 = MarkerSet::new();
+        ms2.restore(
+            snap2
+                .markers
+                .iter()
+                .map(|m| (m.t_ns, m.label.clone(), m.color, m.chain)),
+        );
+        assert_eq!(ms2.markers.len(), 3);
+        assert_eq!(ms2.markers[0].chain, ms2.markers[1].chain);
+        assert!(ms2.markers[0].chain.is_some());
+        assert!(ms2.markers[2].chain.is_none());
+    }
+
+    #[test]
+    fn v3_layout_without_markers_loads_with_empty_markers() {
+        let v3 = serde_json::json!({
+            "version": 3,
+            "name": "old",
+            "dock": null,
+            "plots": []
+        });
+        let layout: Layout = serde_json::from_value(v3).unwrap();
+        assert_eq!(layout.version, 3);
+        assert!(layout.markers.is_empty());
     }
 }

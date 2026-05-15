@@ -359,7 +359,7 @@ fn render_scalar_section(
     let mut signals: Vec<SignalData> = Vec::with_capacity(panel.channels.len());
     let mut ymin = f64::INFINITY;
     let mut ymax = f64::NEG_INFINITY;
-    for ch in panel.channels.iter() {
+    for (i, ch) in panel.channels.iter().enumerate() {
         let bs = ctx.store.query_scalar(*ch, t0, t1, max_buckets);
         if bs.is_empty() {
             continue;
@@ -379,7 +379,7 @@ fn render_scalar_section(
         let path = ctx.by_id.get(ch).map(|c| c.path.clone()).unwrap_or_default();
         signals.push(SignalData {
             ch: *ch,
-            colour: palette_for_name(&path),
+            colour: palette(i),
             name: path,
             points: pts,
             style: panel.style_for(*ch),
@@ -772,7 +772,7 @@ fn render_state_lane(
     ctx: &mut PlotContext<'_>,
     pid: u64,
     ch: ChannelId,
-    lane_idx: usize,
+    _lane_idx: usize,
     (t0, t1): (u64, u64),
     height: f32,
     gutter: f32,
@@ -861,7 +861,7 @@ fn render_state_lane(
                 .cloned()
                 .unwrap_or_else(|| r.value.to_string());
             let fill = match mode {
-                StateLaneMode::Labels => state_colour(lane_idx, r.value),
+                StateLaneMode::Labels => state_colour(name_seed(&info.path), r.value),
                 StateLaneMode::Heatmap => {
                     let frac = if vmax > vmin {
                         (r.value - vmin) as f32 / (vmax - vmin) as f32
@@ -1560,18 +1560,25 @@ pub fn palette(i: usize) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-/// Pick a palette colour deterministically from a channel's leaf name
-/// (everything after the first `.`). Two channels with the same leaf
-/// — e.g. `motor_1.temperature` and `motor_2.temperature` — share a
-/// colour, making it easy to spot the same field across groups.
-pub fn palette_for_name(path: &str) -> Color32 {
+/// Stable FNV-1a hash of a channel's leaf name (everything after the
+/// first `.`). Used as a colour seed so the same channel name yields
+/// the same colour across plots / lane positions.
+pub fn name_seed(path: &str) -> usize {
     let leaf = strip_group_prefix(path);
     let mut h: u64 = 1469598103934665603; // FNV offset
     for b in leaf.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(1099511628211);
     }
-    palette((h as usize) % 10)
+    h as usize
+}
+
+/// Pick a palette colour deterministically from a channel's leaf name
+/// (everything after the first `.`). Two channels with the same leaf
+/// — e.g. `motor_1.temperature` and `motor_2.temperature` — share a
+/// colour, making it easy to spot the same field across groups.
+pub fn palette_for_name(path: &str) -> Color32 {
+    palette(name_seed(path) % 10)
 }
 
 pub fn state_colour(channel_idx: usize, value: u32) -> Color32 {

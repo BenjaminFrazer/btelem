@@ -837,6 +837,36 @@ impl MarkerSet {
         }
     }
 
+    /// Replace contents with `markers`. Used when loading a layout.
+    /// Reassigns IDs (so they stay unique within this set) but
+    /// preserves chain membership by remapping chain ids.
+    pub fn restore<I>(&mut self, markers: I)
+    where
+        I: IntoIterator<Item = (u64, String, [u8; 3], Option<u64>)>,
+    {
+        self.markers.clear();
+        self.selected = None;
+        self.next_id = 1;
+        self.next_chain = 1;
+        let mut chain_remap: std::collections::HashMap<u64, u64> =
+            std::collections::HashMap::new();
+        for (t_ns, label, color, chain) in markers {
+            let id = self.alloc_id();
+            let new_chain = chain.map(|c| {
+                *chain_remap
+                    .entry(c)
+                    .or_insert_with(|| self.alloc_chain())
+            });
+            self.markers.push(Marker {
+                id,
+                t_ns,
+                label,
+                color,
+                chain: new_chain,
+            });
+        }
+    }
+
     fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
