@@ -359,7 +359,7 @@ fn render_scalar_section(
     let mut signals: Vec<SignalData> = Vec::with_capacity(panel.channels.len());
     let mut ymin = f64::INFINITY;
     let mut ymax = f64::NEG_INFINITY;
-    for (idx, ch) in panel.channels.iter().enumerate() {
+    for ch in panel.channels.iter() {
         let bs = ctx.store.query_scalar(*ch, t0, t1, max_buckets);
         if bs.is_empty() {
             continue;
@@ -376,10 +376,11 @@ fn render_scalar_section(
             .iter()
             .map(|b| ((b.t as f64) / 1e9, b.min, b.max))
             .collect();
+        let path = ctx.by_id.get(ch).map(|c| c.path.clone()).unwrap_or_default();
         signals.push(SignalData {
             ch: *ch,
-            name: ctx.by_id.get(ch).map(|c| c.path.clone()).unwrap_or_default(),
-            colour: palette(idx),
+            colour: palette_for_name(&path),
+            name: path,
             points: pts,
             style: panel.style_for(*ch),
         });
@@ -1559,6 +1560,20 @@ pub fn palette(i: usize) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
+/// Pick a palette colour deterministically from a channel's leaf name
+/// (everything after the first `.`). Two channels with the same leaf
+/// — e.g. `motor_1.temperature` and `motor_2.temperature` — share a
+/// colour, making it easy to spot the same field across groups.
+pub fn palette_for_name(path: &str) -> Color32 {
+    let leaf = strip_group_prefix(path);
+    let mut h: u64 = 1469598103934665603; // FNV offset
+    for b in leaf.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    palette((h as usize) % 10)
+}
+
 pub fn state_colour(channel_idx: usize, value: u32) -> Color32 {
     let h = (channel_idx as u32)
         .wrapping_mul(2654435761)
@@ -1605,4 +1620,33 @@ fn heatmap_color(t: f32) -> Color32 {
 
 pub fn short_name(p: &str) -> &str {
     p.rsplit('.').next().unwrap_or(p)
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    #[test]
+    fn same_leaf_gets_same_colour_across_groups() {
+        // motor_1.temperature and motor_2.temperature share the leaf
+        // "temperature" so they must share a palette slot.
+        assert_eq!(
+            palette_for_name("motor_1.temperature"),
+            palette_for_name("motor_2.temperature"),
+        );
+        assert_eq!(
+            palette_for_name("a.x.y"),
+            palette_for_name("b.x.y"),
+        );
+    }
+
+    #[test]
+    fn different_leaves_likely_differ() {
+        // Not a strict guarantee (10-slot palette can collide) but the
+        // common case must differ.
+        assert_ne!(
+            palette_for_name("motor_1.temperature"),
+            palette_for_name("motor_1.current"),
+        );
+    }
 }
