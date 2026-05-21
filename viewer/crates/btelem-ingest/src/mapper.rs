@@ -118,8 +118,8 @@ impl ChannelMap {
                         }
                         for (bit, ch) in bits {
                             let mask = ((1u64 << bit.width) - 1) << bit.start;
-                            let v = ((raw & mask) >> bit.start) as u32;
-                            store.push_state(*ch, t, v);
+                            let v = ((raw & mask) >> bit.start) as f64;
+                            store.push_scalar(*ch, t, v);
                         }
                     }
                 }
@@ -253,10 +253,7 @@ fn build_field(
                 .bits
                 .iter()
                 .map(|b| {
-                    let labels: Vec<String> =
-                        (0u32..(1u32 << b.width)).map(|v| v.to_string()).collect();
-                    let labels_ref: Vec<&str> = labels.iter().map(String::as_str).collect();
-                    let ch = store.add_state(path(&format!(".{}", b.name)), &labels_ref);
+                    let ch = store.add_scalar_int(path(&format!(".{}", b.name)));
                     (b.clone(), ch)
                 })
                 .collect();
@@ -350,6 +347,13 @@ mod tests {
         let info = chans.iter().find(|c| c.id == word).unwrap();
         assert!(info.integer_storage);
         assert!(matches!(info.kind, ChannelKind::Scalar));
+
+        // Per-bit channels are scalar integers (rendered as Stairs, not Named state).
+        for &bit in &[bit_a, bit_b] {
+            let bi = chans.iter().find(|c| c.id == bit).unwrap();
+            assert!(bi.integer_storage);
+            assert!(matches!(bi.kind, ChannelKind::Scalar));
+        }
 
         let bits = store.bits_for_word(word).expect("mapping registered");
         assert_eq!(bits, vec![bit_a, bit_b]);

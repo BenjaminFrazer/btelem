@@ -1719,8 +1719,8 @@ mod logic_drop_tests {
     fn dropping_word_on_logic_analyser_expands_into_per_bit_lanes() {
         let store = MockStore::new();
         let word = store.add_scalar_int("flags.f");
-        let bit_a = store.add_state("flags.f.a", &["0", "1"]);
-        let bit_b = store.add_state("flags.f.b", &["0", "1", "2", "3"]);
+        let bit_a = store.add_scalar_int("flags.f.a");
+        let bit_b = store.add_scalar_int("flags.f.b");
         store.register_word_bits(word, vec![bit_a, bit_b]);
         let by_id = by_id_map(&store);
 
@@ -1751,7 +1751,7 @@ mod logic_drop_tests {
         // Mixed dragging: bit child only — no decomposition.
         let store = MockStore::new();
         let word = store.add_scalar_int("flags.f");
-        let bit_a = store.add_state("flags.f.a", &["0", "1"]);
+        let bit_a = store.add_scalar_int("flags.f.a");
         store.register_word_bits(word, vec![bit_a]);
         let by_id = by_id_map(&store);
 
@@ -1768,7 +1768,7 @@ mod logic_drop_tests {
         // takes the word as-is and does not see the bits mapping at all.
         let store = MockStore::new();
         let word = store.add_scalar_int("flags.f");
-        let bit_a = store.add_state("flags.f.a", &["0", "1"]);
+        let bit_a = store.add_scalar_int("flags.f.a");
         store.register_word_bits(word, vec![bit_a]);
         let by_id = by_id_map(&store);
 
