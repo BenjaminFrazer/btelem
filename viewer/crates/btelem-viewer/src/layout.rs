@@ -122,13 +122,26 @@ fn lane_mode_numeric_default() -> LaneMode {
 /// Outcome of applying a layout to a live `Store`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ApplyReport {
-    /// Number of channel paths that were referenced in the layout but
-    /// not present in the live store. The corresponding plots are still
+    /// Channel paths referenced by the layout but not found in the live
+    /// store (or found with an incompatible kind). Deduplicated;
+    /// insertion order is preserved. The corresponding plots are still
     /// created — just with those channels omitted.
-    pub missing_channels: usize,
+    pub missing_paths: Vec<String>,
     /// Plots that ended up empty (e.g. XY plot whose x or y is missing).
     /// These are dropped from the rebuilt registry.
     pub dropped_plots: usize,
+}
+
+impl ApplyReport {
+    pub fn missing_count(&self) -> usize {
+        self.missing_paths.len()
+    }
+
+    fn add_missing(&mut self, path: &str) {
+        if !self.missing_paths.iter().any(|p| p == path) {
+            self.missing_paths.push(path.to_string());
+        }
+    }
 }
 
 /// Slugify a display name into a filename-safe form. Lowercases ASCII,
@@ -394,10 +407,10 @@ pub fn apply(
                         if matches!(info.kind, ChannelKind::Scalar) {
                             sp.add(info);
                         } else {
-                            report.missing_channels += 1;
+                            report.add_missing(path);
                         }
                     } else {
-                        report.missing_channels += 1;
+                        report.add_missing(path);
                     }
                 }
                 for (path, style) in styles {
@@ -420,10 +433,10 @@ pub fn apply(
                                 chart.add(info);
                                 had_any = true;
                             } else {
-                                report.missing_channels += 1;
+                                report.add_missing(path);
                             }
                         } else {
-                            report.missing_channels += 1;
+                            report.add_missing(path);
                         }
                     }
                     if had_any {
@@ -444,10 +457,10 @@ pub fn apply(
                         if matches!(info.kind, ChannelKind::Scalar) {
                             p.add(info);
                         } else {
-                            report.missing_channels += 1;
+                            report.add_missing(path);
                         }
                     } else {
-                        report.missing_channels += 1;
+                        report.add_missing(path);
                     }
                 }
                 for (path, style) in styles {
@@ -467,10 +480,10 @@ pub fn apply(
                         if matches!(info.kind, ChannelKind::State { .. }) {
                             p.add(info); // default mode for State == LaneMode::Named
                         } else {
-                            report.missing_channels += 1;
+                            report.add_missing(path);
                         }
                     } else {
-                        report.missing_channels += 1;
+                        report.add_missing(path);
                     }
                 }
                 let id = registry.insert(PlotKind::LogicAnalyser(p));
@@ -505,10 +518,10 @@ pub fn apply(
                                 };
                             }
                         } else if !acceptable {
-                            report.missing_channels += 1;
+                            report.add_missing(&ls.ch_path);
                         }
                     } else {
-                        report.missing_channels += 1;
+                        report.add_missing(&ls.ch_path);
                     }
                 }
                 let id = registry.insert(PlotKind::LogicAnalyser(p));
@@ -537,10 +550,10 @@ pub fn apply(
                     }
                     _ => {
                         if xi.is_none() {
-                            report.missing_channels += 1;
+                            report.add_missing(x);
                         }
                         if yi.is_none() {
-                            report.missing_channels += 1;
+                            report.add_missing(y);
                         }
                         report.dropped_plots += 1;
                         new_ids.push(None);
@@ -771,7 +784,7 @@ mod tests {
         };
         let (reg, _dock, report) = apply(&snap, &chs);
         // accel.z (scalar missing) + nope.state + missing.y
-        assert_eq!(report.missing_channels, 3);
+        assert_eq!(report.missing_count(), 3);
         assert_eq!(report.dropped_plots, 1); // the xy
         // Scalar + LogicAnalyser kept (empty LogicAnalyser kept — dropping
         // empty ones isn't part of this code path today).
@@ -814,7 +827,7 @@ mod tests {
             ch_state(2, "fsm.mode"),
         ];
         let (reg, _dock, report) = apply(&layout, &chs);
-        assert_eq!(report.missing_channels, 0);
+        assert_eq!(report.missing_count(), 0);
         assert_eq!(report.dropped_plots, 0);
 
         let mut got_scalar = false;
@@ -931,7 +944,7 @@ mod tests {
 
         let chs = vec![ch_scalar_int(0, "flags"), ch_state(1, "fsm.mode")];
         let (reg, _dock, report) = apply(&layout, &chs);
-        assert_eq!(report.missing_channels, 0);
+        assert_eq!(report.missing_count(), 0);
         assert_eq!(report.dropped_plots, 0);
 
         let mut got_stairs = false;

@@ -354,19 +354,7 @@ impl ViewerApp {
                 .iter()
                 .map(|m| (m.t_ns, m.label.clone(), m.color, m.chain)),
         );
-        let suffix = if report.missing_channels > 0 || report.dropped_plots > 0 {
-            format!(
-                " ({} unknown channel(s){})",
-                report.missing_channels,
-                if report.dropped_plots > 0 {
-                    format!(", {} plot(s) dropped", report.dropped_plots)
-                } else {
-                    String::new()
-                }
-            )
-        } else {
-            String::new()
-        };
+        let suffix = format_apply_suffix(&report, " (", ")");
         Some(format!("layout '{}' applied{suffix}", layout.name))
     }
 
@@ -835,19 +823,7 @@ impl ViewerApp {
                 .iter()
                 .map(|m| (m.t_ns, m.label.clone(), m.color, m.chain)),
         );
-        let suffix = if report.missing_channels > 0 || report.dropped_plots > 0 {
-            format!(
-                " — {} unknown channel(s){}",
-                report.missing_channels,
-                if report.dropped_plots > 0 {
-                    format!(", {} plot(s) dropped", report.dropped_plots)
-                } else {
-                    String::new()
-                }
-            )
-        } else {
-            String::new()
-        };
+        let suffix = format_apply_suffix(&report, " — ", "");
         self.flash(format!("loaded '{}'{}", layout.name, suffix));
     }
 
@@ -1599,6 +1575,46 @@ fn layout_sidecar_path(btlm_path: &Path) -> PathBuf {
     let mut p = btlm_path.to_path_buf();
     p.set_extension("layout.json");
     p
+}
+
+/// Render an `ApplyReport` into a human-readable suffix like
+/// ` — 3 unknown channel(s): imu.gyro.x, imu.gyro.y, +1 more`. Returns
+/// the empty string when nothing was missing/dropped. `open`/`close`
+/// wrap the suffix (e.g. `" ("`/`")"` vs `" — "`/`""`).
+fn format_apply_suffix(report: &crate::layout::ApplyReport, open: &str, close: &str) -> String {
+    let missing = report.missing_count();
+    if missing == 0 && report.dropped_plots == 0 {
+        return String::new();
+    }
+    let mut body = String::new();
+    if missing > 0 {
+        const PREVIEW: usize = 3;
+        let names: Vec<&str> = report
+            .missing_paths
+            .iter()
+            .take(PREVIEW)
+            .map(|s| s.as_str())
+            .collect();
+        let extra = missing.saturating_sub(PREVIEW);
+        let tail = if extra > 0 {
+            format!(", +{extra} more")
+        } else {
+            String::new()
+        };
+        body.push_str(&format!(
+            "{} unknown channel(s): {}{}",
+            missing,
+            names.join(", "),
+            tail,
+        ));
+    }
+    if report.dropped_plots > 0 {
+        if !body.is_empty() {
+            body.push_str("; ");
+        }
+        body.push_str(&format!("{} plot(s) dropped", report.dropped_plots));
+    }
+    format!("{open}{body}{close}")
 }
 
 fn fmt_capture_stats(s: &CaptureStats) -> String {

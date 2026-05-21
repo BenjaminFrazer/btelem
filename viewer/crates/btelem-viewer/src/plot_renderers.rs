@@ -939,6 +939,17 @@ fn render_state_lane(
                 .anchor(egui::Align2::RIGHT_TOP),
             );
         }
+        if runs.is_empty() {
+            pui.text(
+                Text::new(
+                    PlotPoint::new((xmin + xmax) * 0.5, 0.5),
+                    egui::RichText::new("(no samples)")
+                        .italics()
+                        .color(Color32::from_rgba_unmultiplied(220, 220, 220, 180)),
+                )
+                .anchor(egui::Align2::CENTER_CENTER),
+            );
+        }
         render_markers(pui, ctx.markers);
     });
 
@@ -1223,6 +1234,21 @@ fn render_logic_lane(
             )
             .anchor(egui::Align2::LEFT_CENTER),
         );
+        if runs.is_empty() {
+            // Lane resolved from the layout but the store has no
+            // samples for it (yet). Distinguishes "no data" from
+            // "blank because the channel is gone after a schema
+            // change". Centred so it's visible regardless of zoom.
+            pui.text(
+                Text::new(
+                    PlotPoint::new((xmin + xmax) * 0.5, 0.5),
+                    egui::RichText::new("(no samples)")
+                        .italics()
+                        .color(Color32::from_rgba_unmultiplied(220, 220, 220, 180)),
+                )
+                .anchor(egui::Align2::CENTER_CENTER),
+            );
+        }
         render_markers(pui, ctx.markers);
     });
 
