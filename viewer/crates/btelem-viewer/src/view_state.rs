@@ -113,8 +113,7 @@ pub enum LineWidth {
     Thick,
 }
 
-/// Per-signal render style. `envelope` defaults to true to preserve the
-/// dashed min/max band that scalar plots have always drawn.
+/// Per-signal render style. Defaults to Step without envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignalStyle {
     pub line: LineStyle,
@@ -125,9 +124,9 @@ pub struct SignalStyle {
 impl Default for SignalStyle {
     fn default() -> Self {
         Self {
-            line: LineStyle::Line,
+            line: LineStyle::Step,
             width: LineWidth::Medium,
-            envelope: true,
+            envelope: false,
         }
     }
 }
@@ -152,13 +151,20 @@ impl ScalarPanel {
     }
 
     /// Add a scalar channel if not already present. Returns true if added.
-    /// Non-scalar channels are silently rejected.
+    /// Non-scalar channels are silently rejected. New channels inherit the
+    /// style of the first existing signal so all traces in a panel match.
     pub fn add(&mut self, ch: &ChannelInfo) -> bool {
         if !matches!(ch.kind, ChannelKind::Scalar) {
             return false;
         }
         if self.channels.contains(&ch.id) {
             return false;
+        }
+        // Inherit style from first channel (if any and if it has an override).
+        if let Some(&first) = self.channels.first() {
+            if let Some(&style) = self.styles.get(&first) {
+                self.styles.insert(ch.id, style);
+            }
         }
         self.channels.push(ch.id);
         true
@@ -1322,11 +1328,11 @@ mod tests {
     // ---- SignalStyle / ScalarPanel.styles ----
 
     #[test]
-    fn signal_style_default_matches_legacy_render() {
+    fn signal_style_default_is_step_no_envelope() {
         let d = SignalStyle::default();
-        assert_eq!(d.line, LineStyle::Line);
+        assert_eq!(d.line, LineStyle::Step);
         assert_eq!(d.width, LineWidth::Medium);
-        assert!(d.envelope, "envelope on by default = today's look");
+        assert!(!d.envelope, "envelope off by default");
     }
 
     #[test]
@@ -1340,12 +1346,12 @@ mod tests {
         let mut p = ScalarPanel::new("p");
         {
             let s = p.style_for_mut(7);
-            s.line = LineStyle::Step;
-            s.envelope = false;
+            s.line = LineStyle::Line;
+            s.envelope = true;
         }
         let stored = p.style_for(7);
-        assert_eq!(stored.line, LineStyle::Step);
-        assert!(!stored.envelope);
+        assert_eq!(stored.line, LineStyle::Line);
+        assert!(stored.envelope);
         // Width left at default.
         assert_eq!(stored.width, LineWidth::Medium);
     }
@@ -1360,6 +1366,36 @@ mod tests {
         p.remove(99);
         assert!(!p.styles.contains_key(&99));
         assert_eq!(p.style_for(99), SignalStyle::default());
+    }
+
+    #[test]
+    fn new_trace_inherits_first_channel_style() {
+        let mut p = ScalarPanel::new("p");
+        let a = scalar(1, "a");
+        let b = scalar(2, "b");
+        p.add(&a);
+        // Override first channel's style.
+        *p.style_for_mut(1) = SignalStyle {
+            line: LineStyle::Line,
+            width: LineWidth::Thick,
+            envelope: true,
+        };
+        // Second channel inherits first's style.
+        p.add(&b);
+        let inherited = p.style_for(2);
+        assert_eq!(inherited.line, LineStyle::Line);
+        assert_eq!(inherited.width, LineWidth::Thick);
+        assert!(inherited.envelope);
+    }
+
+    #[test]
+    fn first_trace_gets_default_style_no_inherit() {
+        let mut p = ScalarPanel::new("p");
+        let a = scalar(1, "a");
+        p.add(&a);
+        // No explicit style on first channel → no override stored.
+        assert!(!p.styles.contains_key(&1));
+        assert_eq!(p.style_for(1), SignalStyle::default());
     }
 
     // ---- PlotKind / accepts ----
