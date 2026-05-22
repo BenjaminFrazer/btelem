@@ -401,8 +401,12 @@ fn render_scalar_section(
 
     let xmin = (t0 as f64) / 1e9;
     let xmax = (t1 as f64) / 1e9;
-    let (ylo, yhi) = if ymin.is_finite() && ymax.is_finite() && ymax > ymin {
-        let pad = (ymax - ymin) * 0.05;
+    let (ylo, yhi) = if ymin.is_finite() && ymax.is_finite() && ymax >= ymin {
+        let pad = if ymax > ymin {
+            (ymax - ymin) * 0.05
+        } else {
+            ymin.abs().max(1.0) * 0.05
+        };
         (ymin - pad, ymax + pad)
     } else {
         (-1.0, 1.0)
