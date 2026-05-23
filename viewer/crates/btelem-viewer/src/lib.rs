@@ -19,4 +19,8 @@ pub struct Args {
     /// Seconds to retry the initial connection. 0 = single attempt.
     #[arg(long, default_value_t = 5.0)]
     pub connect_timeout: f64,
+
+    /// Open a .btlm capture file on startup instead of connecting.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<std::path::PathBuf>,
 }

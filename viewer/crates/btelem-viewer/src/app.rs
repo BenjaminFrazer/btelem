@@ -121,6 +121,9 @@ pub struct ViewerApp {
 
     /// True while the "Discard accrued data?" confirmation popup is open.
     confirm_clear_open: bool,
+
+    /// File to open on the first update tick (set via `--file`).
+    pending_file: Option<std::path::PathBuf>,
 }
 
 /// Build a fresh dock with one Scalar plot and one Logic Analyser plot
@@ -140,19 +143,27 @@ impl ViewerApp {
         let store = MockStore::new();
         let capture = Capture::default();
         let connection = Connection::parse(&args.addr).unwrap_or_default();
-        let deadline = Instant::now() + Duration::from_secs_f64(args.connect_timeout.max(0.0));
-        let (handle, status) = loop {
-            match TcpSource::connect(
-                connection.socket_addr(),
-                store.clone(),
-                Some(capture.clone()),
-            ) {
-                Ok(h) => break (Some(h), format!("connected to {}", connection.pretty())),
-                Err(e) if Instant::now() >= deadline => {
-                    break (None, format!("connection failed: {e}"));
+
+        let (handle, status, pending_file) = if let Some(ref path) = args.file {
+            // Skip TCP connection when opening a file.
+            (None, String::new(), Some(path.clone()))
+        } else {
+            let deadline =
+                Instant::now() + Duration::from_secs_f64(args.connect_timeout.max(0.0));
+            let (h, s) = loop {
+                match TcpSource::connect(
+                    connection.socket_addr(),
+                    store.clone(),
+                    Some(capture.clone()),
+                ) {
+                    Ok(h) => break (Some(h), format!("connected to {}", connection.pretty())),
+                    Err(e) if Instant::now() >= deadline => {
+                        break (None, format!("connection failed: {e}"));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(100)),
                 }
-                Err(_) => std::thread::sleep(Duration::from_millis(100)),
-            }
+            };
+            (h, s, None)
         };
 
         let mut plots = PlotRegistry::new();
@@ -191,6 +202,7 @@ impl ViewerApp {
             connection,
             connection_dialog_open: false,
             confirm_clear_open: false,
+            pending_file,
         }
     }
 
@@ -250,10 +262,15 @@ impl ViewerApp {
         let pick = rfd::FileDialog::new()
             .add_filter("btelem capture", &["btlm"])
             .pick_file();
-        let Some(path) = pick else {
-            return;
-        };
-        let loaded = match read_btlm(&path) {
+        if let Some(path) = pick {
+            self.load_capture_file(&path);
+        }
+    }
+
+    /// Load a `.btlm` capture from `path`. Shared between the file
+    /// dialog (`do_open_capture`) and the `--file` CLI flag.
+    fn load_capture_file(&mut self, path: &Path) {
+        let loaded = match read_btlm(path) {
             Ok(l) => l,
             Err(e) => {
                 self.flash(format!("open failed: {e}"));
@@ -306,7 +323,7 @@ impl ViewerApp {
         // Auto-apply a sidecar layout, if one exists next to the .btlm.
         // Failures are non-fatal: the user still gets the data even if
         // the layout is missing / unreadable / version-incompatible.
-        let layout_note = self.try_apply_sidecar_layout(&path);
+        let layout_note = self.try_apply_sidecar_layout(path);
 
         let mut bits: Vec<String> = Vec::new();
         bits.push(format!(
@@ -1281,6 +1298,11 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process --file on the first frame.
+        if let Some(path) = self.pending_file.take() {
+            self.load_capture_file(&path);
+        }
+
         let _ = DragAndDrop::payload::<DragPayload>(ctx);
 
         self.poll_redraw(ctx);
