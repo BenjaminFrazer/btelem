@@ -349,6 +349,7 @@ pub struct PlotContext<'a> {
     pub cam: &'a mut Camera,
     pub markers: &'a mut MarkerSet,
     pub dragging_marker: &'a mut Option<u64>,
+    pub dragging_link: &'a mut Option<u64>,
     pub marker_mode: bool,
     pub cursor_t: &'a mut Option<u64>,
     pub cursor_last_set: &'a mut Option<std::time::Instant>,
@@ -396,6 +397,7 @@ fn render_scalar_section(
             name: path,
             points: pts,
             style: panel.style_for(*ch),
+            selected: panel.selected_signals.contains(ch),
         });
     }
 
@@ -430,25 +432,59 @@ fn render_scalar_section(
         for sig in &signals {
             draw_signal(pui, sig);
         }
-        render_pair_overlays(pui, ctx.markers, ctx.store, &signals);
-        if signals.is_empty() {
-            // No traces — show Δt between paired markers near the
-            // top of the visible y range so it doesn't get clipped.
-            let y = ylo + (yhi - ylo) * 0.92;
-            render_pair_dt_only(pui, ctx.markers, y);
-        }
+        render_link_deltas(pui, ctx.markers, ctx.store, &signals, ylo, yhi);
         render_markers(pui, ctx.markers);
         if let Some(p) = pui.pointer_coordinate() {
             hover_t = Some(p.x);
         }
     });
 
+    // Collect selected signals for marker interaction
+    let selected_sigs: Vec<ChannelId> = panel.selected_signals.iter().copied().collect();
+
     let drag = ui.interact(
         inner.response.rect,
         egui::Id::new(("scalar_marker_overlay", pid)),
         egui::Sense::click_and_drag(),
     );
-    handle_marker_interaction(ui, ctx, &drag, &inner.transform);
+    handle_marker_interaction(ui, ctx, &drag, &inner.transform, &selected_sigs, ylo, yhi);
+
+    // Handle Ctrl/Shift-click on signal traces for signal selection.
+    if drag.clicked_by(egui::PointerButton::Primary) {
+        let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let shift = ui.input(|i| i.modifiers.shift);
+        if (ctrl || shift) && !ctx.marker_mode {
+            if let Some(p) = drag.interact_pointer_pos().or_else(|| drag.hover_pos()) {
+                // Hit-test: find the signal trace closest to the cursor
+                let plot_pos = inner.transform.value_from_position(p);
+                if let Some(closest_ch) = nearest_signal(&signals, plot_pos.x, plot_pos.y) {
+                    if let Some(PlotKind::Scalar(panel)) =
+                        ctx.plots.get_mut(crate::view_state::PlotId(pid))
+                    {
+                        if ctrl && panel.selected_signals.contains(&closest_ch) {
+                            panel.selected_signals.remove(&closest_ch);
+                        } else {
+                            panel.selected_signals.insert(closest_ch);
+                        }
+                    }
+                }
+            }
+        } else if !ctx.marker_mode {
+            // Plain click clears signal selection
+            let hit = drag
+                .interact_pointer_pos()
+                .or_else(|| drag.hover_pos())
+                .and_then(|p| hit_marker(ctx.markers, &inner.transform, p.x));
+            if hit.is_none() {
+                if let Some(PlotKind::Scalar(panel)) =
+                    ctx.plots.get_mut(crate::view_state::PlotId(pid))
+                {
+                    panel.selected_signals.clear();
+                }
+            }
+        }
+    }
+
     // Primary-button drag for camera pan is only available when the marker
     // system isn't holding it (no marker is being dragged, no marker hit
     // under cursor on press, and we're not in marker-mode placement).
@@ -558,6 +594,7 @@ struct SignalData {
     colour: Color32,
     points: Vec<(f64, f64, f64)>, // (t_s, min, max)
     style: SignalStyle,
+    selected: bool,
 }
 
 /// Coarse width preset → pixel width.
@@ -590,7 +627,9 @@ fn step_polyline(points: &[(f64, f64, f64)]) -> Vec<[f64; 2]> {
 
 fn draw_signal(pui: &mut PlotUi, sig: &SignalData) {
     let style = sig.style;
-    let main_w = width_px(style.width);
+    let base_w = width_px(style.width);
+    // Selected signals render bolder
+    let main_w = if sig.selected { base_w + 1.5 } else { base_w };
 
     if style.envelope {
         let mins: PlotPoints = sig.points.iter().map(|(t, lo, _)| [*t, *lo]).collect();
@@ -654,8 +693,31 @@ fn draw_signal(pui: &mut PlotUi, sig: &SignalData) {
     }
 }
 
+/// Find the signal whose midpoint value is closest to the given (t, y)
+/// in plot coordinates. Returns the channel id, or `None` if no signals.
+fn nearest_signal(signals: &[SignalData], t: f64, y: f64) -> Option<ChannelId> {
+    let mut best: Option<(ChannelId, f64)> = None;
+    for sig in signals {
+        // Find the point closest in time, then check y distance
+        if sig.points.is_empty() {
+            continue;
+        }
+        let idx = sig
+            .points
+            .partition_point(|(pt, _, _)| *pt < t)
+            .min(sig.points.len() - 1);
+        let (_, lo, hi) = sig.points[idx];
+        let mid = (lo + hi) * 0.5;
+        let dy = (mid - y).abs();
+        if best.is_none_or(|(_, d)| dy < d) {
+            best = Some((sig.ch, dy));
+        }
+    }
+    best.map(|(ch, _)| ch)
+}
+
 // ============================================================================
-//  Markers + pair overlays
+//  Markers + link overlays
 // ============================================================================
 
 /// Render every marker as a dashed VLine. Selected one drawn thicker.
@@ -674,25 +736,32 @@ pub fn render_markers(pui: &mut PlotUi, markers: &MarkerSet) {
     }
 }
 
-const PAIR_POS: Color32 = Color32::from_rgb(120, 180, 255); // light blue
-const PAIR_NEG: Color32 = Color32::from_rgb(255, 130, 130); // light red
-
-/// Draw a Δt label between each paired marker pair, with a thin
-/// horizontal tie-line at the given y in plot-coordinate space. Used
-/// on plots that lack signal-aware overlays (logic/state lanes, or
-/// scalar plots with no traces). `y` should be inside the current
-/// plot bounds; the label is anchored centred-bottom on the line.
-fn render_pair_dt_only(pui: &mut PlotUi, markers: &MarkerSet, y: f64) {
+/// Draw link delta lines: a dashed horizontal Δt line at each link's
+/// y_frac position, coloured with the source marker's colour. If the
+/// link has captured signals, draw intercept markers and Δy labels for
+/// those signals.
+fn render_link_deltas(
+    pui: &mut PlotUi,
+    markers: &MarkerSet,
+    store: &MockStore,
+    signals: &[SignalData],
+    ylo: f64,
+    yhi: f64,
+) {
     let label_bg = Color32::from_rgba_unmultiplied(0, 0, 0, 180);
-    for (a, b) in markers.placement_pairs() {
+    for (a, b, link) in markers.link_pairs() {
         let xa = (a.t_ns as f64) / 1e9;
         let xb = (b.t_ns as f64) / 1e9;
         let dt = xb - xa;
-        let col = if dt >= 0.0 { PAIR_POS } else { PAIR_NEG };
+        let col = Color32::from_rgb(a.color[0], a.color[1], a.color[2]);
+        let y = ylo + link.y_frac as f64 * (yhi - ylo);
+
+        // Dashed horizontal Δt line
         pui.line(
             Line::new(PlotPoints::from(vec![[xa, y], [xb, y]]))
                 .color(col)
-                .width(1.5),
+                .width(1.5)
+                .style(LineStyle::dashed_loose()),
         );
         let mid = (xa + xb) * 0.5;
         pui.text(
@@ -705,73 +774,48 @@ fn render_pair_dt_only(pui: &mut PlotUi, markers: &MarkerSet, y: f64) {
             )
             .anchor(egui::Align2::CENTER_BOTTOM),
         );
-    }
-}
 
-/// For each pair, draw an L-shape (horizontal Δt + vertical Δy) per signal
-/// connecting the (t, value) intersection points, with dx/dy labels. Lines
-/// are solid; light blue when (second − first) is positive, light red when
-/// negative — for both legs independently.
-fn render_pair_overlays(
-    pui: &mut PlotUi,
-    markers: &MarkerSet,
-    store: &MockStore,
-    signals: &[SignalData],
-) {
-    for (a, b) in markers.placement_pairs() {
-        // a = first placed, b = second placed.
-        let xa = (a.t_ns as f64) / 1e9;
-        let xb = (b.t_ns as f64) / 1e9;
-        let dt = xb - xa;
-        let dt_col = if dt >= 0.0 { PAIR_POS } else { PAIR_NEG };
-        let label_bg = Color32::from_rgba_unmultiplied(0, 0, 0, 180);
-
-        for sig in signals {
-            let Some(va) = store.sample_at(sig.ch, a.t_ns) else {
+        // Intercept lines for captured signals
+        for ch in &link.signals {
+            let Some(va) = store.sample_at(*ch, a.t_ns) else {
                 continue;
             };
-            let Some(vb) = store.sample_at(sig.ch, b.t_ns) else {
+            let Some(vb) = store.sample_at(*ch, b.t_ns) else {
                 continue;
             };
             let dy = vb - va;
-            let dy_col = if dy >= 0.0 { PAIR_POS } else { PAIR_NEG };
+            let sig_col = signals
+                .iter()
+                .find(|s| s.ch == *ch)
+                .map(|s| s.colour)
+                .unwrap_or(col);
 
-            // Horizontal leg at va, vertical leg at xb. Solid lines.
-            pui.line(
-                Line::new(PlotPoints::from(vec![[xa, va], [xb, va]]))
-                    .color(dt_col)
-                    .width(1.5),
-            );
+            // Vertical leg at xb from va to vb
             pui.line(
                 Line::new(PlotPoints::from(vec![[xb, va], [xb, vb]]))
-                    .color(dy_col)
+                    .color(sig_col)
                     .width(1.5),
             );
+            // Intercept points
             pui.points(
                 Points::new(PlotPoints::from(vec![[xa, va], [xb, vb]]))
-                    .color(Color32::from_rgb(255, 64, 64))
+                    .color(sig_col)
                     .shape(MarkerShape::Cross)
                     .radius(6.0),
             );
-            let dx_mid = (xa + xb) * 0.5;
-            pui.text(
-                Text::new(
-                    PlotPoint::new(dx_mid, va),
-                    egui::RichText::new(format!("Δt={dt:+.4}s"))
-                        .monospace()
-                        .background_color(label_bg)
-                        .color(dt_col),
-                )
-                .anchor(egui::Align2::CENTER_BOTTOM),
-            );
             let dy_mid = (va + vb) * 0.5;
+            let sig_name = signals
+                .iter()
+                .find(|s| s.ch == *ch)
+                .map(|s| short_name(&s.name))
+                .unwrap_or("?");
             pui.text(
                 Text::new(
                     PlotPoint::new(xb, dy_mid),
-                    egui::RichText::new(format!(" Δ{}={:+.4}", short_name(&sig.name), dy))
+                    egui::RichText::new(format!(" Δ{sig_name}={dy:+.4}"))
                         .monospace()
                         .background_color(label_bg)
-                        .color(dy_col),
+                        .color(sig_col),
                 )
                 .anchor(egui::Align2::LEFT_CENTER),
             );
@@ -1012,7 +1056,7 @@ fn render_state_lane(
             ui.close_menu();
         }
     });
-    handle_marker_interaction(ui, ctx, &drag, &inner.transform);
+    handle_marker_interaction(ui, ctx, &drag, &inner.transform, &[], 0.0, 1.0);
     let data_span_ns = ctx
         .store
         .time_bounds()
@@ -1340,7 +1384,7 @@ fn render_logic_lane(
             }
         });
     });
-    handle_marker_interaction(ui, ctx, &drag, &inner.transform);
+    handle_marker_interaction(ui, ctx, &drag, &inner.transform, &[], 0.0, 1.0);
     let data_span_ns = ctx
         .store
         .time_bounds()
@@ -1527,6 +1571,9 @@ fn handle_marker_interaction(
     ctx: &mut PlotContext<'_>,
     response: &egui::Response,
     transform: &egui_plot::PlotTransform,
+    selected_signals: &[ChannelId],
+    ylo: f64,
+    yhi: f64,
 ) {
     let primary_down = ui.input(|i| i.pointer.primary_down());
     let shift = ui.input(|i| i.modifiers.shift);
@@ -1535,6 +1582,8 @@ fn handle_marker_interaction(
         if let Some(p) = response.hover_pos() {
             if let Some(id) = hit_marker(ctx.markers, transform, p.x) {
                 *ctx.dragging_marker = Some(id);
+            } else if let Some(lid) = hit_delta_line(ctx.markers, transform, p, ylo, yhi) {
+                *ctx.dragging_link = Some(lid);
             }
         }
     }
@@ -1551,8 +1600,25 @@ fn handle_marker_interaction(
         }
     }
 
+    if let Some(lid) = *ctx.dragging_link {
+        if let Some(p) = response
+            .hover_pos()
+            .or_else(|| response.interact_pointer_pos())
+        {
+            let y = transform.value_from_position(p).y;
+            let span = yhi - ylo;
+            if span.abs() > 1e-12 {
+                let frac = ((y - ylo) / span).clamp(0.0, 1.0) as f32;
+                if let Some(link) = ctx.markers.get_link_mut(lid) {
+                    link.y_frac = frac;
+                }
+            }
+        }
+    }
+
     if !primary_down {
         *ctx.dragging_marker = None;
+        *ctx.dragging_link = None;
     }
 
     if response.clicked_by(egui::PointerButton::Primary) {
@@ -1562,9 +1628,9 @@ fn handle_marker_interaction(
         let hit = pos.and_then(|p| hit_marker(ctx.markers, transform, p.x));
 
         // In marker mode, plain click on empty space *places* a free
-        // marker; shift+click places one paired with the most recently
-        // selected (or the last placed if nothing is selected). Hits on
-        // existing markers fall through to the normal select / pair logic.
+        // marker; shift+click places one linked to the most recently
+        // selected (or the last placed if nothing is selected), capturing
+        // the currently selected signals for intercept display.
         if ctx.marker_mode && hit.is_none() {
             if let Some(p) = pos {
                 let t_s = transform.value_from_position(p).x.max(0.0);
@@ -1574,14 +1640,14 @@ fn handle_marker_interaction(
                     crate::view_state::MARKER_PALETTE[n % crate::view_state::MARKER_PALETTE.len()];
                 if shift {
                     let anchor = ctx.markers.selected.or_else(|| {
-                        ctx.markers
-                            .markers
-                            .iter()
-                            .rfind(|m| m.chain.is_none())
-                            .map(|m| m.id)
+                        ctx.markers.markers.last().map(|m| m.id)
                     });
                     let new_id = anchor
-                        .and_then(|a| ctx.markers.add_paired_with(a, t_ns, colour))
+                        .and_then(|a| {
+                            ctx.markers
+                                .add_linked_to(a, t_ns, colour, selected_signals.to_vec())
+                                .map(|(mid, _)| mid)
+                        })
                         .unwrap_or_else(|| ctx.markers.add(t_ns, colour));
                     ctx.markers.select(Some(new_id));
                 } else {
@@ -1593,21 +1659,22 @@ fn handle_marker_interaction(
         }
 
         match (shift, ctx.markers.selected, hit, pos) {
-            // Shift+click on empty + selection → spawn paired marker.
+            // Shift+click on empty + selection → spawn linked marker.
             (true, Some(sel), None, Some(p)) => {
                 let t_s = transform.value_from_position(p).x.max(0.0);
                 let t_ns = (t_s * 1e9) as u64;
                 let n = ctx.markers.len();
-                let _ = ctx.markers.add_paired_with(
-                    sel,
-                    t_ns,
-                    crate::view_state::MARKER_PALETTE
-                        [n % crate::view_state::MARKER_PALETTE.len()],
-                );
+                let colour = crate::view_state::MARKER_PALETTE
+                    [n % crate::view_state::MARKER_PALETTE.len()];
+                if let Some((new_id, _)) =
+                    ctx.markers.add_linked_to(sel, t_ns, colour, selected_signals.to_vec())
+                {
+                    ctx.markers.select(Some(new_id));
+                }
             }
-            // Shift+click on a different existing marker → pair them.
+            // Shift+click on a different existing marker → link them.
             (true, Some(sel), Some(id), _) if id != sel => {
-                ctx.markers.pair(sel, id);
+                ctx.markers.link(sel, id, selected_signals.to_vec());
             }
             // Plain click on a marker → select.
             (false, _, Some(id), _) => ctx.markers.select(Some(id)),
@@ -1634,9 +1701,34 @@ fn hit_marker(
     best.map(|(id, _)| id)
 }
 
-// ============================================================================
-//  Colours + utilities
-// ============================================================================
+/// Hit-test the horizontal delta lines between linked markers.
+/// Returns the link id if the pointer is within ±4px vertically of a
+/// delta line and horizontally between its two marker x-positions.
+fn hit_delta_line(
+    markers: &MarkerSet,
+    transform: &egui_plot::PlotTransform,
+    pointer: egui::Pos2,
+    ylo: f64,
+    yhi: f64,
+) -> Option<u64> {
+    const THRESHOLD_PX: f32 = 6.0;
+    let mut best: Option<(u64, f32)> = None;
+    for (a, b, link) in markers.link_pairs() {
+        let xa = transform.position_from_point_x((a.t_ns as f64) / 1e9);
+        let xb = transform.position_from_point_x((b.t_ns as f64) / 1e9);
+        let (xmin, xmax) = if xa < xb { (xa, xb) } else { (xb, xa) };
+        if pointer.x < xmin - THRESHOLD_PX || pointer.x > xmax + THRESHOLD_PX {
+            continue;
+        }
+        let y_plot = ylo + link.y_frac as f64 * (yhi - ylo);
+        let y_screen = transform.position_from_point(&PlotPoint::new(0.0, y_plot)).y;
+        let dy = (y_screen - pointer.y).abs();
+        if dy <= THRESHOLD_PX && best.is_none_or(|(_, d)| dy < d) {
+            best = Some((link.id, dy));
+        }
+    }
+    best.map(|(id, _)| id)
+}
 
 pub fn palette(i: usize) -> Color32 {
     const P: &[(u8, u8, u8)] = &[

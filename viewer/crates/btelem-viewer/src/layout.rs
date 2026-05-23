@@ -29,8 +29,9 @@ use crate::view_state::{
 /// compatible way. Loaders refuse anything they don't recognise (with
 /// the exception of legacy `time_series` and `state_chart` plot specs,
 /// which are migrated into `scalar` + `logic_analyser` plots on load,
-/// and v3 files which simply lack `markers`).
-pub const SCHEMA_VERSION: u32 = 4;
+/// v3 files which lack `markers`, and v4 files which use chain-based
+/// pairing instead of explicit links).
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// In-memory representation of a layout file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,21 +45,51 @@ pub struct Layout {
     /// parses far enough to be reported).
     pub dock: serde_json::Value,
     pub plots: Vec<PlotSpec>,
-    /// User-placed marker annotations (v4+). Optional so v3 layouts
-    /// still parse — they simply load with no markers.
+    /// User-placed marker annotations.
     #[serde(default)]
     pub markers: Vec<MarkerSpec>,
+    /// Explicit links between markers (v5+). v4 files use chain-based
+    /// pairing which is migrated to links on load.
+    #[serde(default)]
+    pub links: Vec<LinkSpec>,
 }
 
-/// Serialised marker. Chains are encoded as integer ids; markers
-/// sharing an id belong to the same chain. `None` means a free marker.
+/// Serialised marker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MarkerSpec {
     pub t_ns: u64,
     pub label: String,
     pub color: [u8; 3],
+    /// Legacy chain id (v4). Ignored when `links` are present; used
+    /// for migration from v4 layouts.
     #[serde(default)]
     pub chain: Option<u64>,
+}
+
+/// Serialised link between two markers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkSpec {
+    pub a_index: usize,
+    pub b_index: usize,
+    #[serde(default = "default_y_frac")]
+    pub y_frac: f32,
+    /// Channel paths for which intercepts are shown.
+    #[serde(default)]
+    pub signal_paths: Vec<String>,
+}
+
+fn default_y_frac() -> f32 {
+    0.5
+}
+
+impl LinkSpec {
+    /// Resolve signal paths to channel ids using the current channel list.
+    pub fn signals_resolved(&self, channels: &[ChannelInfo]) -> Vec<ChannelId> {
+        self.signal_paths
+            .iter()
+            .filter_map(|path| channels.iter().find(|c| c.path == *path).map(|c| c.id))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -209,10 +240,10 @@ pub fn load(name: &str) -> io::Result<Layout> {
     let bytes = fs::read(path_for(name))?;
     let layout: Layout = serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    // Accept v1 (legacy `TimeSeries`) and v3 (no markers) layout files
-    // and migrate them on load; reject anything else. No backwards-
-    // compat guarantee — see the module docs.
-    if !matches!(layout.version, 1 | 3 | SCHEMA_VERSION) {
+    // Accept v1 (legacy `TimeSeries`), v3 (no markers), and v4 (chain-based
+    // markers) layout files and migrate them on load. v4 chain groups are
+    // converted to explicit links. Reject anything else.
+    if !matches!(layout.version, 1 | 3 | 4 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -220,6 +251,13 @@ pub fn load(name: &str) -> io::Result<Layout> {
                 layout.version
             ),
         ));
+    }
+    // Migrate v4 chain groups to explicit links
+    if layout.version == 4 && layout.links.is_empty() {
+        let mut layout = layout;
+        layout.links = migrate_chains_to_links(&layout.markers);
+        layout.version = SCHEMA_VERSION;
+        return Ok(layout);
     }
     Ok(layout)
 }
@@ -239,6 +277,32 @@ pub fn delete(name: &str) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Migrate v4 chain-based marker pairs into explicit links. Chains are
+/// converted to consecutive links between markers sharing the same chain
+/// id, ordered by their position in the markers array.
+fn migrate_chains_to_links(markers: &[MarkerSpec]) -> Vec<LinkSpec> {
+    let mut chains: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, m) in markers.iter().enumerate() {
+        if let Some(cid) = m.chain {
+            chains.entry(cid).or_default().push(i);
+        }
+    }
+    let mut links = Vec::new();
+    for (_cid, indices) in &chains {
+        let mut sorted = indices.clone();
+        sorted.sort();
+        for w in sorted.windows(2) {
+            links.push(LinkSpec {
+                a_index: w[0],
+                b_index: w[1],
+                y_frac: 0.5,
+                signal_paths: Vec::new(),
+            });
+        }
+    }
+    links
 }
 
 // ----------------------------------------------------------------------
@@ -288,6 +352,14 @@ pub fn capture(
     // capture's two passes — extremely rare).
     let dock_usize = dock_usize.filter_tabs(|i| *i != usize::MAX);
 
+    // Build marker id -> index mapping for link serialization
+    let marker_idx: HashMap<u64, usize> = markers
+        .markers
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id, i))
+        .collect();
+
     Layout {
         version: SCHEMA_VERSION,
         name: name.to_string(),
@@ -300,7 +372,25 @@ pub fn capture(
                 t_ns: m.t_ns,
                 label: m.label.clone(),
                 color: m.color,
-                chain: m.chain,
+                chain: None,
+            })
+            .collect(),
+        links: markers
+            .links
+            .iter()
+            .filter_map(|l| {
+                let a_idx = marker_idx.get(&l.a)?;
+                let b_idx = marker_idx.get(&l.b)?;
+                Some(LinkSpec {
+                    a_index: *a_idx,
+                    b_index: *b_idx,
+                    y_frac: l.y_frac,
+                    signal_paths: l
+                        .signals
+                        .iter()
+                        .filter_map(|ch| by_id.get(ch).map(|c| c.path.clone()))
+                        .collect(),
+                })
             })
             .collect(),
     }
@@ -781,6 +871,7 @@ mod tests {
                 },
             ],
             markers: vec![],
+            links: vec![],
         };
         let (reg, _dock, report) = apply(&snap, &chs);
         // accel.z (scalar missing) + nope.state + missing.y
@@ -868,6 +959,7 @@ mod tests {
                 styles: HashMap::new(),
             }],
             markers: vec![],
+            links: vec![],
         };
         let chs = vec![ch_scalar(0, "a.x")];
         let (reg, _dock, _) = apply(&layout, &chs);
@@ -973,7 +1065,7 @@ mod tests {
         let mut ms = MarkerSet::new();
         let a = ms.add(1_000, [255, 0, 0]);
         let b = ms.add(2_000, [0, 255, 0]);
-        ms.pair(a, b);
+        ms.link(a, b, vec![]);
         ms.add(3_000, [0, 0, 255]);
 
         let reg = PlotRegistry::new();
@@ -981,14 +1073,15 @@ mod tests {
         let by_id: HashMap<ChannelId, ChannelInfo> = HashMap::new();
         let snap = capture("markers", &reg, &dock, &by_id, &ms);
         assert_eq!(snap.markers.len(), 3);
-        assert_eq!(snap.markers[0].chain, snap.markers[1].chain);
-        assert!(snap.markers[0].chain.is_some());
-        assert!(snap.markers[2].chain.is_none());
+        assert_eq!(snap.links.len(), 1);
+        assert_eq!(snap.links[0].a_index, 0);
+        assert_eq!(snap.links[0].b_index, 1);
 
         // JSON round-trip.
         let json = serde_json::to_vec(&snap).unwrap();
         let snap2: Layout = serde_json::from_slice(&json).unwrap();
         assert_eq!(snap2.markers, snap.markers);
+        assert_eq!(snap2.links, snap.links);
 
         // Restore into a fresh set.
         let mut ms2 = MarkerSet::new();
@@ -996,12 +1089,16 @@ mod tests {
             snap2
                 .markers
                 .iter()
-                .map(|m| (m.t_ns, m.label.clone(), m.color, m.chain)),
+                .map(|m| (m.t_ns, m.label.clone(), m.color)),
+            snap2
+                .links
+                .iter()
+                .map(|l| (l.a_index, l.b_index, l.y_frac, l.signals_resolved(&[]))),
         );
         assert_eq!(ms2.markers.len(), 3);
-        assert_eq!(ms2.markers[0].chain, ms2.markers[1].chain);
-        assert!(ms2.markers[0].chain.is_some());
-        assert!(ms2.markers[2].chain.is_none());
+        assert_eq!(ms2.links.len(), 1);
+        assert_eq!(ms2.links[0].a, ms2.markers[0].id);
+        assert_eq!(ms2.links[0].b, ms2.markers[1].id);
     }
 
     #[test]

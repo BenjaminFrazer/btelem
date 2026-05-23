@@ -83,6 +83,7 @@ pub struct ViewerApp {
     // Markers.
     markers: MarkerSet,
     dragging_marker: Option<u64>,
+    dragging_link: Option<u64>,
     /// True when "marker mode" is active: left-click on a plot places a
     /// marker, shift+left-click places a paired marker. Toggled by the M
     /// key or the marker button in the top bar.
@@ -176,6 +177,7 @@ impl ViewerApp {
             pending_g_at: None,
             markers: MarkerSet::new(),
             dragging_marker: None,
+            dragging_link: None,
             marker_mode: false,
             last_revision: 0,
             rate: RateEstimator::new(2.0),
@@ -336,7 +338,7 @@ impl ViewerApp {
             Ok(l) => l,
             Err(e) => return Some(format!("layout sidecar parse failed: {e}")),
         };
-        if !matches!(layout.version, 1 | 3 | crate::layout::SCHEMA_VERSION) {
+        if !matches!(layout.version, 1 | 3 | 4 | crate::layout::SCHEMA_VERSION) {
             return Some(format!(
                 "layout sidecar version {} unsupported",
                 layout.version
@@ -352,7 +354,11 @@ impl ViewerApp {
             layout
                 .markers
                 .iter()
-                .map(|m| (m.t_ns, m.label.clone(), m.color, m.chain)),
+                .map(|m| (m.t_ns, m.label.clone(), m.color)),
+            layout
+                .links
+                .iter()
+                .map(|l| (l.a_index, l.b_index, l.y_frac, l.signals_resolved(&channels))),
         );
         let suffix = format_apply_suffix(&report, " (", ")");
         Some(format!("layout '{}' applied{suffix}", layout.name))
@@ -821,7 +827,11 @@ impl ViewerApp {
             layout
                 .markers
                 .iter()
-                .map(|m| (m.t_ns, m.label.clone(), m.color, m.chain)),
+                .map(|m| (m.t_ns, m.label.clone(), m.color)),
+            layout
+                .links
+                .iter()
+                .map(|l| (l.a_index, l.b_index, l.y_frac, l.signals_resolved(&channels))),
         );
         let suffix = format_apply_suffix(&report, " — ", "");
         self.flash(format!("loaded '{}'{}", layout.name, suffix));
@@ -1186,19 +1196,20 @@ impl ViewerApp {
                         if Some(m.id) == sel {
                             text = format!("► {text}");
                         }
-                        if let Some(cid) = m.chain {
-                            text = format!("{text} ⛓{cid}");
+                        let n_links = self.markers.links_for(m.id).len();
+                        if n_links > 0 {
+                            text = format!("{text} ({n_links} links)");
                         }
                         ui.colored_label(
                             Color32::from_rgb(m.color[0], m.color[1], m.color[2]),
                             text,
                         );
                     }
-                    let pairs = self.markers.unique_pairs();
+                    let pairs = self.markers.time_ordered_pairs();
                     if !pairs.is_empty() {
                         ui.separator();
-                        ui.heading("Pairs");
-                        for (a, b) in pairs {
+                        ui.heading("Links");
+                        for (a, b, link) in pairs {
                             let dt_s = (b.t_ns as f64 - a.t_ns as f64) / 1e9;
                             ui.label(
                                 egui::RichText::new(format!(
@@ -1207,30 +1218,21 @@ impl ViewerApp {
                                 ))
                                 .strong(),
                             );
-                            // Per-channel Δvalue across all currently visible
-                            // TimeSeries plots.
-                            let mut shown = std::collections::HashSet::new();
-                            for (_, kind) in self.iter_plots() {
-                                if let PlotKind::Scalar(p) = kind {
-                                    for ch in p.channels.iter() {
-                                        if !shown.insert(*ch) {
-                                            continue;
-                                        }
-                                        let va = self.store.sample_at(*ch, a.t_ns);
-                                        let vb = self.store.sample_at(*ch, b.t_ns);
-                                        if let (Some(va), Some(vb)) = (va, vb) {
-                                            let info = self.channels_by_id();
-                                            let path = info
-                                                .get(ch)
-                                                .map(|c| c.path.clone())
-                                                .unwrap_or_default();
-                                            ui.monospace(format!(
-                                                "  {}: Δ = {:+.6}",
-                                                path,
-                                                vb - va
-                                            ));
-                                        }
-                                    }
+                            // Per-channel Δvalue for signals captured by this link.
+                            for ch in &link.signals {
+                                let va = self.store.sample_at(*ch, a.t_ns);
+                                let vb = self.store.sample_at(*ch, b.t_ns);
+                                if let (Some(va), Some(vb)) = (va, vb) {
+                                    let info = self.channels_by_id();
+                                    let path = info
+                                        .get(ch)
+                                        .map(|c| c.path.clone())
+                                        .unwrap_or_default();
+                                    ui.monospace(format!(
+                                        "  {}: Δ = {:+.6}",
+                                        path,
+                                        vb - va
+                                    ));
                                 }
                             }
                         }
@@ -1308,6 +1310,7 @@ impl eframe::App for ViewerApp {
             cursor_last_set: &mut self.cursor_last_set,
             markers: &mut self.markers,
             dragging_marker: &mut self.dragging_marker,
+            dragging_link: &mut self.dragging_link,
             marker_mode: self.marker_mode,
             xy_drag: &mut self.xy_drag,
             new_plots: Vec::new(),
@@ -1353,6 +1356,7 @@ struct ViewerTabs<'a> {
     cursor_last_set: &'a mut Option<Instant>,
     markers: &'a mut MarkerSet,
     dragging_marker: &'a mut Option<u64>,
+    dragging_link: &'a mut Option<u64>,
     marker_mode: bool,
     xy_drag: &'a mut XYDragAccumulator,
     new_plots: Vec<PlotKind>,
@@ -1412,6 +1416,7 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     cam: self.cam,
                     markers: self.markers,
                     dragging_marker: self.dragging_marker,
+                    dragging_link: self.dragging_link,
                     marker_mode: self.marker_mode,
                     cursor_t: self.cursor_t,
                     cursor_last_set: self.cursor_last_set,
