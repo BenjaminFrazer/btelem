@@ -5,6 +5,7 @@ btelem/_native.c
 btelem/capture.py
 btelem/cli.py
 btelem/decoder.py
+btelem/recorder.py
 btelem/schema.py
 btelem/storage.py
 btelem/transport.py
