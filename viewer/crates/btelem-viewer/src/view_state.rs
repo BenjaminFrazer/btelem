@@ -526,12 +526,24 @@ impl Camera {
     }
 
     /// Zoom about a plot-space x coordinate. Switches to Pan mode.
+    /// The visible window is clamped to a minimum of 1 μs to prevent
+    /// f64 precision issues (and egui_plot grid-mark explosions) at
+    /// extreme zoom.
     pub fn zoom_x(&mut self, factor: f64, pivot_s: f64, fallback_bounds: (f64, f64)) {
         self.mode = TimeBase::Pan;
         let (lo, hi) = self.free_bounds_s.unwrap_or(fallback_bounds);
         let new_lo = pivot_s + (lo - pivot_s) * factor;
         let new_hi = pivot_s + (hi - pivot_s) * factor;
-        self.free_bounds_s = Some((new_lo, new_hi));
+        // Minimum visible span: 1 μs. Below this, f64 precision of
+        // absolute-second timestamps (~1e9) is exhausted and
+        // egui_plot's grid spacer degenerates.
+        const MIN_SPAN_S: f64 = 1e-6;
+        if (new_hi - new_lo) < MIN_SPAN_S {
+            let mid = (new_lo + new_hi) * 0.5;
+            self.free_bounds_s = Some((mid - MIN_SPAN_S * 0.5, mid + MIN_SPAN_S * 0.5));
+        } else {
+            self.free_bounds_s = Some((new_lo, new_hi));
+        }
     }
 
     pub fn reset(&mut self) {
@@ -1220,6 +1232,19 @@ mod tests {
         cam.zoom_x(0.5, 5.0, (0.0, 10.0));
         assert_eq!(cam.free_bounds_s, Some((2.5, 7.5)));
         assert_eq!(cam.mode, TimeBase::Pan);
+    }
+
+    #[test]
+    fn zoom_x_clamps_minimum_span() {
+        let mut cam = Camera::default();
+        // Zoom to an absurdly narrow window — should be clamped to 1 μs.
+        cam.zoom_x(1e-15, 5.0, (0.0, 10.0));
+        let (lo, hi) = cam.free_bounds_s.unwrap();
+        let span = hi - lo;
+        assert!(span >= 1e-6 - 1e-15, "span {span} must be >= 1 μs");
+        // Pivot should still be roughly centred.
+        let mid = (lo + hi) * 0.5;
+        assert!((mid - 5.0).abs() < 1e-3, "mid {mid} drifted from pivot");
     }
 
     #[test]
