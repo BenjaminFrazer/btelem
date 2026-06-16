@@ -22,7 +22,8 @@ struct Inner {
     word_to_bits: HashMap<ChannelId, Vec<ChannelId>>,
 }
 
-/// Scriptable in-memory store. Cheap to construct; `O(N)` queries.
+/// Scriptable in-memory store. Cheap to construct; `O(log N + K)` range
+/// queries where K is the result size.
 #[derive(Default, Clone)]
 pub struct MockStore {
     inner: Arc<RwLock<Inner>>,
@@ -172,19 +173,18 @@ impl Store for MockStore {
         let Some(samples) = g.scalars.get(ch as usize) else {
             return Vec::new();
         };
-        // Collect samples in [t0, t1).
-        let in_range: Vec<(Timestamp, f64)> = samples
-            .iter()
-            .copied()
-            .filter(|(t, _)| *t >= t0 && *t < t1)
-            .collect();
+        // Binary-search to the [t0, t1) window instead of scanning the
+        // entire vec. Samples are sorted by timestamp (push order).
+        let lo = samples.partition_point(|(t, _)| *t < t0);
+        let hi = samples.partition_point(|(t, _)| *t < t1);
+        let in_range = &samples[lo..hi];
         if in_range.is_empty() {
             return Vec::new();
         }
         if in_range.len() <= max_buckets {
             return in_range
-                .into_iter()
-                .map(|(t, v)| Bucket { t, min: v, max: v })
+                .iter()
+                .map(|&(t, v)| Bucket { t, min: v, max: v })
                 .collect();
         }
         // Down-sample: equal-width time buckets. Drop empty buckets.
@@ -197,7 +197,7 @@ impl Store for MockStore {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
         };
-        for (t, v) in in_range {
+        for &(t, v) in in_range {
             let idx = (((t - t0) as f64) / bw).floor() as i64;
             if idx != cur_idx {
                 if cur_idx >= 0 {
@@ -230,19 +230,15 @@ impl Store for MockStore {
         let Some(samples) = g.scalars.get(ch as usize) else {
             return Vec::new();
         };
-        // Pull raw samples in window. If we'd exceed max_samples,
-        // stride-sample. Bucket aggregation is *not* applied — colour
-        // mapping needs zoom-stable per-sample values.
-        let in_range: Vec<(Timestamp, f64)> = samples
-            .iter()
-            .copied()
-            .filter(|(t, _)| *t >= t0 && *t < t1)
-            .collect();
+        // Binary-search to the [t0, t1) window.
+        let lo = samples.partition_point(|(t, _)| *t < t0);
+        let hi = samples.partition_point(|(t, _)| *t < t1);
+        let in_range = &samples[lo..hi];
         if in_range.len() <= max_samples {
-            return in_range;
+            return in_range.to_vec();
         }
         let stride = in_range.len().div_ceil(max_samples).max(1);
-        in_range.into_iter().step_by(stride).collect()
+        in_range.iter().step_by(stride).copied().collect()
     }
 
     fn query_state(&self, ch: ChannelId, t0: Timestamp, t1: Timestamp) -> Vec<StateRun> {
@@ -250,25 +246,35 @@ impl Store for MockStore {
         let Some(runs) = g.states.get(ch as usize) else {
             return Vec::new();
         };
-        let last_idx = runs.len().saturating_sub(1);
-        runs.iter()
+        if runs.is_empty() {
+            return Vec::new();
+        }
+        let last_idx = runs.len() - 1;
+        // Skip runs that end before the query window. For the trailing
+        // run, effective_end is u64::MAX (held forward), so it's never
+        // skipped.
+        let start = if last_idx == 0 {
+            0
+        } else {
+            // Among non-trailing runs, find the first whose t_end > t0.
+            // partition_point returns the count of runs where t_end <= t0.
+            let skip = runs[..last_idx].partition_point(|r| r.t_end <= t0);
+            skip
+        };
+        runs[start..]
+            .iter()
             .enumerate()
-            .filter_map(|(i, r)| {
-                // The trailing run always has t_end == its first
-                // observation timestamp (push_state only extends on
-                // the next sample). For querying we treat that run
-                // as held to u64::MAX so a window past it still
-                // returns the current state — otherwise zooming
-                // past the last transition shows nothing.
-                let effective_end = if i == last_idx { u64::MAX } else { r.t_end };
-                if effective_end > t0 && r.t_start < t1 {
-                    Some(StateRun {
-                        t_start: r.t_start,
-                        t_end: effective_end,
-                        value: r.value,
-                    })
+            .take_while(|(_, r)| r.t_start < t1)
+            .map(|(i, r)| {
+                let effective_end = if start + i == last_idx {
+                    u64::MAX
                 } else {
-                    None
+                    r.t_end
+                };
+                StateRun {
+                    t_start: r.t_start,
+                    t_end: effective_end,
+                    value: r.value,
                 }
             })
             .collect()
@@ -302,18 +308,22 @@ impl Store for MockStore {
                 if runs.is_empty() {
                     return None;
                 }
-                // Match query_state semantics: the trailing run is held
-                // forward (t_end on the last run is just its first
-                // observation). Walk normal runs first, then fall back
-                // to the trailing run for any t at or after its start.
                 let last_idx = runs.len() - 1;
-                for (i, r) in runs.iter().enumerate() {
-                    let effective_end = if i == last_idx { u64::MAX } else { r.t_end };
-                    if r.t_start <= t && t < effective_end {
-                        return Some(r.value as f64);
-                    }
+                // Binary search: find the last run whose t_start <= t.
+                let idx = runs.partition_point(|r| r.t_start <= t);
+                // partition_point gives the first run with t_start > t,
+                // so the candidate is at idx - 1.
+                if idx == 0 {
+                    return None;
                 }
-                None
+                let i = idx - 1;
+                let r = &runs[i];
+                let effective_end = if i == last_idx { u64::MAX } else { r.t_end };
+                if t < effective_end {
+                    Some(r.value as f64)
+                } else {
+                    None
+                }
             }
         }
     }
