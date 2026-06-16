@@ -11,6 +11,10 @@ fn constructs_offline() {
         addr: "127.0.0.1:1".to_string(),
         connect_timeout: 0.0,
         file: None,
+        layout: None,
+        capture_prefix: "btelem".to_string(),
+        capture_suffix: None,
+        save_dir: None,
     });
     let _app = ViewerApp::new(args);
 }

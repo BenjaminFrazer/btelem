@@ -272,6 +272,14 @@ impl PlotKind {
         }
     }
 
+    pub fn title_mut(&mut self) -> &mut String {
+        match self {
+            PlotKind::Scalar(p) => &mut p.title,
+            PlotKind::LogicAnalyser(p) => &mut p.title,
+            PlotKind::XY(p) => &mut p.title,
+        }
+    }
+
     /// True if dropping `ch` onto this plot is meaningful.
     pub fn accepts(&self, ch: &ChannelInfo) -> bool {
         match self {

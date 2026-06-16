@@ -336,15 +336,21 @@ pub fn read_btlm(path: &Path) -> Result<LoadedCapture, CaptureError> {
     Ok(LoadedCapture { schema, packets })
 }
 
-/// UTC-flavoured suggested filename: `btelem-YYYYMMDD-HHMMSS.btlm`.
-pub fn suggested_filename() -> String {
+/// UTC-flavoured suggested filename: `{prefix}-YYYYMMDD-HHMMSS{suffix}.btlm`.
+pub fn suggested_filename_with(prefix: &str, suffix: Option<&str>) -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // Tiny UTC formatter — no chrono dep needed for a filename.
     let (y, m, d, hh, mm, ss) = utc_components(secs);
-    format!("btelem-{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}.btlm")
+    let sfx = suffix.map(|s| format!("-{s}")).unwrap_or_default();
+    format!("{prefix}-{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}{sfx}.btlm")
+}
+
+/// UTC-flavoured suggested filename: `btelem-YYYYMMDD-HHMMSS.btlm`.
+pub fn suggested_filename() -> String {
+    suggested_filename_with("btelem", None)
 }
 
 fn utc_components(unix_secs: u64) -> (u32, u32, u32, u32, u32, u32) {

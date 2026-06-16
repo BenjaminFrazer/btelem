@@ -124,6 +124,13 @@ pub struct ViewerApp {
 
     /// File to open on the first update tick (set via `--file`).
     pending_file: Option<std::path::PathBuf>,
+
+    /// Layout JSON to apply on the first update tick (set via `--layout`).
+    pending_layout: Option<std::path::PathBuf>,
+
+    /// When `Some`, a tab rename popup is open for this plot id with the
+    /// in-progress name buffer.
+    rename_tab: Option<(PlotId, String)>,
 }
 
 /// Build a fresh dock with one Scalar plot and one Logic Analyser plot
@@ -143,6 +150,7 @@ impl ViewerApp {
         let store = MockStore::new();
         let capture = Capture::default();
         let connection = Connection::parse(&args.addr).unwrap_or_default();
+        let pending_layout = args.layout.clone();
 
         let (handle, status, pending_file) = if let Some(ref path) = args.file {
             // Skip TCP connection when opening a file.
@@ -203,6 +211,8 @@ impl ViewerApp {
             connection_dialog_open: false,
             confirm_clear_open: false,
             pending_file,
+            pending_layout,
+            rename_tab: None,
         }
     }
 
@@ -381,17 +391,66 @@ impl ViewerApp {
         Some(format!("layout '{}' applied{suffix}", layout.name))
     }
 
+    /// Load a layout JSON file from an arbitrary path (for `--layout`).
+    fn load_layout_file(&mut self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.flash(format!("layout load failed: {e}"));
+                return;
+            }
+        };
+        let layout: crate::layout::Layout = match serde_json::from_slice(&bytes) {
+            Ok(l) => l,
+            Err(e) => {
+                self.flash(format!("layout parse failed: {e}"));
+                return;
+            }
+        };
+        if !matches!(layout.version, 1 | 3 | 4 | crate::layout::SCHEMA_VERSION) {
+            self.flash(format!(
+                "layout version {} unsupported",
+                layout.version
+            ));
+            return;
+        }
+        let channels = self.store.channels();
+        let (registry, dock, report) = crate::layout::apply(&layout, &channels);
+        self.plots = registry;
+        self.dock = dock;
+        self.next_plot_num = self.plots.len() + 1;
+        self.current_layout_name = Some(layout.name.clone());
+        self.markers.restore(
+            layout
+                .markers
+                .iter()
+                .map(|m| (m.t_ns, m.label.clone(), m.color)),
+            layout
+                .links
+                .iter()
+                .map(|l| (l.a_index, l.b_index, l.y_frac, l.signals_resolved(&channels))),
+        );
+        let suffix = format_apply_suffix(&report, " — ", "");
+        self.flash(format!("loaded '{}'{}", layout.name, suffix));
+    }
+
     /// Open a native save dialog and write the current ring as a .btlm.
     fn do_save_capture(&mut self) {
         if !self.capture.has_data() {
             self.flash("nothing to save (no packets captured yet)");
             return;
         }
-        let default_name = btelem_capture::suggested_filename();
-        let pick = rfd::FileDialog::new()
+        let default_name = btelem_capture::suggested_filename_with(
+            &self._args.capture_prefix,
+            self._args.capture_suffix.as_deref(),
+        );
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("btelem capture", &["btlm"])
-            .set_file_name(&default_name)
-            .save_file();
+            .set_file_name(&default_name);
+        if let Some(ref dir) = self._args.save_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let pick = dialog.save_file();
         let Some(mut path) = pick else {
             return;
         };
@@ -524,6 +583,46 @@ impl ViewerApp {
             self.confirm_clear_open = false;
         } else if cancel || !open {
             self.confirm_clear_open = false;
+        }
+    }
+
+    /// Popup for renaming a tab (opened by right-click → Rename).
+    fn rename_tab_dialog(&mut self, ctx: &egui::Context) {
+        let Some((pid, ref mut buf)) = self.rename_tab else {
+            return;
+        };
+        let mut open = true;
+        let mut commit = false;
+        let mut cancel = false;
+        egui::Window::new("Rename tab")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let re = ui.text_edit_singleline(buf);
+                if re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        commit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if commit {
+            let trimmed = buf.trim().to_string();
+            if !trimmed.is_empty() {
+                if let Some(plot) = self.plots.get_mut(pid) {
+                    *plot.title_mut() = trimmed;
+                }
+            }
+            self.rename_tab = None;
+        } else if cancel || !open {
+            self.rename_tab = None;
         }
     }
 
@@ -1303,6 +1402,12 @@ impl eframe::App for ViewerApp {
             self.load_capture_file(&path);
         }
 
+        // Process --layout on the first frame (after file load so channels
+        // are available for resolution).
+        if let Some(path) = self.pending_layout.take() {
+            self.load_layout_file(&path);
+        }
+
         let _ = DragAndDrop::payload::<DragPayload>(ctx);
 
         self.poll_redraw(ctx);
@@ -1313,6 +1418,7 @@ impl eframe::App for ViewerApp {
         self.save_as_dialog(ctx);
         self.delete_confirm_dialog(ctx);
         self.confirm_clear_dialog(ctx);
+        self.rename_tab_dialog(ctx);
         self.tree_panel(ctx);
         self.cursor_panel(ctx);
 
@@ -1337,6 +1443,7 @@ impl eframe::App for ViewerApp {
             xy_drag: &mut self.xy_drag,
             new_plots: Vec::new(),
             removed: Vec::new(),
+            rename_request: None,
         };
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1347,6 +1454,9 @@ impl eframe::App for ViewerApp {
 
         let removed = tab_viewer.removed;
         let new_plots = tab_viewer.new_plots;
+        if let Some(req) = tab_viewer.rename_request {
+            self.rename_tab = Some(req);
+        }
 
         for id in removed {
             self.plots.remove(id);
@@ -1383,6 +1493,8 @@ struct ViewerTabs<'a> {
     xy_drag: &'a mut XYDragAccumulator,
     new_plots: Vec<PlotKind>,
     removed: Vec<PlotId>,
+    /// If set by the context menu, signals that a rename dialog should open.
+    rename_request: Option<(PlotId, String)>,
 }
 
 impl<'a> TabViewer for ViewerTabs<'a> {
@@ -1403,6 +1515,24 @@ impl<'a> TabViewer for ViewerTabs<'a> {
     fn on_close(&mut self, tab: &mut Self::Tab) -> bool {
         self.removed.push(*tab);
         true
+    }
+
+    fn context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        tab: &mut Self::Tab,
+        _surface: egui_dock::SurfaceIndex,
+        _node: NodeIndex,
+    ) {
+        if ui.button("✏ Rename").clicked() {
+            let current = self
+                .plots
+                .get(*tab)
+                .map(|k| k.title().to_string())
+                .unwrap_or_default();
+            self.rename_request = Some((*tab, current));
+            ui.close_menu();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {

@@ -23,4 +23,20 @@ pub struct Args {
     /// Open a .btlm capture file on startup instead of connecting.
     #[arg(long, value_name = "PATH")]
     pub file: Option<std::path::PathBuf>,
+
+    /// Load a layout JSON file on startup (works with both live and file mode).
+    #[arg(long, value_name = "PATH")]
+    pub layout: Option<std::path::PathBuf>,
+
+    /// Prefix for auto-generated capture filenames (default: "btelem").
+    #[arg(long, value_name = "STR", default_value = "btelem")]
+    pub capture_prefix: String,
+
+    /// Suffix appended before the .btlm extension in auto-generated filenames.
+    #[arg(long, value_name = "STR")]
+    pub capture_suffix: Option<String>,
+
+    /// Default directory for the capture save dialog.
+    #[arg(long, value_name = "DIR")]
+    pub save_dir: Option<std::path::PathBuf>,
 }
