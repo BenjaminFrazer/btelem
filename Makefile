@@ -3,7 +3,7 @@ CMAKE_FLAGS ?=
 
 BENCH_DIR := build-bench
 
-.PHONY: all configure build examples viewer viewer-rs viewer-demo viewer-soak tests stress-test e2e-test tests-all bench compile-commands clean
+.PHONY: all configure build examples viewer-rs viewer-demo viewer-soak tests stress-test e2e-test tests-all bench compile-commands clean
 
 VIEWER_PORT ?= 4040
 VIEWER_ADDR ?= 127.0.0.1:$(VIEWER_PORT)
@@ -20,9 +20,6 @@ build: configure
 
 examples: build
 	./$(BUILD_DIR)/btelem_basic
-
-viewer:
-	btelem-viewer --live tcp:localhost:4040
 
 # Rust viewer: launch against an already-running btelem TCP server.
 #   make viewer-rs                     # connects to 127.0.0.1:4040

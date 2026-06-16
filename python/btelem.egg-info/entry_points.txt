@@ -1,3 +1,0 @@
-[console_scripts]
-btelem = btelem.cli:main
-btelem-viewer = btelem.viewer:launch

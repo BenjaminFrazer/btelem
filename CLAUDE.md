@@ -1,6 +1,6 @@
 # btelem
 
-Zero-copy, lock-free binary telemetry library (C99) with Python tooling and a DearPyGui viewer.
+Zero-copy, lock-free binary telemetry library (C99) with Python tooling and a Rust viewer.
 
 ## Build & Run
 
@@ -17,7 +17,6 @@ make examples           # Build and run basic TCP example (localhost:4040)
 Python package:
 ```bash
 pip install -e python/              # core
-pip install -e 'python/[viewer]'    # + DearPyGui viewer
 ```
 
 ## Project Layout
@@ -26,7 +25,7 @@ pip install -e 'python/[viewer]'    # + DearPyGui viewer
 - `src/` — C implementation (ring buffer, schema serialisation, TCP server)
 - `python/btelem/` — Python package: schema parser, decoder, storage (.btlm), transport, CLI
 - `python/btelem/_native.c` — NumPy C extension for Capture/LiveCapture
-- `python/btelem/viewer/` — DearPyGui app (provider abstraction, plots, tree explorer, event log)
+- `viewer/` — Rust viewer (eframe/egui)
 - `tests/` — C unit/stress tests, Python schema/e2e/capture tests
 - `examples/` — C and Python usage examples
 
@@ -36,7 +35,7 @@ pip install -e 'python/[viewer]'    # + DearPyGui viewer
 - **Schema**: Compile-time macros (`BTELEM_SCHEMA_ENTRY`, `BTELEM_FIELD`, `BTELEM_FIELD_ENUM`) generate static schema definitions. Wire format uses packed structs (`btelem_schema_wire`, `btelem_field_wire`, `btelem_enum_wire`).
 - **Draining**: `btelem_drain_packed()` produces fixed-stride packets (8B header + 16B/entry + packed payload). `btelem_schema_stream()` emits schema in fixed-size chunks via callback.
 - **TCP server**: Accept thread + per-client threads. Streams schema then length-prefixed packets.
-- **Viewer**: Provider ABC decouples UI from data source. `BtelemFileProvider` (mmap) and `BtelemLiveProvider` (TCP/serial stream). Tree nodes are drag sources for plots and event log filters.
+- **Viewer**: Rust-based (eframe/egui) viewer in `viewer/`.
 
 ## Key Constants (btelem_types.h)
 
@@ -45,4 +44,4 @@ pip install -e 'python/[viewer]'    # + DearPyGui viewer
 ## Style
 
 - C: C99, no dynamic allocation in hot path, `snake_case`, prefix all public symbols with `btelem_`.
-- Python: Type hints, dataclasses, `snake_case`. Viewer uses DearPyGui immediate-mode API.
+- Python: Type hints, dataclasses, `snake_case`.
