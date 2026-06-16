@@ -22,6 +22,8 @@ pub enum PlotKind {
     /// (integer value step plot with hex/dec/bin labels). Accepts state
     /// channels and integer-storage scalars.
     LogicAnalyser(LogicAnalyserPanel),
+    /// Tabular view of one schema group's fields over time.
+    LogView(LogViewPanel),
     /// Parametric scalar X vs scalar Y over time.
     XY(XYPlot),
 }
@@ -90,6 +92,22 @@ pub struct LogicLane {
 pub struct LogicAnalyserPanel {
     pub title: String,
     pub lanes: Vec<LogicLane>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogViewPanel {
+    pub title: String,
+    /// Group prefix (schema entry name, e.g. "my_log") — used to identify
+    /// which channels belong to this log view.
+    pub group: String,
+    /// Channel IDs of all fields in this struct.
+    pub columns: Vec<ChannelId>,
+    /// Which columns are visible (indices into `columns`). Order = display order.
+    pub visible: Vec<usize>,
+    /// Per-column filter strings. Sparse: absent = no filter.
+    pub filters: HashMap<ChannelId, String>,
+    /// Channel used to colour rows. None = no colouring.
+    pub color_by: Option<ChannelId>,
 }
 
 /// How a scalar signal is drawn.
@@ -249,9 +267,23 @@ impl LogicAnalyserPanel {
     }
 }
 
+impl LogViewPanel {
+    pub fn new(title: impl Into<String>, group: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            group: group.into(),
+            columns: Vec::new(),
+            visible: Vec::new(),
+            filters: HashMap::new(),
+            color_by: None,
+        }
+    }
+}
+
 /// True if `ch` can be added as a lane to a `LogicAnalyserPanel`.
 fn accepts_logic(ch: &ChannelInfo) -> bool {
-    matches!(ch.kind, ChannelKind::State { .. }) || ch.integer_storage
+    matches!(ch.kind, ChannelKind::State { .. })
+        || matches!(ch.kind, ChannelKind::Scalar) && ch.integer_storage
 }
 
 /// Default per-lane render mode for a fresh add. State channels render
@@ -269,6 +301,7 @@ impl PlotKind {
         match self {
             PlotKind::Scalar(p) => &p.title,
             PlotKind::LogicAnalyser(p) => &p.title,
+            PlotKind::LogView(p) => &p.title,
             PlotKind::XY(p) => &p.title,
         }
     }
@@ -277,6 +310,7 @@ impl PlotKind {
         match self {
             PlotKind::Scalar(p) => &mut p.title,
             PlotKind::LogicAnalyser(p) => &mut p.title,
+            PlotKind::LogView(p) => &mut p.title,
             PlotKind::XY(p) => &mut p.title,
         }
     }
@@ -286,6 +320,7 @@ impl PlotKind {
         match self {
             PlotKind::Scalar(_) => matches!(ch.kind, ChannelKind::Scalar),
             PlotKind::LogicAnalyser(_) => accepts_logic(ch),
+            PlotKind::LogView(_) => false,
             PlotKind::XY(_) => matches!(ch.kind, ChannelKind::Scalar),
         }
     }
@@ -352,6 +387,8 @@ pub enum DragPayload {
     Channel(ChannelId),
     /// Multi-select drag from the tree.
     Channels(Vec<ChannelId>),
+    /// Whole schema-group drag from the tree.
+    Group { name: String, channels: Vec<ChannelId> },
     /// Shift-drag of a scalar to seed an XY plot. Spawns a new plot
     /// rather than landing on an existing one.
     XYSeed(ChannelId),
@@ -391,6 +428,7 @@ pub fn tint_for_drop(
                 DropTint::Reject
             })
         }
+        DragPayload::Group { .. } => None,
         // XY seeds spawn new plots; existing panes neither accept nor
         // reject them in a meaningful way — leave their drop zones plain.
         DragPayload::XYSeed(_) => None,
@@ -426,6 +464,7 @@ pub fn try_move_channel(
                     *slot = r;
                 }
             }
+            PlotKind::LogView(_) => {}
             PlotKind::XY(_) => {}
         }
     }
@@ -433,6 +472,7 @@ pub fn try_move_channel(
         match plot {
             PlotKind::Scalar(p) => p.remove(ch),
             PlotKind::LogicAnalyser(p) => p.remove(ch),
+            PlotKind::LogView(_) => {}
             PlotKind::XY(_) => {}
         }
     }
@@ -1156,6 +1196,9 @@ mod tests {
             },
         )
     }
+    fn text(id: u32, path: &str) -> ChannelInfo {
+        ch(id, path, ChannelKind::Text)
+    }
 
     // ---- compute_view ----
 
@@ -1420,6 +1463,13 @@ mod tests {
         assert_eq!(xy.title(), "xy");
     }
 
+    #[test]
+    fn log_view_rejects_channel_drops() {
+        let p = PlotKind::LogView(LogViewPanel::new("log", "my_log"));
+        assert!(!p.accepts(&scalar(1, "my_log.value")));
+        assert!(!p.accepts(&state(2, "my_log.state")));
+    }
+
     // ---- LogicAnalyserPanel ----
 
     #[test]
@@ -1429,6 +1479,8 @@ mod tests {
         assert!(p.accepts(&scalar_int(1, "flags")));
         // state channel (enum / bool / bit) is accepted
         assert!(p.accepts(&state(2, "fsm")));
+        // text channel is rejected
+        assert!(!p.accepts(&text(4, "msg.text")));
         // float-storage scalar is rejected
         assert!(!p.accepts(&scalar(3, "imu.x")));
     }
@@ -1864,6 +1916,22 @@ mod tests {
         by_id.insert(s.id, s.clone());
         let plot = PlotKind::Scalar(ScalarPanel::new("p"));
         assert_eq!(tint_for_drop(&DragPayload::XYSeed(s.id), &plot, &by_id), None);
+    }
+
+    #[test]
+    fn tint_group_returns_none_for_existing_plot() {
+        let plot = PlotKind::Scalar(ScalarPanel::new("p"));
+        assert_eq!(
+            tint_for_drop(
+                &DragPayload::Group {
+                    name: "log".into(),
+                    channels: vec![1, 2],
+                },
+                &plot,
+                &HashMap::new()
+            ),
+            None
+        );
     }
 
     // ---- state_lane_mode ----

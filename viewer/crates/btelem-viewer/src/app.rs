@@ -21,8 +21,8 @@ use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 use crate::plot_renderers::{self, PlotContext};
 use crate::view_state::{
     compute_view, group_by_struct, matches_query, tint_for_drop, Camera, Connection, DragPayload,
-    DropTint, LogicAnalyserPanel, MarkerSet, PlotId, PlotKind, PlotRegistry, Protocol,
-    RateEstimator, ScalarPanel, TimeBase, XYDragAccumulator, XYPlot,
+    DropTint, LogicAnalyserPanel, LogViewPanel, MarkerSet, PlotId, PlotKind, PlotRegistry,
+    Protocol, RateEstimator, ScalarPanel, TimeBase, XYDragAccumulator, XYPlot,
 };
 use crate::Args;
 
@@ -47,6 +47,17 @@ fn add_logic_lane(
     } else {
         panel.add(info);
     }
+}
+
+fn log_view_from_group(
+    title: impl Into<String>,
+    group: impl Into<String>,
+    channels: Vec<ChannelId>,
+) -> PlotKind {
+    let mut panel = LogViewPanel::new(title, group);
+    panel.columns = channels;
+    panel.visible = (0..panel.columns.len()).collect();
+    PlotKind::LogView(panel)
 }
 
 pub struct ViewerApp {
@@ -814,6 +825,14 @@ impl ViewerApp {
                         .insert(PlotKind::LogicAnalyser(LogicAnalyserPanel::new(title)));
                     self.dock.push_to_focused_leaf(id);
                 }
+                if ui.button("📋 Log View").clicked() {
+                    let title = format!("log {}", self.next_plot_num);
+                    self.next_plot_num += 1;
+                    let id = self
+                        .plots
+                        .insert(PlotKind::LogView(LogViewPanel::new(title, "")));
+                    self.dock.push_to_focused_leaf(id);
+                }
                 let marker_btn =
                     egui::SelectableLabel::new(self.marker_mode, "⌖ marker mode (m)");
                 if ui
@@ -1180,7 +1199,8 @@ impl ViewerApp {
                         }
                         let count = self.group_counts.get(head).copied().unwrap_or(0);
                         let header_text = format!("{head}  ({})", fmt_count(count));
-                        egui::CollapsingHeader::new(header_text)
+                        let group_channels: Vec<ChannelId> = items.iter().map(|c| c.id).collect();
+                        let header = egui::CollapsingHeader::new(header_text)
                             .id_salt(("group", head))
                             .default_open(false)
                             .open(if self.tree_query.is_empty() {
@@ -1266,6 +1286,21 @@ impl ViewerApp {
                                     let _ = id;
                                 }
                             });
+                        let header_resp = header.header_response.on_hover_cursor(egui::CursorIcon::Grab);
+                        header_resp.dnd_set_drag_payload(DragPayload::Group {
+                            name: head.clone(),
+                            channels: group_channels,
+                        });
+                        if ctx.is_being_dragged(header_resp.id) {
+                            egui::show_tooltip_at_pointer(
+                                ctx,
+                                ui.layer_id(),
+                                egui::Id::new(("drag_group_preview", head)),
+                                |ui| {
+                                    ui.label(format!("📋 {head}"));
+                                },
+                            );
+                        }
                     }
                 });
             });
@@ -1294,6 +1329,11 @@ impl ViewerApp {
                         PlotKind::LogicAnalyser(p) => {
                             for lane in p.lanes.iter() {
                                 self.cursor_row(ui, &by_id, lane.ch, t);
+                            }
+                        }
+                        PlotKind::LogView(p) => {
+                            for ch in p.columns.iter() {
+                                self.cursor_row(ui, &by_id, *ch, t);
                             }
                         }
                         PlotKind::XY(p) => {
@@ -1448,16 +1488,26 @@ impl eframe::App for ViewerApp {
             rename_request: None,
         };
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            DockArea::new(&mut self.dock)
-                .style(Style::from_egui(ui.ctx().style().as_ref()))
-                .show_inside(ui, &mut tab_viewer);
-        });
+        let dock_drop = egui::CentralPanel::default()
+            .show(ctx, |ui| {
+                ui.dnd_drop_zone::<DragPayload, _>(egui::Frame::none(), |ui| {
+                    DockArea::new(&mut self.dock)
+                        .style(Style::from_egui(ui.ctx().style().as_ref()))
+                        .show_inside(ui, &mut tab_viewer);
+                })
+                .1
+            })
+            .inner;
 
         let removed = tab_viewer.removed;
-        let new_plots = tab_viewer.new_plots;
+        let mut new_plots = tab_viewer.new_plots;
         if let Some(req) = tab_viewer.rename_request {
             self.rename_tab = Some(req);
+        }
+        if let Some(payload) = dock_drop {
+            if let DragPayload::Group { name, channels } = (*payload).clone() {
+                new_plots.push(log_view_from_group(name.clone(), name, channels));
+            }
         }
 
         for id in removed {
@@ -1582,6 +1632,9 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     PlotKind::LogicAnalyser(panel) => {
                         plot_renderers::render_logic_analyser(ui, &mut ctx, pid.0, &panel);
                     }
+                    PlotKind::LogView(panel) => {
+                        plot_renderers::render_log_view(ui, &mut ctx, pid.0, &panel);
+                    }
                     PlotKind::XY(xy) => {
                         plot_renderers::render_xy(ui, &mut ctx, pid.0, &xy);
                     }
@@ -1602,6 +1655,7 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                                 PlotKind::LogicAnalyser(p) => {
                                     add_logic_lane(p, ch, info, self.store, self.by_id);
                                 }
+                                PlotKind::LogView(_) => {}
                                 PlotKind::XY(_) => {}
                             }
                         }
@@ -1628,6 +1682,7 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                         _ => {}
                     }
                 }
+                DragPayload::Group { .. } => {}
                 DragPayload::XYSeed(ch) => {
                     if let Some((x, y)) = self.xy_drag.feed(ch) {
                         let title = format!(

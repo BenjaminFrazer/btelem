@@ -50,6 +50,12 @@ struct gpio_state {
     uint32_t flags;  /* bitfield: enabled(1), error(1), mode(2), channel(4), priority(3), seq(8), active(1) */
 };
 
+struct log_msg {
+    uint8_t severity;   /* enum: DEBUG, INFO, WARN, ERROR, FATAL */
+    char    source[32]; /* source file / module name */
+    char    message[64]; /* log message text */
+};
+
 /* -------------------------------------------------------------------------
  * 2. Schema
  * ---------------------------------------------------------------------- */
@@ -103,6 +109,19 @@ static const struct btelem_field_def gpio_fields[] = {
 };
 BTELEM_SCHEMA_ENTRY(GPIO, 4, "gpio_state", "GPIO pin status",
                     struct gpio_state, gpio_fields);
+
+static const char *severity_labels[] = {
+    "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
+};
+BTELEM_ENUM_DEF(severity, severity_labels);
+
+static const struct btelem_field_def log_fields[] = {
+    BTELEM_FIELD_ENUM(struct log_msg, severity, severity),
+    BTELEM_FIELD_STRING(struct log_msg, source),
+    BTELEM_FIELD_STRING(struct log_msg, message),
+};
+BTELEM_SCHEMA_ENTRY(LOG, 5, "log_msg", "Application log messages",
+                    struct log_msg, log_fields);
 
 /* -------------------------------------------------------------------------
  * 3. Signal handling
@@ -187,6 +206,25 @@ static void log_telemetry(struct btelem_ctx *ctx, double t)
     gf |= (((uint32_t)((int)(t / 4.0) & 1)) << 27);    /* active: toggles every 4s */
     struct gpio_state gs = { .flags = gf };
     BTELEM_LOG(ctx, GPIO, gs);
+
+    /* log_msg: periodic log messages with varying severity */
+    static const char *sources[] = { "sensor", "motor", "imu", "gpio", "main" };
+    static const char *messages[] = {
+        "initialised OK",
+        "reading within bounds",
+        "calibration drift detected",
+        "threshold exceeded",
+        "hardware fault",
+    };
+    if (fmod(t, 0.5) < 0.001) {
+        int idx = (int)(t / 0.5) % 5;
+        struct log_msg lg;
+        memset(&lg, 0, sizeof(lg));
+        lg.severity = (uint8_t)idx;
+        snprintf(lg.source, sizeof(lg.source), "%s", sources[idx]);
+        snprintf(lg.message, sizeof(lg.message), "%s", messages[idx]);
+        BTELEM_LOG(ctx, LOG, lg);
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -219,6 +257,7 @@ int main(void)
     btelem_register(&ctx, &btelem_schema_IMU);
     btelem_register(&ctx, &btelem_schema_STATUS);
     btelem_register(&ctx, &btelem_schema_GPIO);
+    btelem_register(&ctx, &btelem_schema_LOG);
 
     static struct btelem_server srv;
     memset(&srv, 0, sizeof(srv));

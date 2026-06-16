@@ -21,8 +21,8 @@ use btelem_store::{ChannelId, ChannelInfo, ChannelKind};
 use serde::{Deserialize, Serialize};
 
 use crate::view_state::{
-    default_lane_mode, LabelRadix, LaneMode, LogicAnalyserPanel, MarkerSet, PlotId, PlotKind,
-    PlotRegistry, ScalarPanel, SignalStyle, XYPlot,
+    default_lane_mode, LabelRadix, LaneMode, LogicAnalyserPanel, LogViewPanel, MarkerSet, PlotId,
+    PlotKind, PlotRegistry, ScalarPanel, SignalStyle, XYPlot,
 };
 
 /// Bumped when the on-disk JSON shape changes in a non-backwards-
@@ -31,7 +31,7 @@ use crate::view_state::{
 /// which are migrated into `scalar` + `logic_analyser` plots on load,
 /// v3 files which lack `markers`, and v4 files which use chain-based
 /// pairing instead of explicit links).
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// In-memory representation of a layout file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +122,15 @@ pub enum PlotSpec {
     LogicAnalyser {
         title: String,
         lanes: Vec<LogicLaneSpec>,
+    },
+    LogView {
+        title: String,
+        group: String,
+        visible_columns: Vec<String>,
+        #[serde(default)]
+        filters: HashMap<String, String>,
+        #[serde(default)]
+        color_by: Option<String>,
     },
     Xy {
         title: String,
@@ -436,6 +445,28 @@ fn spec_from_kind(
                 lanes,
             }
         }
+        PlotKind::LogView(p) => {
+            let visible_columns = p
+                .visible
+                .iter()
+                .filter_map(|&idx| p.columns.get(idx))
+                .filter_map(|id| by_id.get(id).map(|c| c.path.clone()))
+                .collect::<Vec<_>>();
+            let filters = p
+                .filters
+                .iter()
+                .filter_map(|(id, value)| by_id.get(id).map(|c| (c.path.clone(), value.clone())))
+                .collect::<HashMap<_, _>>();
+            PlotSpec::LogView {
+                title: p.title.clone(),
+                group: p.group.clone(),
+                visible_columns,
+                filters,
+                color_by: p
+                    .color_by
+                    .and_then(|id| by_id.get(&id).map(|c| c.path.clone())),
+            }
+        }
         PlotKind::XY(xy) => PlotSpec::Xy {
             title: xy.title.clone(),
             x: by_id
@@ -615,6 +646,49 @@ pub fn apply(
                     }
                 }
                 let id = registry.insert(PlotKind::LogicAnalyser(p));
+                new_ids.push(Some(id));
+            }
+            PlotSpec::LogView {
+                title,
+                group,
+                visible_columns,
+                filters,
+                color_by,
+            } => {
+                let mut p = LogViewPanel::new(title, group);
+                p.columns = channels
+                    .iter()
+                    .filter(|c| c.path == *group || c.path.starts_with(&format!("{group}.")))
+                    .map(|c| c.id)
+                    .collect();
+                p.visible = if visible_columns.is_empty() {
+                    (0..p.columns.len()).collect()
+                } else {
+                    visible_columns
+                        .iter()
+                        .filter_map(|path| {
+                            let info = by_path.get(path.as_str())?;
+                            p.columns.iter().position(|id| *id == info.id)
+                        })
+                        .collect()
+                };
+                p.filters = filters
+                    .iter()
+                    .filter_map(|(path, value)| {
+                        let info = by_path.get(path.as_str())?;
+                        if p.columns.contains(&info.id) {
+                            Some((info.id, value.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                p.color_by = color_by
+                    .as_deref()
+                    .and_then(|path| by_path.get(path))
+                    .map(|info| info.id)
+                    .filter(|id| p.columns.contains(id));
+                let id = registry.insert(PlotKind::LogView(p));
                 new_ids.push(Some(id));
             }
             PlotSpec::Xy {
@@ -836,6 +910,7 @@ mod tests {
                     assert_eq!(p.lanes[0].mode, LaneMode::Named);
                     got_state = true;
                 }
+                PlotKind::LogView(_) => panic!("unexpected LogView"),
                 PlotKind::XY(_) => panic!("unexpected XY"),
             }
         }
@@ -939,6 +1014,7 @@ mod tests {
                     assert_eq!(p.lanes[0].mode, LaneMode::Named);
                     got_state = true;
                 }
+                PlotKind::LogView(_) => panic!("unexpected LogView"),
                 PlotKind::XY(_) => panic!("unexpected XY"),
             }
         }

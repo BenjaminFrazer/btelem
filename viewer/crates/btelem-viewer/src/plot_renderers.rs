@@ -3,7 +3,7 @@
 //! turning `app.rs` into a god-file. Pure logic still lives in
 //! `view_state.rs`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use btelem_store::{ChannelId, ChannelInfo, ChannelKind, MockStore, StateRun, Store};
 use eframe::egui::{self, Color32};
@@ -15,8 +15,8 @@ use egui_plot::{
 use crate::view_state::{
     channel_group, channel_has_labels, fit_label, group_then_name_order, state_lane_mode,
     strip_group_prefix, try_move_channel, Camera, LabelRadix, LaneMode,
-    LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel, LogicLane, MarkerSet, PlotId,
-    PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateLaneMode, TimeBase, XYPlot,
+    LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel, LogicLane, LogViewPanel, MarkerSet,
+    PlotId, PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateLaneMode, TimeBase, XYPlot,
 };
 
 /// Pixels per character used to truncate state-lane labels. Matches the
@@ -36,6 +36,8 @@ const Y_AXIS_GUTTER: f32 = 48.0;
 const GROUP_GUTTER: f32 = 16.0;
 /// Cap for plot titles in the "Move to plot…" submenu.
 const MOVE_MENU_TITLE_CHARS: usize = 24;
+/// Hard cap for the log-view row count to keep UI work bounded.
+const LOG_VIEW_MAX_ROWS: usize = 1000;
 
 /// Build the `(target_id, fitted_title)` list for the "Move to plot…"
 /// submenu. Filters self out and only keeps plots whose `accepts(info)`
@@ -268,6 +270,288 @@ pub fn render_logic_analyser(
                 }
             }
         });
+}
+
+#[derive(Clone)]
+struct LogColumn {
+    id: ChannelId,
+    label: String,
+}
+
+#[derive(Clone)]
+struct LogRow {
+    t: u64,
+    cells: HashMap<ChannelId, String>,
+}
+
+pub fn render_log_view(
+                ui: &mut egui::Ui,
+                ctx: &mut PlotContext<'_>,
+                pid: u64,
+                panel: &LogViewPanel,
+            ) {
+                let Some((t0, t1)) = ctx.view else {
+                    ui.centered_and_justified(|ui| ui.label("waiting for data…"));
+                    return;
+                };
+                let plot_id = PlotId(pid);
+                let column_meta: Vec<(usize, ChannelId, String)> = panel
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, ch)| {
+                        ctx.by_id
+                            .get(ch)
+                            .map(|info| (idx, *ch, strip_group_prefix(&info.path).to_string()))
+                    })
+                    .collect();
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&panel.title).strong());
+                    ui.menu_button("☰ Columns", |ui| {
+                        if let Some(PlotKind::LogView(p)) = ctx.plots.get_mut(plot_id) {
+                            for (idx, _ch, name) in &column_meta {
+                                let mut shown = p.visible.contains(idx);
+                                if ui.checkbox(&mut shown, name).changed() {
+                                    if shown {
+                                        if !p.visible.contains(idx) {
+                                            p.visible.push(*idx);
+                                        }
+                                    } else {
+                                        p.visible.retain(|i| *i != *idx);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ui.menu_button("🎨 Colour by", |ui| {
+                        if let Some(PlotKind::LogView(p)) = ctx.plots.get_mut(plot_id) {
+                            let none_selected = p.color_by.is_none();
+                            if ui.selectable_label(none_selected, "None").clicked() {
+                                p.color_by = None;
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            for (_, ch, name) in &column_meta {
+                                let selected = p.color_by == Some(*ch);
+                                if ui.selectable_label(selected, name).clicked() {
+                                    p.color_by = Some(*ch);
+                                    ui.close_menu();
+                                }
+                            }
+                        }
+                    });
+                });
+
+                let Some(PlotKind::LogView(panel)) = ctx.plots.get(plot_id).cloned() else {
+                    return;
+                };
+                if panel.columns.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new("drop a schema group here").weak());
+                    });
+                    return;
+                }
+
+                let visible_cols: Vec<LogColumn> = panel
+                    .visible
+                    .iter()
+                    .filter_map(|&idx| {
+                        let ch = *panel.columns.get(idx)?;
+                        Some(LogColumn {
+                            id: ch,
+                            label: strip_group_prefix(&ctx.by_id.get(&ch)?.path).to_string(),
+                        })
+                    })
+                    .collect();
+
+                if visible_cols.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new("no visible columns").weak());
+                    });
+                    return;
+                }
+
+                let column_count = visible_cols.len() + 1;
+                ui.columns(column_count, |cols| {
+                    cols[0].strong("t [s]");
+                    for (i, col) in visible_cols.iter().enumerate() {
+                        cols[i + 1].strong(&col.label);
+                    }
+                });
+
+                if let Some(PlotKind::LogView(p)) = ctx.plots.get_mut(plot_id) {
+                    let mut to_prune = Vec::new();
+                    ui.columns(column_count, |cols| {
+                        cols[0].label("");
+                        for (i, col) in visible_cols.iter().enumerate() {
+                            let filter = p.filters.entry(col.id).or_default();
+                            cols[i + 1].add(
+                                egui::TextEdit::singleline(filter)
+                                    .hint_text("filter")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if filter.trim().is_empty() {
+                                to_prune.push(col.id);
+                            }
+                        }
+                    });
+                    for id in to_prune {
+                        p.filters.remove(&id);
+                    }
+                }
+                ui.separator();
+
+                let Some(PlotKind::LogView(panel)) = ctx.plots.get(plot_id).cloned() else {
+                    return;
+                };
+                let visible_cols: Vec<LogColumn> = panel
+                    .visible
+                    .iter()
+                    .filter_map(|&idx| {
+                        let ch = *panel.columns.get(idx)?;
+                        Some(LogColumn {
+                            id: ch,
+                            label: strip_group_prefix(&ctx.by_id.get(&ch)?.path).to_string(),
+                        })
+                    })
+                    .collect();
+
+                let mut sample_cells: HashMap<ChannelId, HashMap<u64, String>> = HashMap::new();
+                let mut state_runs: HashMap<ChannelId, Vec<StateRun>> = HashMap::new();
+                let mut timestamps: BTreeMap<u64, ()> = BTreeMap::new();
+
+                for &ch in &panel.columns {
+                    let Some(info) = ctx.by_id.get(&ch) else { continue };
+                    match &info.kind {
+                        ChannelKind::Scalar => {
+                            let samples = ctx.store.query_raw(ch, t0, t1, LOG_VIEW_MAX_ROWS);
+                            if !samples.is_empty() {
+                                let mut by_t = HashMap::with_capacity(samples.len());
+                                for (t, v) in samples {
+                                    timestamps.insert(t, ());
+                                    by_t.insert(t, format_scalar_value(v));
+                                }
+                                sample_cells.insert(ch, by_t);
+                            }
+                        }
+                        ChannelKind::State { labels } => {
+                            let runs = ctx.store.query_state(ch, t0, t1);
+                            for run in &runs {
+                                timestamps.insert(run.t_start, ());
+                            }
+                            let mut by_t = HashMap::with_capacity(runs.len());
+                            for run in &runs {
+                                by_t.insert(run.t_start, state_value_text(run.value, labels));
+                            }
+                            sample_cells.insert(ch, by_t);
+                            state_runs.insert(ch, runs);
+                        }
+                        ChannelKind::Text => {
+                            let samples = ctx.store.query_text(ch, t0, t1, LOG_VIEW_MAX_ROWS);
+                            if !samples.is_empty() {
+                                let mut by_t = HashMap::with_capacity(samples.len());
+                                for (t, value) in samples {
+                                    timestamps.insert(t, ());
+                                    by_t.insert(t, value);
+                                }
+                                sample_cells.insert(ch, by_t);
+                            }
+                        }
+                    }
+                }
+
+                let all_ts: Vec<u64> = timestamps.keys().copied().collect();
+                let start = all_ts.len().saturating_sub(LOG_VIEW_MAX_ROWS);
+                let rows: Vec<LogRow> = all_ts[start..]
+                    .iter()
+                    .map(|&t| {
+                        let mut cells = HashMap::new();
+                        for &ch in &panel.columns {
+                            if let Some(text) = sample_cells.get(&ch).and_then(|by_t| by_t.get(&t)) {
+                                cells.insert(ch, text.clone());
+                                continue;
+                            }
+                            let Some(info) = ctx.by_id.get(&ch) else { continue };
+                            if let ChannelKind::State { labels } = &info.kind {
+                                if let Some(value) = state_value_at(state_runs.get(&ch), t) {
+                                    cells.insert(ch, state_value_text(value, labels));
+                                }
+                            }
+                        }
+                        LogRow { t, cells }
+                    })
+                    .collect();
+
+                let filters: HashMap<ChannelId, String> = panel
+                    .filters
+                    .iter()
+                    .map(|(id, value)| (*id, value.to_ascii_lowercase()))
+                    .collect();
+                let filtered_rows: Vec<LogRow> = rows
+                    .into_iter()
+                    .filter(|row| {
+                        visible_cols.iter().all(|col| {
+                            let Some(filter) = filters.get(&col.id) else {
+                                return true;
+                            };
+                            if filter.is_empty() {
+                                return true;
+                            }
+                            row.cells
+                                .get(&col.id)
+                                .map(|value| value.to_ascii_lowercase().contains(filter))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .collect();
+
+                if filtered_rows.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(egui::RichText::new("no rows in view").weak());
+                    });
+                    return;
+                }
+
+                let fallback_bounds = ((t0 as f64) / 1e9, (t1 as f64) / 1e9);
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for row in filtered_rows {
+                            let fill = panel
+                                .color_by
+                                .and_then(|ch| row.cells.get(&ch))
+                                .filter(|value| !value.is_empty())
+                                .map(|value| state_colour(name_seed(value), 0).gamma_multiply(0.25))
+                                .unwrap_or_else(|| Color32::TRANSPARENT);
+                            let text_colour = if fill == Color32::TRANSPARENT {
+                                None
+                            } else {
+                                Some(contrast_text_colour(fill))
+                            };
+                            let inner = egui::Frame::none()
+                                .fill(fill)
+                                .inner_margin(egui::vec2(4.0, 2.0))
+                                .show(ui, |ui| {
+                                    ui.columns(column_count, |cols| {
+                                        cols[0].monospace(format!("{:.6}", (row.t as f64) / 1e9));
+                                        for (i, col) in visible_cols.iter().enumerate() {
+                                            let value = row.cells.get(&col.id).cloned().unwrap_or_default();
+                                            let rich = if let Some(color) = text_colour {
+                                                egui::RichText::new(value).color(color)
+                                            } else {
+                                                egui::RichText::new(value)
+                                            };
+                                            cols[i + 1].label(rich);
+                                        }
+                                    });
+                                });
+                            let resp = inner.response.interact(egui::Sense::click());
+                            if resp.double_clicked() {
+                                ctx.cam.jump_to(row.t, fallback_bounds);
+                            }
+                        }
+                    });
 }
 
 /// Route a lane to the appropriate renderer based on its `mode`.
@@ -1734,6 +2018,41 @@ fn hit_delta_line(
         }
     }
     best.map(|(id, _)| id)
+}
+
+fn format_scalar_value(v: f64) -> String {
+    let mut s = format!("{v:.6}");
+    while s.contains('.') && s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
+}
+
+fn state_value_text(value: u32, labels: &[String]) -> String {
+    labels
+        .get(value as usize)
+        .cloned()
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn state_value_at(runs: Option<&Vec<StateRun>>, t: u64) -> Option<u32> {
+    let runs = runs?;
+    if runs.is_empty() {
+        return None;
+    }
+    let idx = runs.partition_point(|r| r.t_start <= t);
+    if idx == 0 {
+        return None;
+    }
+    let run = &runs[idx - 1];
+    if t < run.t_end || run.t_end == u64::MAX {
+        Some(run.value)
+    } else {
+        None
+    }
 }
 
 pub fn palette(i: usize) -> Color32 {
