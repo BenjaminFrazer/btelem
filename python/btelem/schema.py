@@ -23,6 +23,7 @@ class BtelemType(IntEnum):
     BYTES = 11
     ENUM = 12
     BITFIELD = 13
+    STRING = 14
 
 
 # struct format chars indexed by BtelemType (little-endian base)
@@ -41,6 +42,7 @@ _TYPE_FMT = {
     BtelemType.BYTES: None,  # handled separately
     BtelemType.ENUM: "B",    # uint8 storage
     BtelemType.BITFIELD: None,  # handled by size: 1→B, 2→H, 4→I
+    BtelemType.STRING: None,  # fixed-length char array, decoded as UTF-8
 }
 
 # Wire format constants (must match btelem_types.h)
@@ -148,6 +150,15 @@ class Schema:
                     result[f.name] = bits
                 else:
                     result[f.name] = raw
+                continue
+
+            if f.type == BtelemType.STRING:
+                raw_bytes = payload[f.offset:f.offset + f.size]
+                # Null-terminated: truncate at first \0
+                nul = raw_bytes.find(0)
+                if nul >= 0:
+                    raw_bytes = raw_bytes[:nul]
+                result[f.name] = raw_bytes.decode("utf-8", errors="replace")
                 continue
 
             fmt_char = _TYPE_FMT[f.type]

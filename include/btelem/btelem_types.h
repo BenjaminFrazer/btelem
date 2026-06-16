@@ -51,6 +51,7 @@ enum btelem_type {
     BTELEM_BYTES,
     BTELEM_ENUM = 12,  /* uint8 storage, labels in schema metadata */
     BTELEM_BITFIELD = 13, /* uint8/16/32 storage, bit sub-fields in schema metadata */
+    BTELEM_STRING = 14, /* fixed-length char array, null-terminated for display */
 };
 
 /* --------------------------------------------------------------------------
@@ -171,6 +172,13 @@ struct btelem_schema_entry {
       (uint16_t)offsetof(stype, member), \
       (uint16_t)sizeof(((stype *)0)->member), \
       BTELEM_BITFIELD, 1, NULL, &btelem_bfdef_##bf_name }
+
+/* Define a string field (fixed-length char array, null-terminated) */
+#define BTELEM_FIELD_STRING(stype, member) \
+    { #member, \
+      (uint16_t)offsetof(stype, member), \
+      (uint16_t)sizeof(((stype *)0)->member), \
+      BTELEM_STRING, 1, NULL, NULL }
 
 /* Declare a complete schema entry (creates the schema_entry const).
  *

@@ -1202,6 +1202,7 @@ impl ViewerApp {
                                     let icon = match c.kind {
                                         ChannelKind::Scalar => "📈",
                                         ChannelKind::State { .. } => "▮",
+                                        ChannelKind::Text => "📝",
                                     };
                                     let label = format!("{icon} {leaf}");
                                     let selected = self.tree_selection.contains(&c.id);
@@ -1378,6 +1379,7 @@ impl ViewerApp {
                     .unwrap_or_else(|| (v as i64).to_string());
                 format!("  {}: {label}", info.path)
             }
+            (ChannelKind::Text, Some(_)) => format!("  {}: —", info.path),
         };
         ui.monospace(text);
     }

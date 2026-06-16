@@ -50,6 +50,8 @@ pub enum ChannelKind {
     /// Discrete value with a small, known label set (bool / enum / bitfield bit).
     /// `labels[value as usize]` is the display string.
     State { labels: Arc<[String]> },
+    /// Fixed-length string field (null-terminated char array).
+    Text,
 }
 
 /// One bucket of a min/max LOD query result. For raw (level 0) data,
@@ -170,5 +172,20 @@ pub trait Store: Send + Sync {
             (lo.min(r.value), hi.max(r.value))
         });
         Some((lo as f64, hi as f64))
+    }
+
+    /// Text samples in `[t0, t1)`, capped at `max_samples`.
+    ///
+    /// Returned pairs are sorted by timestamp ascending. For channels
+    /// that are not `ChannelKind::Text`, returns an empty vec.
+    fn query_text(
+        &self,
+        ch: ChannelId,
+        t0: Timestamp,
+        t1: Timestamp,
+        max_samples: usize,
+    ) -> Vec<(Timestamp, String)> {
+        let _ = (ch, t0, t1, max_samples);
+        Vec::new()
     }
 }

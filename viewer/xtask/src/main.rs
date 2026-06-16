@@ -141,6 +141,9 @@ fn replay(
                     ChannelKind::State { .. } => {
                         let _ = store.query_state(c.id, t0, t1);
                     }
+                    ChannelKind::Text => {
+                        // Skip text channels in benchmark
+                    }
                 }
             }
         }
@@ -162,6 +165,7 @@ fn replay(
         let n = match c.kind {
             ChannelKind::Scalar => store.query_scalar(c.id, 0, u64::MAX, usize::MAX).len() as u64,
             ChannelKind::State { .. } => store.query_state(c.id, 0, u64::MAX).len() as u64,
+            ChannelKind::Text => 0, // Text channels not counted in benchmark
         };
         spc.push(n);
         total += n;

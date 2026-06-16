@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use btelem_store::{ChannelId, MockStore};
-use btelem_wire::{BitDef, FieldDef, FieldType, Schema, SchemaEntry};
+use btelem_wire::{BitDef, FieldDef, FieldType, Schema, SchemaEntry, field_as_string};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -46,6 +46,10 @@ enum FieldKind {
         /// that case only the per-bit lanes are dispatched.
         word: Option<ChannelId>,
         bits: Vec<(BitDef, ChannelId)>,
+    },
+    Text {
+        ch: ChannelId,
+        field_def: FieldDef,
     },
     Ignored,
 }
@@ -124,6 +128,11 @@ impl ChannelMap {
                     }
                 }
                 FieldKind::Ignored => {}
+                FieldKind::Text { ch, field_def } => {
+                    if let Some(value) = field_as_string(field_def, payload) {
+                        store.push_text(*ch, t, value);
+                    }
+                }
             }
         }
     }
@@ -265,6 +274,13 @@ fn build_field(
                 storage_bytes: f.size,
                 word,
                 bits,
+            }
+        }
+        FieldType::String => {
+            let ch = store.add_text(path(""));
+            FieldKind::Text {
+                ch,
+                field_def: f.clone(),
             }
         }
         _ => FieldKind::Ignored,

@@ -14,6 +14,7 @@ struct Inner {
     channels: Vec<ChannelInfo>,
     scalars: Vec<Vec<(Timestamp, f64)>>, // index parallel to `channels`
     states: Vec<Vec<StateRun>>,
+    texts: Vec<Vec<(Timestamp, String)>>,
     revision: u64,
     /// Bitfield-word channel id → ordered list of its per-bit state channel
     /// ids. Populated by ingest at registration time so the viewer can
@@ -59,6 +60,7 @@ impl MockStore {
         });
         g.scalars.push(Vec::new());
         g.states.push(Vec::new());
+        g.texts.push(Vec::new());
         g.revision += 1;
         id
     }
@@ -77,6 +79,24 @@ impl MockStore {
         });
         g.scalars.push(Vec::new());
         g.states.push(Vec::new());
+        g.texts.push(Vec::new());
+        g.revision += 1;
+        id
+    }
+
+    /// Register a text channel.
+    pub fn add_text(&self, path: impl Into<String>) -> ChannelId {
+        let mut g = self.inner.write().unwrap();
+        let id = g.channels.len() as ChannelId;
+        g.channels.push(ChannelInfo {
+            id,
+            path: path.into(),
+            kind: ChannelKind::Text,
+            integer_storage: false,
+        });
+        g.scalars.push(Vec::new());
+        g.states.push(Vec::new());
+        g.texts.push(Vec::new());
         g.revision += 1;
         id
     }
@@ -130,6 +150,15 @@ impl MockStore {
         }
         g.revision += 1;
     }
+
+    /// Append a text sample.
+    pub fn push_text(&self, ch: ChannelId, t: Timestamp, value: String) {
+        let mut g = self.inner.write().unwrap();
+        if let Some(buf) = g.texts.get_mut(ch as usize) {
+            buf.push((t, value));
+            g.revision += 1;
+        }
+    }
 }
 impl Store for MockStore {
     fn channels(&self) -> Vec<ChannelInfo> {
@@ -150,6 +179,12 @@ impl Store for MockStore {
             if let (Some(first), Some(last)) = (runs.first(), runs.last()) {
                 min = Some(min.map_or(first.t_start, |m| m.min(first.t_start)));
                 max = Some(max.map_or(last.t_end, |m| m.max(last.t_end)));
+            }
+        }
+        for t in &g.texts {
+            if let (Some(first), Some(last)) = (t.first(), t.last()) {
+                min = Some(min.map_or(first.0, |m| m.min(first.0)));
+                max = Some(max.map_or(last.0, |m| m.max(last.0)));
             }
         }
         Some((min?, max?))
@@ -325,6 +360,7 @@ impl Store for MockStore {
                     None
                 }
             }
+            ChannelKind::Text => None,
         }
     }
 
@@ -344,6 +380,11 @@ impl Store for MockStore {
                 .get(ch as usize)
                 .map(|v| v.len() as u64)
                 .unwrap_or(0),
+            ChannelKind::Text => g
+                .texts
+                .get(ch as usize)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0),
         }
     }
 
@@ -352,8 +393,33 @@ impl Store for MockStore {
         g.channels.clear();
         g.scalars.clear();
         g.states.clear();
+        g.texts.clear();
         g.word_to_bits.clear();
         g.revision = g.revision.wrapping_add(1);
+    }
+
+    fn query_text(
+        &self,
+        ch: ChannelId,
+        t0: Timestamp,
+        t1: Timestamp,
+        max_samples: usize,
+    ) -> Vec<(Timestamp, String)> {
+        if max_samples == 0 || t1 <= t0 {
+            return Vec::new();
+        }
+        let g = self.inner.read().unwrap();
+        let Some(samples) = g.texts.get(ch as usize) else {
+            return Vec::new();
+        };
+        let lo = samples.partition_point(|(t, _)| *t < t0);
+        let hi = samples.partition_point(|(t, _)| *t < t1);
+        let in_range = &samples[lo..hi];
+        if in_range.len() <= max_samples {
+            return in_range.to_vec();
+        }
+        let stride = in_range.len().div_ceil(max_samples).max(1);
+        in_range.iter().step_by(stride).cloned().collect()
     }
 }
 

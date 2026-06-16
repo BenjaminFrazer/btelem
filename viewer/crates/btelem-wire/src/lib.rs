@@ -34,7 +34,7 @@ pub mod value;
 
 pub use packet::{decode_packet, DecodedEntry, Packet, PacketHeader};
 pub use schema::{BitDef, BitfieldDef, EnumDef, FieldDef, FieldType, Schema, SchemaEntry};
-pub use value::field_as_f64;
+pub use value::{field_as_f64, field_as_string};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WireError {

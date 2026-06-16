@@ -20,6 +20,7 @@ pub enum FieldType {
     Bytes = 11,
     Enum = 12,
     Bitfield = 13,
+    String = 14,
 }
 
 impl FieldType {
@@ -39,6 +40,7 @@ impl FieldType {
             11 => Self::Bytes,
             12 => Self::Enum,
             13 => Self::Bitfield,
+            14 => Self::String,
             other => return Err(WireError::UnknownType(other)),
         })
     }

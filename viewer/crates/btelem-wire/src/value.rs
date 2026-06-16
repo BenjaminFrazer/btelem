@@ -31,6 +31,23 @@ pub fn field_as_f64(field: &FieldDef, payload: &[u8]) -> Option<f64> {
         FieldType::F64 => f64::from_le_bytes(s.try_into().ok()?),
         FieldType::Bool => (s[0] != 0) as u8 as f64,
         FieldType::Enum => s[0] as f64,
-        FieldType::Bytes | FieldType::Bitfield => return None,
+        FieldType::Bytes | FieldType::Bitfield | FieldType::String => return None,
     })
+}
+
+/// Read a string field as a Rust `String`. Returns `None` if the payload
+/// is too short or the field is not a `String` type. The raw bytes are
+/// truncated at the first null byte and decoded as UTF-8 (lossy).
+pub fn field_as_string(field: &FieldDef, payload: &[u8]) -> Option<String> {
+    if field.ty != FieldType::String {
+        return None;
+    }
+    let off = field.offset as usize;
+    let size = field.size as usize;
+    if off + size > payload.len() {
+        return None;
+    }
+    let raw = &payload[off..off + size];
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    Some(String::from_utf8_lossy(&raw[..end]).into_owned())
 }

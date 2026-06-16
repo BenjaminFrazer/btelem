@@ -1087,6 +1087,11 @@ fn render_logic_lane(
     };
     let path = info.path.clone();
 
+    // Text channels cannot be rendered as logic lanes
+    if matches!(info.kind, ChannelKind::Text) {
+        return;
+    }
+
     // Collect "runs" of held integer values, regardless of channel kind.
     let mut runs: Vec<LogicRun> = match &info.kind {
         ChannelKind::State { .. } => ctx
@@ -1178,6 +1183,7 @@ fn render_logic_lane(
             }
             out
         }
+        ChannelKind::Text => unreachable!("text channels handled above"),
     };
     // Hold the trailing state run out to the right edge — see comment
     // in render_state_lane. (Scalar branch already does this above.)

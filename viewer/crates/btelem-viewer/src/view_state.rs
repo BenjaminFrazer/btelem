@@ -260,6 +260,7 @@ pub fn default_lane_mode(kind: &ChannelKind, _integer_storage: bool) -> LaneMode
     match kind {
         ChannelKind::State { .. } => LaneMode::Named,
         ChannelKind::Scalar => LaneMode::Numeric,
+        ChannelKind::Text => LaneMode::Numeric, // Text channels default to numeric fallback
     }
 }
 
