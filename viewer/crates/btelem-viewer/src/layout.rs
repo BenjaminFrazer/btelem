@@ -226,7 +226,7 @@ pub fn list() -> io::Result<Vec<String>> {
         }
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(layout) = serde_json::from_slice::<Layout>(&bytes) {
-                if matches!(layout.version, 1 | 3 | SCHEMA_VERSION) {
+                if matches!(layout.version, 1 | 3 | 4 | SCHEMA_VERSION) {
                     names.push(layout.name);
                 }
             }
