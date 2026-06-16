@@ -1,4 +1,4 @@
-"""Tests for BtelemData and BtelemRecorder."""
+"""Tests for BtelemData and Recorder."""
 
 import os
 import struct
@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 from btelem.schema import Schema, SchemaEntry, FieldDef, BtelemType
 from btelem.storage import LogReader, build_packet
-from btelem.recorder import BtelemData, BtelemRecorder
+from btelem.recorder import BtelemData, Recorder
 
 
 def _make_schema() -> Schema:
@@ -130,7 +130,7 @@ class FakeTransport:
 
 
 def test_recorder_stop_returns_data():
-    """BtelemRecorder.stop() returns BtelemData with correct packets."""
+    """Recorder.to_data() returns BtelemData with correct packets."""
     print("test_recorder_stop_returns_data...", end="")
 
     schema = _make_schema()
@@ -138,7 +138,7 @@ def test_recorder_stop_returns_data():
     packets_wire = _make_length_prefixed_packets([p1])
 
     transport = FakeTransport(schema.to_bytes(), packets_wire)
-    recorder = BtelemRecorder(transport)
+    recorder = Recorder(transport=transport)
     recorder.start()
 
     # Wait for the recorder to consume everything
@@ -148,7 +148,8 @@ def test_recorder_stop_returns_data():
             break
         time.sleep(0.01)
 
-    data = recorder.stop()
+    recorder.stop()
+    data = recorder.to_data()
 
     assert data.schema_bytes == schema.to_bytes()
     assert data.packet_count == 1
@@ -160,7 +161,7 @@ def test_recorder_stop_returns_data():
 
 
 def test_recorder_save():
-    """BtelemRecorder.save() stops and writes a valid .btlm."""
+    """Recorder.save() stops and writes a valid .btlm."""
     print("test_recorder_save...", end="")
 
     schema = _make_schema()
@@ -168,7 +169,7 @@ def test_recorder_save():
     packets_wire = _make_length_prefixed_packets([p1])
 
     transport = FakeTransport(schema.to_bytes(), packets_wire)
-    recorder = BtelemRecorder(transport)
+    recorder = Recorder(transport=transport)
     recorder.start()
 
     import time
@@ -193,10 +194,49 @@ def test_recorder_save():
     print(" OK")
 
 
+def test_recorder_query():
+    """Recorder.query() and latest() return decoded entries."""
+    print("test_recorder_query...", end="")
+
+    schema = _make_schema()
+    p1 = build_packet([(0, 1_000, struct.pack("<ff", 20.0, 101.3))])
+    p2 = build_packet([(0, 2_000, struct.pack("<ff", 21.5, 101.1))])
+    p3 = build_packet([(0, 3_000, struct.pack("<ff", 22.0, 100.9))])
+    packets_wire = _make_length_prefixed_packets([p1, p2, p3])
+
+    transport = FakeTransport(schema.to_bytes(), packets_wire)
+    recorder = Recorder(transport=transport)
+    recorder.start()
+
+    import time
+    for _ in range(100):
+        if recorder.packet_count >= 3:
+            break
+        time.sleep(0.01)
+
+    assert recorder.entry_count == 3
+    all_entries = recorder.query("sensor")
+    assert len(all_entries) == 3
+    assert abs(all_entries[0].fields["temperature"] - 20.0) < 0.001
+    assert abs(all_entries[2].fields["temperature"] - 22.0) < 0.001
+
+    latest = recorder.latest("sensor", 2)
+    assert len(latest) == 2
+    assert abs(latest[0].fields["temperature"] - 21.5) < 0.001
+    assert abs(latest[1].fields["temperature"] - 22.0) < 0.001
+
+    assert "sensor" in recorder.names()
+    assert recorder.query("nonexistent") == []
+
+    recorder.stop()
+    print(" OK")
+
+
 if __name__ == "__main__":
     test_iter_packets()
     test_iter_packets_empty()
     test_save_creates_valid_btlm()
     test_recorder_stop_returns_data()
     test_recorder_save()
+    test_recorder_query()
     print("\nAll recorder tests passed.")
