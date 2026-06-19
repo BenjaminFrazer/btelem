@@ -518,12 +518,18 @@ pub fn render_log_view(
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for row in filtered_rows {
-                            let fill = panel
+                            let selected = ctx.log_highlights.contains(&row.t);
+                            let base_fill = panel
                                 .color_by
                                 .and_then(|ch| row.cells.get(&ch))
                                 .filter(|value| !value.is_empty())
                                 .map(|value| state_colour(name_seed(value), 0).gamma_multiply(0.25))
                                 .unwrap_or_else(|| Color32::TRANSPARENT);
+                            let fill = if selected {
+                                Color32::from_rgba_unmultiplied(100, 160, 255, 60)
+                            } else {
+                                base_fill
+                            };
                             let text_colour = if fill == Color32::TRANSPARENT {
                                 None
                             } else {
@@ -547,7 +553,15 @@ pub fn render_log_view(
                                     });
                                 });
                             let resp = inner.response.interact(egui::Sense::click());
+                            if resp.clicked() {
+                                if selected {
+                                    ctx.log_highlights.remove(&row.t);
+                                } else {
+                                    ctx.log_highlights.insert(row.t);
+                                }
+                            }
                             if resp.double_clicked() {
+                                ctx.log_highlights.insert(row.t);
                                 ctx.cam.jump_to(row.t, fallback_bounds);
                             }
                         }
@@ -637,6 +651,9 @@ pub struct PlotContext<'a> {
     pub marker_mode: bool,
     pub cursor_t: &'a mut Option<u64>,
     pub cursor_last_set: &'a mut Option<std::time::Instant>,
+    /// Timestamps selected in LogView panels — rendered as translucent
+    /// vertical lines on time-domain plots.
+    pub log_highlights: &'a mut std::collections::HashSet<u64>,
 }
 
 // ============================================================================
@@ -711,6 +728,7 @@ fn render_scalar_section(
         .allow_boxed_zoom(false)
         .allow_double_click_reset(false);
 
+    let log_highlights = ctx.log_highlights.clone();
     let inner = plot.show(ui, |pui| {
         pui.set_plot_bounds(PlotBounds::from_min_max([xmin, ylo], [xmax, yhi]));
         for sig in &signals {
@@ -718,6 +736,7 @@ fn render_scalar_section(
         }
         render_link_deltas(pui, ctx.markers, ctx.store, &signals, ylo, yhi);
         render_markers(pui, ctx.markers);
+        render_log_highlights(pui, &log_highlights);
         if let Some(p) = pui.pointer_coordinate() {
             hover_t = Some(p.x);
         }
@@ -1016,6 +1035,19 @@ pub fn render_markers(pui: &mut PlotUi, markers: &MarkerSet) {
                 .style(LineStyle::dashed_loose())
                 .width(if selected { 3.0 } else { 1.5 })
                 .name(&m.label),
+        );
+    }
+}
+
+/// Draw translucent vertical lines for timestamps selected in LogView panels.
+fn render_log_highlights(pui: &mut PlotUi, highlights: &std::collections::HashSet<u64>) {
+    let col = Color32::from_rgba_unmultiplied(100, 160, 255, 120);
+    for &t_ns in highlights {
+        pui.vline(
+            VLine::new((t_ns as f64) / 1e9)
+                .color(col)
+                .style(LineStyle::dashed_loose())
+                .width(1.5),
         );
     }
 }

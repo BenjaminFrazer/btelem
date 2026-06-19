@@ -143,6 +143,11 @@ pub struct ViewerApp {
     /// When `Some`, a tab rename popup is open for this plot id with the
     /// in-progress name buffer.
     rename_tab: Option<(PlotId, String)>,
+
+    /// Timestamps of log rows selected in LogView panels. Drawn as
+    /// translucent vertical markers on all time-domain plots so the
+    /// user can see where the selected logs fall.
+    log_highlights: HashSet<u64>,
 }
 
 /// Build a fresh dock with one Scalar plot and one Logic Analyser plot
@@ -225,6 +230,7 @@ impl ViewerApp {
             pending_file,
             pending_layout,
             rename_tab: None,
+            log_highlights: HashSet::new(),
         }
     }
 
@@ -1201,7 +1207,29 @@ impl ViewerApp {
                         let count = self.group_counts.get(head).copied().unwrap_or(0);
                         let header_text = format!("{head}  ({})", fmt_count(count));
                         let group_channels: Vec<ChannelId> = items.iter().map(|c| c.id).collect();
-                        let header = egui::CollapsingHeader::new(header_text)
+                        let drag_payload = DragPayload::Group {
+                            name: head.clone(),
+                            channels: group_channels,
+                        };
+                        // Drag handle for the group — placed before the
+                        // collapsing header so it's always visible.
+                        let drag_resp = ui
+                            .add(egui::Button::new("📋").small().frame(false))
+                            .on_hover_text("drag to create log view")
+                            .interact(egui::Sense::click_and_drag())
+                            .on_hover_cursor(egui::CursorIcon::Grab);
+                        drag_resp.dnd_set_drag_payload(drag_payload.clone());
+                        if ctx.is_being_dragged(drag_resp.id) {
+                            egui::show_tooltip_at_pointer(
+                                ctx,
+                                ui.layer_id(),
+                                egui::Id::new(("drag_group_preview", head)),
+                                |ui| {
+                                    ui.label(format!("📋 {head}"));
+                                },
+                            );
+                        }
+                        egui::CollapsingHeader::new(header_text)
                             .id_salt(("group", head))
                             .default_open(false)
                             .open(if self.tree_query.is_empty() {
@@ -1287,21 +1315,6 @@ impl ViewerApp {
                                     let _ = id;
                                 }
                             });
-                        let header_resp = header.header_response.on_hover_cursor(egui::CursorIcon::Grab);
-                        header_resp.dnd_set_drag_payload(DragPayload::Group {
-                            name: head.clone(),
-                            channels: group_channels,
-                        });
-                        if ctx.is_being_dragged(header_resp.id) {
-                            egui::show_tooltip_at_pointer(
-                                ctx,
-                                ui.layer_id(),
-                                egui::Id::new(("drag_group_preview", head)),
-                                |ui| {
-                                    ui.label(format!("📋 {head}"));
-                                },
-                            );
-                        }
                     }
                 });
             });
@@ -1484,6 +1497,7 @@ impl eframe::App for ViewerApp {
             dragging_link: &mut self.dragging_link,
             marker_mode: self.marker_mode,
             xy_drag: &mut self.xy_drag,
+            log_highlights: &mut self.log_highlights,
             new_plots: Vec::new(),
             removed: Vec::new(),
             rename_request: None,
@@ -1544,6 +1558,7 @@ struct ViewerTabs<'a> {
     dragging_link: &'a mut Option<u64>,
     marker_mode: bool,
     xy_drag: &'a mut XYDragAccumulator,
+    log_highlights: &'a mut HashSet<u64>,
     new_plots: Vec<PlotKind>,
     removed: Vec<PlotId>,
     /// If set by the context menu, signals that a rename dialog should open.
@@ -1625,6 +1640,7 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                     marker_mode: self.marker_mode,
                     cursor_t: self.cursor_t,
                     cursor_last_set: self.cursor_last_set,
+                    log_highlights: self.log_highlights,
                 };
                 match kind {
                     PlotKind::Scalar(panel) => {
@@ -1661,7 +1677,8 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                             }
                         } else if matches!(info.kind, ChannelKind::Text) {
                             // Text channel dropped on a non-LogView panel:
-                            // create a LogView for the parent group.
+                            // create a LogView for the parent group with
+                            // only the dragged column visible by default.
                             let group = channel_group(&info.path).to_string();
                             let group_chs: Vec<ChannelId> = self
                                 .by_id
@@ -1669,11 +1686,15 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                                 .filter(|c| channel_group(&c.path) == group)
                                 .map(|c| c.id)
                                 .collect();
-                            self.new_plots.push(log_view_from_group(
-                                group.clone(),
-                                group,
-                                group_chs,
-                            ));
+                            let mut panel = LogViewPanel::new(group.clone(), group);
+                            panel.columns = group_chs;
+                            // Only the dragged channel is visible initially.
+                            if let Some(idx) = panel.columns.iter().position(|&c| c == ch) {
+                                panel.visible = vec![idx];
+                            } else {
+                                panel.visible = (0..panel.columns.len()).collect();
+                            }
+                            self.new_plots.push(PlotKind::LogView(panel));
                         }
                     }
                 }
