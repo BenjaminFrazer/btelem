@@ -1211,25 +1211,7 @@ impl ViewerApp {
                             name: head.clone(),
                             channels: group_channels,
                         };
-                        // Drag handle for the group — placed before the
-                        // collapsing header so it's always visible.
-                        let drag_resp = ui
-                            .add(egui::Button::new("📋").small().frame(false))
-                            .on_hover_text("drag to create log view")
-                            .interact(egui::Sense::click_and_drag())
-                            .on_hover_cursor(egui::CursorIcon::Grab);
-                        drag_resp.dnd_set_drag_payload(drag_payload.clone());
-                        if ctx.is_being_dragged(drag_resp.id) {
-                            egui::show_tooltip_at_pointer(
-                                ctx,
-                                ui.layer_id(),
-                                egui::Id::new(("drag_group_preview", head)),
-                                |ui| {
-                                    ui.label(format!("📋 {head}"));
-                                },
-                            );
-                        }
-                        egui::CollapsingHeader::new(header_text)
+                        let header = egui::CollapsingHeader::new(header_text)
                             .id_salt(("group", head))
                             .default_open(false)
                             .open(if self.tree_query.is_empty() {
@@ -1315,6 +1297,26 @@ impl ViewerApp {
                                     let _ = id;
                                 }
                             });
+                        // Invisible drag overlay on the header — click
+                        // still toggles the collapsing header, but drag
+                        // initiates a Group payload.
+                        let header_rect = header.header_response.rect;
+                        let drag_resp = ui.interact(
+                            header_rect,
+                            egui::Id::new(("group_drag", head)),
+                            egui::Sense::drag(),
+                        );
+                        drag_resp.dnd_set_drag_payload(drag_payload);
+                        if ctx.is_being_dragged(drag_resp.id) {
+                            egui::show_tooltip_at_pointer(
+                                ctx,
+                                ui.layer_id(),
+                                egui::Id::new(("drag_group_preview", head)),
+                                |ui| {
+                                    ui.label(format!("📋 {head}"));
+                                },
+                            );
+                        }
                     }
                 });
             });
