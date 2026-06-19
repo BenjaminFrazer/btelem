@@ -148,6 +148,10 @@ pub struct ViewerApp {
     /// translucent vertical markers on all time-domain plots so the
     /// user can see where the selected logs fall.
     log_highlights: HashSet<u64>,
+
+    /// Deferred LogView creation from tree context menu (can't mutate
+    /// plots while the tree panel borrows the store).
+    pending_log_view: Option<DragPayload>,
 }
 
 /// Build a fresh dock with one Scalar plot and one Logic Analyser plot
@@ -231,6 +235,7 @@ impl ViewerApp {
             pending_layout,
             rename_tab: None,
             log_highlights: HashSet::new(),
+            pending_log_view: None,
         }
     }
 
@@ -1297,26 +1302,13 @@ impl ViewerApp {
                                     let _ = id;
                                 }
                             });
-                        // Invisible drag overlay on the header — click
-                        // still toggles the collapsing header, but drag
-                        // initiates a Group payload.
-                        let header_rect = header.header_response.rect;
-                        let drag_resp = ui.interact(
-                            header_rect,
-                            egui::Id::new(("group_drag", head)),
-                            egui::Sense::drag(),
-                        );
-                        drag_resp.dnd_set_drag_payload(drag_payload);
-                        if ctx.is_being_dragged(drag_resp.id) {
-                            egui::show_tooltip_at_pointer(
-                                ctx,
-                                ui.layer_id(),
-                                egui::Id::new(("drag_group_preview", head)),
-                                |ui| {
-                                    ui.label(format!("📋 {head}"));
-                                },
-                            );
-                        }
+                        // Right-click the group header → "Open as Log View"
+                        header.header_response.context_menu(|ui| {
+                            if ui.button("📋 Open as Log View").clicked() {
+                                ui.close_menu();
+                                self.pending_log_view = Some(drag_payload);
+                            }
+                        });
                     }
                 });
             });
@@ -1525,6 +1517,9 @@ impl eframe::App for ViewerApp {
             if let DragPayload::Group { name, channels } = (*payload).clone() {
                 new_plots.push(log_view_from_group(name.clone(), name, channels));
             }
+        }
+        if let Some(DragPayload::Group { name, channels }) = self.pending_log_view.take() {
+            new_plots.push(log_view_from_group(name.clone(), name, channels));
         }
 
         for id in removed {
