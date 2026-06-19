@@ -20,9 +20,10 @@ use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 
 use crate::plot_renderers::{self, PlotContext};
 use crate::view_state::{
-    compute_view, group_by_struct, matches_query, tint_for_drop, Camera, Connection, DragPayload,
-    DropTint, LogicAnalyserPanel, LogViewPanel, MarkerSet, PlotId, PlotKind, PlotRegistry,
-    Protocol, RateEstimator, ScalarPanel, TimeBase, XYDragAccumulator, XYPlot,
+    channel_group, compute_view, group_by_struct, matches_query, tint_for_drop, Camera,
+    Connection, DragPayload, DropTint, LogicAnalyserPanel, LogViewPanel, MarkerSet, PlotId,
+    PlotKind, PlotRegistry, Protocol, RateEstimator, ScalarPanel, TimeBase, XYDragAccumulator,
+    XYPlot,
 };
 use crate::Args;
 
@@ -1658,6 +1659,21 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                                 PlotKind::LogView(_) => {}
                                 PlotKind::XY(_) => {}
                             }
+                        } else if matches!(info.kind, ChannelKind::Text) {
+                            // Text channel dropped on a non-LogView panel:
+                            // create a LogView for the parent group.
+                            let group = channel_group(&info.path).to_string();
+                            let group_chs: Vec<ChannelId> = self
+                                .by_id
+                                .values()
+                                .filter(|c| channel_group(&c.path) == group)
+                                .map(|c| c.id)
+                                .collect();
+                            self.new_plots.push(log_view_from_group(
+                                group.clone(),
+                                group,
+                                group_chs,
+                            ));
                         }
                     }
                 }
@@ -1682,7 +1698,13 @@ impl<'a> TabViewer for ViewerTabs<'a> {
                         _ => {}
                     }
                 }
-                DragPayload::Group { .. } => {}
+                DragPayload::Group { name, channels } => {
+                    self.new_plots.push(log_view_from_group(
+                        name.clone(),
+                        name,
+                        channels,
+                    ));
+                }
                 DragPayload::XYSeed(ch) => {
                     if let Some((x, y)) = self.xy_drag.feed(ch) {
                         let title = format!(
