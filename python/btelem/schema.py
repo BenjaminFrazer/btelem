@@ -98,6 +98,11 @@ class SchemaEntry:
     description: str
     payload_size: int
     fields: list[FieldDef] = field(default_factory=list)
+    # Raw field_count as declared on the wire, before clamping to MAX_FIELDS.
+    # len(fields) is capped at MAX_FIELDS, so this preserves the true count for
+    # overflow detection (a value > MAX_FIELDS is rejected by strict readers
+    # such as the Rust viewer).
+    declared_field_count: int = 0
 
 
 def _unpack_str(raw: bytes) -> str:
@@ -204,7 +209,8 @@ class Schema:
                     BtelemType(ftype), fcount,
                 ))
 
-            entries.append(SchemaEntry(eid, name, desc, payload_size, fields))
+            entries.append(SchemaEntry(eid, name, desc, payload_size, fields,
+                                       declared_field_count=field_count))
             pos += _SCHEMA_WIRE_SIZE
 
         schema = cls(entries, endianness)
