@@ -21,8 +21,8 @@ use btelem_store::{ChannelId, ChannelInfo, ChannelKind};
 use serde::{Deserialize, Serialize};
 
 use crate::view_state::{
-    default_lane_mode, LabelRadix, LaneMode, LogicAnalyserPanel, LogViewPanel, MarkerSet, PlotId,
-    PlotKind, PlotRegistry, ScalarPanel, SignalStyle, XYPlot,
+    default_lane_mode, ColumnFilter, LabelRadix, LaneMode, LogicAnalyserPanel, LogViewPanel,
+    MarkerSet, PlotId, PlotKind, PlotRegistry, ScalarPanel, SignalStyle, XYPlot,
 };
 
 /// Bumped when the on-disk JSON shape changes in a non-backwards-
@@ -140,9 +140,13 @@ pub enum PlotSpec {
         group: String,
         visible_columns: Vec<String>,
         #[serde(default)]
-        filters: HashMap<String, String>,
+        filters: HashMap<String, FilterSpec>,
         #[serde(default)]
         color_by: Option<String>,
+        #[serde(default)]
+        priority_by: Option<String>,
+        #[serde(default)]
+        max_rows: Option<usize>,
     },
     Xy {
         title: String,
@@ -151,6 +155,79 @@ pub enum PlotSpec {
         #[serde(default)]
         trail_ns: Option<u64>,
     },
+}
+
+/// Serialised per-column LogView filter. `#[serde(untagged)]` accepts either a
+/// bare string (legacy pre-typed-filter layouts: a case-insensitive substring)
+/// or a typed object, so older `layout.json` files still load.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum FilterSpec {
+    /// Legacy plain-string filter == case-insensitive substring on the column.
+    Legacy(String),
+    Typed(TypedFilterSpec),
+}
+
+/// Typed column filter, tagged by `kind` in JSON.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TypedFilterSpec {
+    Text {
+        needle: String,
+        #[serde(default)]
+        case_sensitive: bool,
+    },
+    Range {
+        #[serde(default)]
+        min: Option<f64>,
+        #[serde(default)]
+        max: Option<f64>,
+    },
+    Enum {
+        allowed: Vec<u32>,
+    },
+}
+
+impl FilterSpec {
+    fn from_filter(f: &ColumnFilter) -> Self {
+        match f {
+            ColumnFilter::Text { needle, case_sensitive } => {
+                FilterSpec::Typed(TypedFilterSpec::Text {
+                    needle: needle.clone(),
+                    case_sensitive: *case_sensitive,
+                })
+            }
+            ColumnFilter::Range { min, max } => FilterSpec::Typed(TypedFilterSpec::Range {
+                min: *min,
+                max: *max,
+            }),
+            ColumnFilter::EnumSet { allowed } => FilterSpec::Typed(TypedFilterSpec::Enum {
+                allowed: allowed.iter().copied().collect(),
+            }),
+        }
+    }
+
+    fn to_filter(&self) -> ColumnFilter {
+        match self {
+            FilterSpec::Legacy(s) => ColumnFilter::Text {
+                needle: s.clone(),
+                case_sensitive: false,
+            },
+            FilterSpec::Typed(TypedFilterSpec::Text { needle, case_sensitive }) => {
+                ColumnFilter::Text {
+                    needle: needle.clone(),
+                    case_sensitive: *case_sensitive,
+                }
+            }
+            FilterSpec::Typed(TypedFilterSpec::Range { min, max }) => ColumnFilter::Range {
+                min: *min,
+                max: *max,
+            },
+            FilterSpec::Typed(TypedFilterSpec::Enum { allowed }) => ColumnFilter::EnumSet {
+                allowed: allowed.iter().copied().collect(),
+            },
+        }
+    }
 }
 
 /// Serialised logic-analyser lane. Channel referenced by dotted path so
@@ -467,7 +544,9 @@ fn spec_from_kind(
             let filters = p
                 .filters
                 .iter()
-                .filter_map(|(id, value)| by_id.get(id).map(|c| (c.path.clone(), value.clone())))
+                .filter_map(|(id, f)| {
+                    by_id.get(id).map(|c| (c.path.clone(), FilterSpec::from_filter(f)))
+                })
                 .collect::<HashMap<_, _>>();
             PlotSpec::LogView {
                 title: p.title.clone(),
@@ -477,6 +556,10 @@ fn spec_from_kind(
                 color_by: p
                     .color_by
                     .and_then(|id| by_id.get(&id).map(|c| c.path.clone())),
+                priority_by: p
+                    .priority_by
+                    .and_then(|id| by_id.get(&id).map(|c| c.path.clone())),
+                max_rows: Some(p.max_rows),
             }
         }
         PlotKind::XY(xy) => PlotSpec::Xy {
@@ -666,6 +749,8 @@ pub fn apply(
                 visible_columns,
                 filters,
                 color_by,
+                priority_by,
+                max_rows,
             } => {
                 let mut p = LogViewPanel::new(title, group);
                 p.columns = channels
@@ -686,10 +771,10 @@ pub fn apply(
                 };
                 p.filters = filters
                     .iter()
-                    .filter_map(|(path, value)| {
+                    .filter_map(|(path, spec)| {
                         let info = by_path.get(path.as_str())?;
                         if p.columns.contains(&info.id) {
-                            Some((info.id, value.clone()))
+                            Some((info.id, spec.to_filter()))
                         } else {
                             None
                         }
@@ -700,6 +785,14 @@ pub fn apply(
                     .and_then(|path| by_path.get(path))
                     .map(|info| info.id)
                     .filter(|id| p.columns.contains(id));
+                p.priority_by = priority_by
+                    .as_deref()
+                    .and_then(|path| by_path.get(path))
+                    .map(|info| info.id)
+                    .filter(|id| p.columns.contains(id));
+                if let Some(m) = max_rows {
+                    p.max_rows = (*m).max(1);
+                }
                 let id = registry.insert(PlotKind::LogView(p));
                 new_ids.push(Some(id));
             }
@@ -817,6 +910,56 @@ fn build_dock(
 mod tests {
     use super::*;
     use btelem_store::ChannelInfo;
+
+    #[test]
+    fn filter_spec_legacy_string_deserializes_as_text() {
+        // Old layouts stored filters as plain strings.
+        let spec: FilterSpec = serde_json::from_str("\"err\"").unwrap();
+        assert_eq!(spec, FilterSpec::Legacy("err".into()));
+        match spec.to_filter() {
+            ColumnFilter::Text { needle, case_sensitive } => {
+                assert_eq!(needle, "err");
+                assert!(!case_sensitive);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_spec_typed_round_trip() {
+        for f in [
+            ColumnFilter::Text { needle: "x".into(), case_sensitive: true },
+            ColumnFilter::Range { min: Some(1.0), max: None },
+            ColumnFilter::EnumSet { allowed: [1u32, 3u32].into_iter().collect() },
+        ] {
+            let spec = FilterSpec::from_filter(&f);
+            let json = serde_json::to_string(&spec).unwrap();
+            let back: FilterSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.to_filter(), f, "round-trip via {json}");
+        }
+    }
+
+    #[test]
+    fn log_view_spec_back_compat_minimal() {
+        // A pre-priority layout (no priority_by / max_rows, empty filters)
+        // must still deserialize.
+        let json = r#"{
+            "kind": "log_view",
+            "title": "awrc_log",
+            "group": "awrc_log",
+            "visible_columns": ["awrc_log.message"],
+            "filters": {},
+            "color_by": "awrc_log.severity"
+        }"#;
+        let spec: PlotSpec = serde_json::from_str(json).unwrap();
+        match spec {
+            PlotSpec::LogView { priority_by, max_rows, .. } => {
+                assert!(priority_by.is_none());
+                assert!(max_rows.is_none());
+            }
+            other => panic!("expected LogView, got {other:?}"),
+        }
+    }
 
     fn ch_scalar(id: ChannelId, path: &str) -> ChannelInfo {
         ChannelInfo {

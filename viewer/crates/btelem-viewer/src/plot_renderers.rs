@@ -3,7 +3,8 @@
 //! turning `app.rs` into a god-file. Pure logic still lives in
 //! `view_state.rs`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use btelem_store::{ChannelId, ChannelInfo, ChannelKind, MockStore, StateRun, Store};
 use eframe::egui::{self, Color32};
@@ -14,7 +15,7 @@ use egui_plot::{
 
 use crate::view_state::{
     channel_group, channel_has_labels, fit_label, group_then_name_order, state_lane_mode,
-    strip_group_prefix, try_move_channel, Camera, LabelRadix, LaneMode,
+    strip_group_prefix, try_move_channel, Camera, ColumnFilter, FilterValue, LabelRadix, LaneMode,
     LineStyle as SigLineStyle, LineWidth, LogicAnalyserPanel, LogicLane, LogViewPanel, MarkerSet,
     PlotId, PlotKind, PlotRegistry, ScalarPanel, SignalStyle, StateLaneMode, TimeBase, XYPlot,
 };
@@ -36,8 +37,6 @@ const Y_AXIS_GUTTER: f32 = 48.0;
 const GROUP_GUTTER: f32 = 16.0;
 /// Cap for plot titles in the "Move to plot…" submenu.
 const MOVE_MENU_TITLE_CHARS: usize = 24;
-/// Hard cap for the log-view row count to keep UI work bounded.
-const LOG_VIEW_MAX_ROWS: usize = 1000;
 
 /// Build the `(target_id, fitted_title)` list for the "Move to plot…"
 /// submenu. Filters self out and only keeps plots whose `accepts(info)`
@@ -281,10 +280,342 @@ struct LogColumn {
     is_text: bool,
 }
 
+/// Which filter editor a column gets, derived from its channel kind.
+#[derive(Clone)]
+enum FilterKind {
+    Text,
+    Numeric,
+    Enum(Arc<[String]>),
+}
+
+impl FilterKind {
+    fn from_channel(kind: &ChannelKind) -> Self {
+        match kind {
+            ChannelKind::Text => FilterKind::Text,
+            ChannelKind::Scalar => FilterKind::Numeric,
+            ChannelKind::State { labels } => FilterKind::Enum(labels.clone()),
+        }
+    }
+}
+
+/// A rendered cell: the display string plus the optional raw numeric value
+/// (scalar value, or enum raw value cast to f64) used for type-aware filtering
+/// and truncation priority. Text cells have `raw == None`.
+#[derive(Clone, Default)]
+struct LogCell {
+    display: String,
+    raw: Option<f64>,
+}
+
 #[derive(Clone)]
 struct LogRow {
     t: u64,
-    cells: HashMap<ChannelId, String>,
+    cells: HashMap<ChannelId, LogCell>,
+}
+
+/// Upper bound on anchor entries scanned per window before sampling. Filtering
+/// runs over this full set so rare events are never decimated away pre-filter.
+const LOG_SCAN_MAX: usize = 200_000;
+
+/// Per-column carry-forward source built once per render.
+enum ColSource {
+    /// Text or scalar samples keyed by timestamp; value is (display, raw).
+    Values(BTreeMap<u64, (String, Option<f64>)>),
+    /// State/enum runs plus the schema label set.
+    States { runs: Vec<StateRun>, labels: Arc<[String]> },
+}
+
+/// Build the (unfiltered, untruncated) rows for a LogView panel.
+///
+/// Entry-centric: one row per sample of the *anchor* channel (the first Text
+/// column, else the first column). Every other column is joined by carrying
+/// forward its nearest prior value, so a row never has a blank primary cell.
+/// Each cell carries both a display string and the raw value, enabling
+/// type-aware filtering and priority-based truncation downstream.
+///
+/// The full set in `[t0, t1)` is returned (bounded by `LOG_SCAN_MAX`) so that
+/// filtering and truncation — applied by the caller — operate on every entry,
+/// never a pre-decimated subset.
+fn build_log_rows(
+    store: &impl Store,
+    by_id: &HashMap<ChannelId, ChannelInfo>,
+    columns: &[ChannelId],
+    t0: u64,
+    t1: u64,
+) -> Vec<LogRow> {
+    // Anchor = first text column, else first column.
+    let anchor = columns
+        .iter()
+        .copied()
+        .find(|ch| matches!(by_id.get(ch).map(|i| &i.kind), Some(ChannelKind::Text)))
+        .or_else(|| columns.first().copied());
+    let Some(anchor) = anchor else {
+        return Vec::new();
+    };
+
+    let mut sources: HashMap<ChannelId, ColSource> = HashMap::new();
+    for &ch in columns {
+        let Some(info) = by_id.get(&ch) else { continue };
+        match &info.kind {
+            ChannelKind::Scalar => {
+                let mut m = BTreeMap::new();
+                for (t, v) in store.query_raw(ch, t0, t1, LOG_SCAN_MAX) {
+                    m.insert(t, (format_scalar_value(v), Some(v)));
+                }
+                sources.insert(ch, ColSource::Values(m));
+            }
+            ChannelKind::Text => {
+                let mut m = BTreeMap::new();
+                for (t, s) in store.query_text(ch, t0, t1, LOG_SCAN_MAX) {
+                    m.insert(t, (s, None));
+                }
+                sources.insert(ch, ColSource::Values(m));
+            }
+            ChannelKind::State { labels } => {
+                let runs = store.query_state(ch, t0, t1);
+                sources.insert(
+                    ch,
+                    ColSource::States {
+                        runs,
+                        labels: labels.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    // Row timestamps come solely from the anchor channel's samples.
+    let anchor_ts: Vec<u64> = match sources.get(&anchor) {
+        Some(ColSource::Values(m)) => m.keys().copied().collect(),
+        Some(ColSource::States { runs, .. }) => runs.iter().map(|r| r.t_start).collect(),
+        None => Vec::new(),
+    };
+
+    anchor_ts
+        .into_iter()
+        .map(|t| {
+            let mut cells = HashMap::new();
+            for &ch in columns {
+                match sources.get(&ch) {
+                    Some(ColSource::Values(m)) => {
+                        if let Some((_, (disp, raw))) = m.range(..=t).next_back() {
+                            cells.insert(
+                                ch,
+                                LogCell {
+                                    display: disp.clone(),
+                                    raw: *raw,
+                                },
+                            );
+                        }
+                    }
+                    Some(ColSource::States { runs, labels }) => {
+                        if let Some(value) = state_value_at(Some(runs), t) {
+                            cells.insert(
+                                ch,
+                                LogCell {
+                                    display: state_value_text(value, labels),
+                                    raw: Some(value as f64),
+                                },
+                            );
+                        }
+                    }
+                    None => {}
+                }
+            }
+            LogRow { t, cells }
+        })
+        .collect()
+}
+
+/// True if `row` passes the AND of all active column filters. An absent or
+/// inactive filter is the identity predicate (accepts everything).
+fn row_passes_filters(row: &LogRow, filters: &HashMap<ChannelId, ColumnFilter>) -> bool {
+    filters.iter().all(|(ch, f)| {
+        if !f.is_active() {
+            return true;
+        }
+        let v = row.cells.get(ch).map(|c| match c.raw {
+            Some(n) => FilterValue::Num(n),
+            None => FilterValue::Text(c.display.as_str()),
+        });
+        f.accepts(v)
+    })
+}
+
+/// Sample `rows` (sorted ascending by `t`) down to at most `n`, spread evenly
+/// over *time* (one row per time-bucket) rather than evenly over index — so
+/// bursty periods don't dominate the result. Order is preserved.
+fn sample_even_over_time(rows: Vec<LogRow>, n: usize) -> Vec<LogRow> {
+    let len = rows.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if len <= n {
+        return rows;
+    }
+    let t_first = rows.first().map(|r| r.t).unwrap_or(0);
+    let t_last = rows.last().map(|r| r.t).unwrap_or(0);
+    if t_last == t_first {
+        // Degenerate span: fall back to even-over-index.
+        let stride = len.div_ceil(n).max(1);
+        return rows.into_iter().step_by(stride).take(n).collect();
+    }
+    let span = (t_last - t_first) as u128 + 1;
+    let mut out = Vec::with_capacity(n);
+    let mut last_bucket = usize::MAX;
+    for r in rows {
+        let bucket = (((r.t - t_first) as u128) * (n as u128) / span) as usize;
+        if bucket != last_bucket {
+            out.push(r);
+            last_bucket = bucket;
+        }
+    }
+    out
+}
+
+/// Reduce `rows` (sorted ascending by `t`) to at most `max_rows` for display.
+///
+/// The `priority_by` value is treated as a *score*: higher = more likely to be
+/// kept. Rows are grouped into score tiers and filled highest-score-first —
+/// whole tiers are taken while they fit; the first tier that would overflow the
+/// budget is partially included (sampled even-over-time) to bring the total
+/// exactly up to `max_rows`. Lower tiers are then dropped entirely. Rows missing
+/// the priority value form the lowest tier. With no `priority_by`, the whole set
+/// is sampled even-over-time. Returns `(display_rows, total_in)`.
+fn truncate_rows(
+    rows: Vec<LogRow>,
+    priority_by: Option<ChannelId>,
+    max_rows: usize,
+) -> (Vec<LogRow>, usize) {
+    let total = rows.len();
+    if total <= max_rows {
+        return (rows, total);
+    }
+
+    let Some(pch) = priority_by else {
+        // No priority field: spread evenly over the window.
+        return (sample_even_over_time(rows, max_rows), total);
+    };
+
+    // Group rows into score tiers. Missing value -> lowest tier (i64::MIN).
+    // Rows within a tier stay in ascending-time order (input is sorted).
+    let mut tiers: BTreeMap<i64, Vec<LogRow>> = BTreeMap::new();
+    for r in rows {
+        let score = r
+            .cells
+            .get(&pch)
+            .and_then(|c| c.raw)
+            .map(|n| n as i64)
+            .unwrap_or(i64::MIN);
+        tiers.entry(score).or_default().push(r);
+    }
+
+    // Fill highest score first; take whole tiers until one overflows, then
+    // partially include that tier (even-over-time) to reach the budget exactly.
+    let mut out: Vec<LogRow> = Vec::with_capacity(max_rows);
+    for (_score, tier_rows) in tiers.into_iter().rev() {
+        let remaining = max_rows - out.len();
+        if remaining == 0 {
+            break;
+        }
+        if tier_rows.len() <= remaining {
+            out.extend(tier_rows);
+        } else {
+            out.extend(sample_even_over_time(tier_rows, remaining));
+            break;
+        }
+    }
+    out.sort_by_key(|r| r.t);
+    (out, total)
+}
+
+/// Render the type-aware filter editor for one column into `ui`, reconciling
+/// `panel.filters[col]` each frame. The filter is removed when it reduces to
+/// the identity predicate (empty text / all enum members selected / no bounds).
+fn render_column_filter_editor(
+    ui: &mut egui::Ui,
+    panel: &mut LogViewPanel,
+    col: ChannelId,
+    kind: Option<&FilterKind>,
+) {
+    match kind {
+        Some(FilterKind::Text) => {
+            let (mut needle, mut case_sensitive) = match panel.filters.get(&col) {
+                Some(ColumnFilter::Text { needle, case_sensitive }) => {
+                    (needle.clone(), *case_sensitive)
+                }
+                _ => (String::new(), false),
+            };
+            ui.add(egui::TextEdit::singleline(&mut needle).hint_text("contains…"));
+            ui.checkbox(&mut case_sensitive, "case sensitive");
+            if needle.trim().is_empty() {
+                panel.filters.remove(&col);
+            } else {
+                panel
+                    .filters
+                    .insert(col, ColumnFilter::Text { needle, case_sensitive });
+            }
+        }
+        Some(FilterKind::Numeric) => {
+            let (mut has_min, mut min_v, mut has_max, mut max_v) = match panel.filters.get(&col) {
+                Some(ColumnFilter::Range { min, max }) => {
+                    (min.is_some(), min.unwrap_or(0.0), max.is_some(), max.unwrap_or(0.0))
+                }
+                _ => (false, 0.0, false, 0.0),
+            };
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut has_min, "min ≥");
+                if has_min {
+                    ui.add(egui::DragValue::new(&mut min_v));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut has_max, "max ≤");
+                if has_max {
+                    ui.add(egui::DragValue::new(&mut max_v));
+                }
+            });
+            let min = has_min.then_some(min_v);
+            let max = has_max.then_some(max_v);
+            if min.is_none() && max.is_none() {
+                panel.filters.remove(&col);
+            } else {
+                panel.filters.insert(col, ColumnFilter::Range { min, max });
+            }
+        }
+        Some(FilterKind::Enum(labels)) => {
+            let all: BTreeSet<u32> = (0..labels.len() as u32).collect();
+            let mut allowed: BTreeSet<u32> = match panel.filters.get(&col) {
+                Some(ColumnFilter::EnumSet { allowed }) => allowed.clone(),
+                _ => all.clone(),
+            };
+            ui.horizontal(|ui| {
+                if ui.button("All").clicked() {
+                    allowed = all.clone();
+                }
+                if ui.button("None").clicked() {
+                    allowed.clear();
+                }
+            });
+            for (i, lab) in labels.iter().enumerate() {
+                let mut on = allowed.contains(&(i as u32));
+                if ui.checkbox(&mut on, lab).changed() {
+                    if on {
+                        allowed.insert(i as u32);
+                    } else {
+                        allowed.remove(&(i as u32));
+                    }
+                }
+            }
+            // All selected = identity -> drop the filter entirely.
+            if allowed == all {
+                panel.filters.remove(&col);
+            } else {
+                panel.filters.insert(col, ColumnFilter::EnumSet { allowed });
+            }
+        }
+        None => {}
+    }
 }
 
 pub fn render_log_view(
@@ -306,6 +637,16 @@ pub fn render_log_view(
                         ctx.by_id
                             .get(ch)
                             .map(|info| (idx, *ch, strip_group_prefix(&info.path).to_string()))
+                    })
+                    .collect();
+                // Filter-editor kind per column (local copy so menu closures can
+                // mutate the panel without re-borrowing ctx.by_id).
+                let col_kind: HashMap<ChannelId, FilterKind> = column_meta
+                    .iter()
+                    .filter_map(|(_, ch, _)| {
+                        ctx.by_id
+                            .get(ch)
+                            .map(|info| (*ch, FilterKind::from_channel(&info.kind)))
                     })
                     .collect();
 
@@ -342,6 +683,35 @@ pub fn render_log_view(
                                     ui.close_menu();
                                 }
                             }
+                        }
+                    });
+                    ui.menu_button("⚠ Priority", |ui| {
+                        if let Some(PlotKind::LogView(p)) = ctx.plots.get_mut(plot_id) {
+                            ui.label(egui::RichText::new("Truncation priority (score: higher kept first)").small());
+                            if ui.selectable_label(p.priority_by.is_none(), "None (even over time)").clicked() {
+                                p.priority_by = None;
+                                ui.close_menu();
+                            }
+                            for (_, ch, name) in &column_meta {
+                                // Only enum/numeric columns make sense as a score.
+                                if matches!(col_kind.get(ch), Some(FilterKind::Text)) {
+                                    continue;
+                                }
+                                if ui.selectable_label(p.priority_by == Some(*ch), name).clicked() {
+                                    p.priority_by = Some(*ch);
+                                }
+                            }
+                            ui.separator();
+                            let mut maxr = p.max_rows as u32;
+                            ui.horizontal(|ui| {
+                                ui.label("Max rows:");
+                                if ui
+                                    .add(egui::DragValue::new(&mut maxr).range(1..=100_000))
+                                    .changed()
+                                {
+                                    p.max_rows = maxr.max(1) as usize;
+                                }
+                            });
                         }
                     });
                 });
@@ -389,150 +759,88 @@ pub fn render_log_view(
                     compact_w
                 };
 
-                // Header + filter row
+                // Header row with a type-aware filter popup per column.
                 if let Some(PlotKind::LogView(p)) = ctx.plots.get_mut(plot_id) {
-                    let mut to_prune = Vec::new();
                     ui.horizontal(|ui| {
-                        ui.add_sized(egui::vec2(compact_w, ui.spacing().interact_size.y),
-                            egui::Label::new(egui::RichText::new("t [s]").strong()));
+                        ui.add_sized(
+                            egui::vec2(compact_w, ui.spacing().interact_size.y),
+                            egui::Label::new(egui::RichText::new("t [s]").strong()),
+                        );
                         for col in &visible_cols {
                             let w = if col.is_text { text_w } else { compact_w };
-                            ui.add_sized(egui::vec2(w, ui.spacing().interact_size.y),
-                                egui::Label::new(egui::RichText::new(&col.label).strong()));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(compact_w + ui.spacing().item_spacing.x);
-                        for col in &visible_cols {
-                            let w = if col.is_text { text_w } else { compact_w };
-                            let filter = p.filters.entry(col.id).or_default();
-                            ui.add_sized(
+                            let active =
+                                p.filters.get(&col.id).map(|f| f.is_active()).unwrap_or(false);
+                            let header = if active {
+                                egui::RichText::new(format!("{} ⏷*", col.label)).strong()
+                            } else {
+                                egui::RichText::new(format!("{} ⏷", col.label)).strong()
+                            };
+                            ui.allocate_ui(
                                 egui::vec2(w, ui.spacing().interact_size.y),
-                                egui::TextEdit::singleline(filter).hint_text("filter"),
+                                |ui| {
+                                    ui.menu_button(header, |ui| {
+                                        render_column_filter_editor(
+                                            ui,
+                                            p,
+                                            col.id,
+                                            col_kind.get(&col.id),
+                                        );
+                                        ui.separator();
+                                        if ui.button("Clear filter").clicked() {
+                                            p.filters.remove(&col.id);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                },
                             );
-                            if filter.trim().is_empty() {
-                                to_prune.push(col.id);
-                            }
                         }
                     });
-                    for id in to_prune {
-                        p.filters.remove(&id);
-                    }
                 }
                 ui.separator();
 
                 let Some(PlotKind::LogView(panel)) = ctx.plots.get(plot_id).cloned() else {
                     return;
                 };
-                let visible_cols: Vec<LogColumn> = panel
-                    .visible
-                    .iter()
-                    .filter_map(|&idx| {
-                        let ch = *panel.columns.get(idx)?;
-                        let info = ctx.by_id.get(&ch)?;
-                        Some(LogColumn {
-                            id: ch,
-                            label: strip_group_prefix(&info.path).to_string(),
-                            is_text: matches!(info.kind, ChannelKind::Text),
-                        })
-                    })
-                    .collect();
 
-                let mut sample_cells: HashMap<ChannelId, HashMap<u64, String>> = HashMap::new();
-                let mut state_runs: HashMap<ChannelId, Vec<StateRun>> = HashMap::new();
-                let mut timestamps: BTreeMap<u64, ()> = BTreeMap::new();
-
-                for &ch in &panel.columns {
-                    let Some(info) = ctx.by_id.get(&ch) else { continue };
-                    match &info.kind {
-                        ChannelKind::Scalar => {
-                            let samples = ctx.store.query_raw(ch, t0, t1, LOG_VIEW_MAX_ROWS);
-                            if !samples.is_empty() {
-                                let mut by_t = HashMap::with_capacity(samples.len());
-                                for (t, v) in samples {
-                                    timestamps.insert(t, ());
-                                    by_t.insert(t, format_scalar_value(v));
-                                }
-                                sample_cells.insert(ch, by_t);
-                            }
-                        }
-                        ChannelKind::State { labels } => {
-                            let runs = ctx.store.query_state(ch, t0, t1);
-                            for run in &runs {
-                                timestamps.insert(run.t_start, ());
-                            }
-                            let mut by_t = HashMap::with_capacity(runs.len());
-                            for run in &runs {
-                                by_t.insert(run.t_start, state_value_text(run.value, labels));
-                            }
-                            sample_cells.insert(ch, by_t);
-                            state_runs.insert(ch, runs);
-                        }
-                        ChannelKind::Text => {
-                            let samples = ctx.store.query_text(ch, t0, t1, LOG_VIEW_MAX_ROWS);
-                            if !samples.is_empty() {
-                                let mut by_t = HashMap::with_capacity(samples.len());
-                                for (t, value) in samples {
-                                    timestamps.insert(t, ());
-                                    by_t.insert(t, value);
-                                }
-                                sample_cells.insert(ch, by_t);
-                            }
-                        }
-                    }
-                }
-
-                let all_ts: Vec<u64> = timestamps.keys().copied().collect();
-                let start = all_ts.len().saturating_sub(LOG_VIEW_MAX_ROWS);
-                let rows: Vec<LogRow> = all_ts[start..]
-                    .iter()
-                    .map(|&t| {
-                        let mut cells = HashMap::new();
-                        for &ch in &panel.columns {
-                            if let Some(text) = sample_cells.get(&ch).and_then(|by_t| by_t.get(&t)) {
-                                cells.insert(ch, text.clone());
-                                continue;
-                            }
-                            let Some(info) = ctx.by_id.get(&ch) else { continue };
-                            if let ChannelKind::State { labels } = &info.kind {
-                                if let Some(value) = state_value_at(state_runs.get(&ch), t) {
-                                    cells.insert(ch, state_value_text(value, labels));
-                                }
-                            }
-                        }
-                        LogRow { t, cells }
-                    })
-                    .collect();
-
-                let filters: HashMap<ChannelId, String> = panel
-                    .filters
-                    .iter()
-                    .map(|(id, value)| (*id, value.to_ascii_lowercase()))
-                    .collect();
-                let filtered_rows: Vec<LogRow> = rows
+                // Pipeline: build (full window) -> filter (AND of predicates) ->
+                // truncate (tiered by priority). Filtering happens BEFORE the
+                // row cap so rare events are never decimated away first.
+                let all_rows = build_log_rows(ctx.store, ctx.by_id, &panel.columns, t0, t1);
+                let in_window = all_rows.len();
+                let matched: Vec<LogRow> = all_rows
                     .into_iter()
-                    .filter(|row| {
-                        visible_cols.iter().all(|col| {
-                            let Some(filter) = filters.get(&col.id) else {
-                                return true;
-                            };
-                            if filter.is_empty() {
-                                return true;
-                            }
-                            row.cells
-                                .get(&col.id)
-                                .map(|value| value.to_ascii_lowercase().contains(filter))
-                                .unwrap_or(false)
-                        })
-                    })
+                    .filter(|row| row_passes_filters(row, &panel.filters))
                     .collect();
+                let matched_count = matched.len();
+                let (display_rows, _) =
+                    truncate_rows(matched, panel.priority_by, panel.max_rows);
+                let shown = display_rows.len();
 
-                if filtered_rows.is_empty() {
+                // Always surface how much is shown vs matched (truncation is
+                // never silent).
+                ui.horizontal(|ui| {
+                    let truncated = matched_count > shown;
+                    let text = format!(
+                        "showing {shown} of {matched_count} matched ({in_window} in window)\
+                         {}",
+                        if truncated { " — truncated" } else { "" }
+                    );
+                    let rich = egui::RichText::new(text).small();
+                    let rich = if truncated {
+                        rich.color(Color32::from_rgb(230, 170, 60))
+                    } else {
+                        rich.weak()
+                    };
+                    ui.label(rich);
+                });
+
+                if display_rows.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.label(egui::RichText::new("no rows in view").weak());
+                        ui.label(egui::RichText::new("no rows match").weak());
                     });
                     return;
                 }
+                let filtered_rows = display_rows;
 
                 let fallback_bounds = ((t0 as f64) / 1e9, (t1 as f64) / 1e9);
                 egui::ScrollArea::vertical()
@@ -543,6 +851,7 @@ pub fn render_log_view(
                             let base_fill = panel
                                 .color_by
                                 .and_then(|ch| row.cells.get(&ch))
+                                .map(|cell| cell.display.as_str())
                                 .filter(|value| !value.is_empty())
                                 .map(|value| state_colour(name_seed(value), 0).gamma_multiply(0.25))
                                 .unwrap_or_else(|| Color32::TRANSPARENT);
@@ -569,7 +878,11 @@ pub fn render_log_view(
                                         );
                                         for col in &visible_cols {
                                             let w = if col.is_text { text_w } else { compact_w };
-                                            let value = row.cells.get(&col.id).cloned().unwrap_or_default();
+                                            let value = row
+                                                .cells
+                                                .get(&col.id)
+                                                .map(|c| c.display.clone())
+                                                .unwrap_or_default();
                                             let rich = if let Some(color) = text_colour {
                                                 egui::RichText::new(value).color(color)
                                             } else {
@@ -2201,6 +2514,148 @@ fn heatmap_color(t: f32) -> Color32 {
 
 pub fn short_name(p: &str) -> &str {
     p.rsplit('.').next().unwrap_or(p)
+}
+
+#[cfg(test)]
+mod log_view_tests {
+    use super::*;
+
+    fn by_id_map(store: &MockStore) -> HashMap<ChannelId, ChannelInfo> {
+        store.channels().into_iter().map(|c| (c.id, c)).collect()
+    }
+
+    /// Build a store with `n` log entries: a text `message`, an enum
+    /// `severity` (toggling), and a scalar `device`. Returns (store, ids).
+    fn make_log(n: u64) -> (MockStore, ChannelId, ChannelId, ChannelId) {
+        let store = MockStore::new();
+        let msg = store.add_text("log.message");
+        let sev = store.add_state("log.severity", &["TRACE", "INFO", "WARN", "ERROR"]);
+        let dev = store.add_scalar_int("log.device");
+        for i in 0..n {
+            let t = (i + 1) * 1000;
+            store.push_text(msg, t, format!("line {i}"));
+            // mostly INFO, occasional ERROR every 500th entry
+            let s = if i % 500 == 0 { 3 } else { 1 };
+            store.push_state(sev, t, s);
+            store.push_scalar(dev, t, (i % 4) as f64);
+        }
+        (store, msg, sev, dev)
+    }
+
+    /// Entry-centric: one row per message entry, every cell populated via
+    /// carry-forward (regression for the blank-message bug).
+    #[test]
+    fn entry_centric_no_blank_cells() {
+        let (store, msg, sev, dev) = make_log(3000);
+        let by_id = by_id_map(&store);
+        let rows = build_log_rows(&store, &by_id, &[msg, sev, dev], 0, 4_000_000);
+        assert_eq!(rows.len(), 3000, "one row per message entry");
+        for row in &rows {
+            assert!(row.cells.get(&msg).is_some_and(|c| !c.display.is_empty()));
+            assert!(row.cells.contains_key(&sev));
+            assert!(row.cells.contains_key(&dev));
+        }
+    }
+
+    /// Filtering scans the FULL window before any cap, so a rare ERROR is
+    /// always found even when total entries far exceed the display budget.
+    #[test]
+    fn filter_finds_rare_event_before_truncation() {
+        let (store, msg, sev, _dev) = make_log(3000);
+        let by_id = by_id_map(&store);
+        let rows = build_log_rows(&store, &by_id, &[msg, sev], 0, 4_000_000);
+
+        // Filter: severity == ERROR (raw value 3).
+        let mut filters = HashMap::new();
+        filters.insert(sev, ColumnFilter::EnumSet { allowed: [3u32].into_iter().collect() });
+
+        let matched: Vec<_> = rows
+            .into_iter()
+            .filter(|r| row_passes_filters(r, &filters))
+            .collect();
+        // ERROR every 500th of 3000 => indices 0,500,1000,1500,2000,2500 = 6
+        assert_eq!(matched.len(), 6, "all ERROR rows found pre-truncation");
+    }
+
+    /// AND composition: two column predicates intersect.
+    #[test]
+    fn filters_and_compose() {
+        let (store, msg, sev, dev) = make_log(2000);
+        let by_id = by_id_map(&store);
+        let rows = build_log_rows(&store, &by_id, &[msg, sev, dev], 0, 3_000_000);
+
+        let mut filters = HashMap::new();
+        filters.insert(sev, ColumnFilter::EnumSet { allowed: [1u32].into_iter().collect() });
+        filters.insert(dev, ColumnFilter::Range { min: Some(2.0), max: Some(2.0) });
+
+        let matched: Vec<_> = rows
+            .iter()
+            .filter(|r| row_passes_filters(r, &filters))
+            .collect();
+        assert!(!matched.is_empty());
+        for r in matched {
+            assert_eq!(r.cells.get(&sev).unwrap().raw, Some(1.0));
+            assert_eq!(r.cells.get(&dev).unwrap().raw, Some(2.0));
+        }
+    }
+
+    /// Score-tier truncation: fill whole tiers highest-score-first; the tier
+    /// that overflows is partially included; lower tiers are dropped entirely.
+    #[test]
+    fn truncation_fills_tiers_highest_first() {
+        let store = MockStore::new();
+        let msg = store.add_text("log.message");
+        let sev = store.add_state("log.severity", &["TRACE", "INFO", "WARN", "ERROR"]);
+        let mut t = 0u64;
+        // 10 ERROR(3), 20 WARN(2), 1000 INFO(1) — by row (state runs coalesce
+        // but per-row carry-forward restores the counts).
+        for _ in 0..10 {
+            t += 1000;
+            store.push_text(msg, t, "e".into());
+            store.push_state(sev, t, 3);
+        }
+        for _ in 0..20 {
+            t += 1000;
+            store.push_text(msg, t, "w".into());
+            store.push_state(sev, t, 2);
+        }
+        for _ in 0..1000 {
+            t += 1000;
+            store.push_text(msg, t, "i".into());
+            store.push_state(sev, t, 1);
+        }
+        let by_id = by_id_map(&store);
+        let rows = build_log_rows(&store, &by_id, &[msg, sev], 0, t + 1000);
+
+        let (shown, total_in) = truncate_rows(rows, Some(sev), 25);
+        assert_eq!(total_in, 1030);
+        assert!(shown.len() <= 25);
+        let count = |v: f64| {
+            shown
+                .iter()
+                .filter(|r| r.cells.get(&sev).and_then(|c| c.raw) == Some(v))
+                .count()
+        };
+        assert_eq!(count(3.0), 10, "all ERROR kept (whole tier fits)");
+        assert!(count(2.0) >= 1 && count(2.0) <= 15, "WARN tier partially filled");
+        assert_eq!(count(1.0), 0, "INFO tier dropped (budget exhausted)");
+    }
+
+    /// Even-over-time sampling spreads rows across the window rather than
+    /// clustering at one end (used for no-priority and partial-tier fills).
+    #[test]
+    fn even_over_time_spreads_rows() {
+        let (store, msg, _sev, _dev) = make_log(10_000);
+        let by_id = by_id_map(&store);
+        let rows = build_log_rows(&store, &by_id, &[msg], 0, 11_000_000);
+        let (shown, _) = truncate_rows(rows, None, 100);
+        assert!(shown.len() <= 100 && shown.len() >= 90);
+        // First and last shown rows should bracket most of the window.
+        let first = shown.first().unwrap().t;
+        let last = shown.last().unwrap().t;
+        assert!(first < 1_000_000, "coverage starts near window start");
+        assert!(last > 9_000_000, "coverage reaches window end");
+    }
 }
 
 #[cfg(test)]

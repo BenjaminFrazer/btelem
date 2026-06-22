@@ -1,6 +1,6 @@
 //! Pure UI state and logic — no egui dependencies. Headless-testable.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use btelem_store::{ChannelId, ChannelInfo, ChannelKind};
 use serde::{Deserialize, Serialize};
@@ -104,10 +104,99 @@ pub struct LogViewPanel {
     pub columns: Vec<ChannelId>,
     /// Which columns are visible (indices into `columns`). Order = display order.
     pub visible: Vec<usize>,
-    /// Per-column filter strings. Sparse: absent = no filter.
-    pub filters: HashMap<ChannelId, String>,
+    /// Per-column filter predicates. Sparse: absent = identity (accept all).
+    /// A row is visible iff EVERY column's predicate accepts its value
+    /// (logical AND across columns).
+    pub filters: HashMap<ChannelId, ColumnFilter>,
     /// Channel used to colour rows. None = no colouring.
     pub color_by: Option<ChannelId>,
+    /// Channel whose value is the truncation *priority score*: higher value =
+    /// more likely to be kept. Truncation fills whole score-tiers highest-first
+    /// until the budget is reached. None = even-over-time truncation.
+    pub priority_by: Option<ChannelId>,
+    /// Maximum rows to display after filtering. Truncation reduces to this.
+    pub max_rows: usize,
+}
+
+/// Default display-row budget for a LogView.
+pub const LOG_VIEW_DEFAULT_MAX_ROWS: usize = 1000;
+
+/// A value presented to a [`ColumnFilter`] predicate. Text columns yield
+/// `Text`; numeric/enum columns yield `Num` (enum raw value cast to f64).
+#[derive(Debug, Clone, Copy)]
+pub enum FilterValue<'a> {
+    Text(&'a str),
+    Num(f64),
+}
+
+/// A per-column filter predicate: conceptually the set of accepted values for
+/// that column. An absent filter is the identity predicate (accepts all). The
+/// final visible set is the logical AND of every column's predicate.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnFilter {
+    /// Substring match on the displayed text (optionally case-sensitive).
+    Text { needle: String, case_sensitive: bool },
+    /// Inclusive numeric range; either bound optional (open).
+    Range { min: Option<f64>, max: Option<f64> },
+    /// Membership in a set of enum raw values (from the schema's label set).
+    EnumSet { allowed: BTreeSet<u32> },
+}
+
+impl ColumnFilter {
+    /// Does this filter accept a row whose value in this column is `value`?
+    /// A missing value (`None`) is rejected by any active predicate.
+    pub fn accepts(&self, value: Option<FilterValue<'_>>) -> bool {
+        match self {
+            ColumnFilter::Text { needle, case_sensitive } => {
+                if needle.trim().is_empty() {
+                    return true; // identity
+                }
+                match value {
+                    Some(FilterValue::Text(s)) => {
+                        if *case_sensitive {
+                            s.contains(needle.as_str())
+                        } else {
+                            s.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            ColumnFilter::Range { min, max } => match value {
+                Some(FilterValue::Num(n)) => {
+                    if let Some(lo) = min {
+                        if n < *lo {
+                            return false;
+                        }
+                    }
+                    if let Some(hi) = max {
+                        if n > *hi {
+                            return false;
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            },
+            ColumnFilter::EnumSet { allowed } => match value {
+                Some(FilterValue::Num(n)) => allowed.contains(&(n as u32)),
+                _ => false,
+            },
+        }
+    }
+
+    /// True if this filter actually constrains anything (i.e. is not the
+    /// identity predicate). Inactive filters can be pruned / omitted from
+    /// serialization. Note an `EnumSet` is always considered active — even an
+    /// empty set is an explicit "show none" constraint; the UI removes the
+    /// filter entirely when the user selects all members.
+    pub fn is_active(&self) -> bool {
+        match self {
+            ColumnFilter::Text { needle, .. } => !needle.trim().is_empty(),
+            ColumnFilter::Range { min, max } => min.is_some() || max.is_some(),
+            ColumnFilter::EnumSet { .. } => true,
+        }
+    }
 }
 
 /// How a scalar signal is drawn.
@@ -276,6 +365,8 @@ impl LogViewPanel {
             visible: Vec::new(),
             filters: HashMap::new(),
             color_by: None,
+            priority_by: None,
+            max_rows: LOG_VIEW_DEFAULT_MAX_ROWS,
         }
     }
 }
@@ -1468,6 +1559,62 @@ mod tests {
         let p = PlotKind::LogView(LogViewPanel::new("log", "my_log"));
         assert!(!p.accepts(&scalar(1, "my_log.value")));
         assert!(!p.accepts(&state(2, "my_log.state")));
+    }
+
+    // ---- ColumnFilter predicates ----
+
+    #[test]
+    fn text_filter_substring_case_insensitive_by_default() {
+        let f = ColumnFilter::Text { needle: "err".into(), case_sensitive: false };
+        assert!(f.accepts(Some(FilterValue::Text("HARD ERROR"))));
+        assert!(f.accepts(Some(FilterValue::Text("error here"))));
+        assert!(!f.accepts(Some(FilterValue::Text("all good"))));
+        // numeric value or missing -> reject
+        assert!(!f.accepts(Some(FilterValue::Num(3.0))));
+        assert!(!f.accepts(None));
+    }
+
+    #[test]
+    fn text_filter_empty_is_identity() {
+        let f = ColumnFilter::Text { needle: "  ".into(), case_sensitive: false };
+        assert!(!f.is_active());
+        assert!(f.accepts(Some(FilterValue::Text("anything"))));
+    }
+
+    #[test]
+    fn text_filter_case_sensitive() {
+        let f = ColumnFilter::Text { needle: "Err".into(), case_sensitive: true };
+        assert!(f.accepts(Some(FilterValue::Text("Err!"))));
+        assert!(!f.accepts(Some(FilterValue::Text("err!"))));
+    }
+
+    #[test]
+    fn range_filter_bounds_optional() {
+        let lo = ColumnFilter::Range { min: Some(2.0), max: None };
+        assert!(!lo.accepts(Some(FilterValue::Num(1.0))));
+        assert!(lo.accepts(Some(FilterValue::Num(2.0))));
+        assert!(lo.accepts(Some(FilterValue::Num(99.0))));
+
+        let band = ColumnFilter::Range { min: Some(2.0), max: Some(5.0) };
+        assert!(!band.accepts(Some(FilterValue::Num(1.9))));
+        assert!(band.accepts(Some(FilterValue::Num(3.0))));
+        assert!(!band.accepts(Some(FilterValue::Num(5.1))));
+        // text/missing -> reject
+        assert!(!band.accepts(Some(FilterValue::Text("x"))));
+        assert!(!band.accepts(None));
+    }
+
+    #[test]
+    fn enum_set_membership() {
+        let f = ColumnFilter::EnumSet { allowed: [1u32, 3u32].into_iter().collect() };
+        assert!(f.accepts(Some(FilterValue::Num(1.0))));
+        assert!(!f.accepts(Some(FilterValue::Num(2.0))));
+        assert!(f.accepts(Some(FilterValue::Num(3.0))));
+        assert!(!f.accepts(None));
+        // empty set = explicit show-none
+        let none = ColumnFilter::EnumSet { allowed: BTreeSet::new() };
+        assert!(!none.accepts(Some(FilterValue::Num(1.0))));
+        assert!(none.is_active());
     }
 
     // ---- LogicAnalyserPanel ----
