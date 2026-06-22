@@ -276,6 +276,9 @@ pub fn render_logic_analyser(
 struct LogColumn {
     id: ChannelId,
     label: String,
+    /// True for Text channels — these expand to fill available space.
+    /// Numeric/state columns stay compact.
+    is_text: bool,
 }
 
 #[derive(Clone)]
@@ -358,9 +361,11 @@ pub fn render_log_view(
                     .iter()
                     .filter_map(|&idx| {
                         let ch = *panel.columns.get(idx)?;
+                        let info = ctx.by_id.get(&ch)?;
                         Some(LogColumn {
                             id: ch,
-                            label: strip_group_prefix(&ctx.by_id.get(&ch)?.path).to_string(),
+                            label: strip_group_prefix(&info.path).to_string(),
+                            is_text: matches!(info.kind, ChannelKind::Text),
                         })
                     })
                     .collect();
@@ -372,24 +377,38 @@ pub fn render_log_view(
                     return;
                 }
 
-                let column_count = visible_cols.len() + 1;
-                ui.columns(column_count, |cols| {
-                    cols[0].strong("t [s]");
-                    for (i, col) in visible_cols.iter().enumerate() {
-                        cols[i + 1].strong(&col.label);
-                    }
-                });
+                // Column widths: timestamp and numeric/state columns are compact,
+                // text columns expand to share remaining horizontal space.
+                let compact_w: f32 = 100.0; // timestamp + numeric columns
+                let text_col_count = visible_cols.iter().filter(|c| c.is_text).count() as f32;
+                let avail = ui.available_width();
+                let compact_total = compact_w * (1.0 + visible_cols.iter().filter(|c| !c.is_text).count() as f32);
+                let text_w = if text_col_count > 0.0 {
+                    ((avail - compact_total) / text_col_count).max(compact_w)
+                } else {
+                    compact_w
+                };
 
+                // Header + filter row
                 if let Some(PlotKind::LogView(p)) = ctx.plots.get_mut(plot_id) {
                     let mut to_prune = Vec::new();
-                    ui.columns(column_count, |cols| {
-                        cols[0].label("");
-                        for (i, col) in visible_cols.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(egui::vec2(compact_w, ui.spacing().interact_size.y),
+                            egui::Label::new(egui::RichText::new("t [s]").strong()));
+                        for col in &visible_cols {
+                            let w = if col.is_text { text_w } else { compact_w };
+                            ui.add_sized(egui::vec2(w, ui.spacing().interact_size.y),
+                                egui::Label::new(egui::RichText::new(&col.label).strong()));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(compact_w + ui.spacing().item_spacing.x);
+                        for col in &visible_cols {
+                            let w = if col.is_text { text_w } else { compact_w };
                             let filter = p.filters.entry(col.id).or_default();
-                            cols[i + 1].add(
-                                egui::TextEdit::singleline(filter)
-                                    .hint_text("filter")
-                                    .desired_width(f32::INFINITY),
+                            ui.add_sized(
+                                egui::vec2(w, ui.spacing().interact_size.y),
+                                egui::TextEdit::singleline(filter).hint_text("filter"),
                             );
                             if filter.trim().is_empty() {
                                 to_prune.push(col.id);
@@ -410,9 +429,11 @@ pub fn render_log_view(
                     .iter()
                     .filter_map(|&idx| {
                         let ch = *panel.columns.get(idx)?;
+                        let info = ctx.by_id.get(&ch)?;
                         Some(LogColumn {
                             id: ch,
-                            label: strip_group_prefix(&ctx.by_id.get(&ch)?.path).to_string(),
+                            label: strip_group_prefix(&info.path).to_string(),
+                            is_text: matches!(info.kind, ChannelKind::Text),
                         })
                     })
                     .collect();
@@ -514,7 +535,7 @@ pub fn render_log_view(
                 }
 
                 let fallback_bounds = ((t0 as f64) / 1e9, (t1 as f64) / 1e9);
-                egui::ScrollArea::both()
+                egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for row in filtered_rows {
@@ -539,16 +560,25 @@ pub fn render_log_view(
                                 .fill(fill)
                                 .inner_margin(egui::vec2(4.0, 2.0))
                                 .show(ui, |ui| {
-                                    ui.columns(column_count, |cols| {
-                                        cols[0].monospace(format!("{:.6}", (row.t as f64) / 1e9));
-                                        for (i, col) in visible_cols.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized(
+                                            egui::vec2(compact_w, ui.spacing().interact_size.y),
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("{:.6}", (row.t as f64) / 1e9)).monospace(),
+                                            ),
+                                        );
+                                        for col in &visible_cols {
+                                            let w = if col.is_text { text_w } else { compact_w };
                                             let value = row.cells.get(&col.id).cloned().unwrap_or_default();
                                             let rich = if let Some(color) = text_colour {
                                                 egui::RichText::new(value).color(color)
                                             } else {
                                                 egui::RichText::new(value)
                                             };
-                                            cols[i + 1].label(rich);
+                                            ui.add_sized(
+                                                egui::vec2(w, ui.spacing().interact_size.y),
+                                                egui::Label::new(rich).truncate(),
+                                            );
                                         }
                                     });
                                 });
