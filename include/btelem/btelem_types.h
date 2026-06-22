@@ -180,6 +180,26 @@ struct btelem_schema_entry {
       (uint16_t)sizeof(((stype *)0)->member), \
       BTELEM_STRING, 1, NULL, NULL }
 
+/* Compute a schema entry's field_count from its field-definition array, with a
+ * built-in compile-time guard against exceeding BTELEM_MAX_FIELDS.
+ *
+ * Use this for hand-rolled schema entries that set .field_count directly
+ * (instead of via BTELEM_SCHEMA_ENTRY) — e.g. token-pasted or parameterised
+ * entries. It evaluates to the field count as a uint16_t, but fails the build
+ * loudly if the array is too long for the fixed wire format (which a strict
+ * reader such as the Rust viewer rejects, while the Python parser silently
+ * clamps it).
+ */
+#define BTELEM_FIELD_COUNT(_fields) \
+    (sizeof(struct { \
+        _Static_assert(sizeof(_fields) / sizeof((_fields)[0]) <= BTELEM_MAX_FIELDS, \
+            "btelem schema field array '" #_fields "' has more fields than " \
+            "BTELEM_MAX_FIELDS; either reduce field count, group members into " \
+            "an array/sub-struct, or raise BTELEM_MAX_FIELDS in btelem_types.h " \
+            "(must match Python and Rust viewer)"); \
+        char _c; \
+    }) ? (uint16_t)(sizeof(_fields) / sizeof((_fields)[0])) : (uint16_t)0)
+
 /* Declare a complete schema entry (creates the schema_entry const).
  *
  * Compile-time guards:
