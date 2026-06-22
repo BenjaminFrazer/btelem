@@ -235,7 +235,7 @@ pub fn list() -> io::Result<Vec<String>> {
         }
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(layout) = serde_json::from_slice::<Layout>(&bytes) {
-                if matches!(layout.version, 1 | 3 | 4 | SCHEMA_VERSION) {
+                if matches!(layout.version, 1 | 3 | 4 | 5 | SCHEMA_VERSION) {
                     names.push(layout.name);
                 }
             }
@@ -252,7 +252,7 @@ pub fn load(name: &str) -> io::Result<Layout> {
     // Accept v1 (legacy `TimeSeries`), v3 (no markers), and v4 (chain-based
     // markers) layout files and migrate them on load. v4 chain groups are
     // converted to explicit links. Reject anything else.
-    if !matches!(layout.version, 1 | 3 | 4 | SCHEMA_VERSION) {
+    if !matches!(layout.version, 1 | 3 | 4 | 5 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
