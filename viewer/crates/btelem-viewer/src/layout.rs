@@ -33,6 +33,18 @@ use crate::view_state::{
 /// pairing instead of explicit links).
 pub const SCHEMA_VERSION: u32 = 6;
 
+/// Minimum layout version the loader accepts. Versions 0 and 2 were
+/// never emitted (v2 was skipped); everything from v1 onward is
+/// loadable via migration.
+const MIN_VERSION: u32 = 1;
+
+/// True if `v` is a layout version this code can load. Accepts any
+/// version in `[MIN_VERSION, SCHEMA_VERSION]` — new versions only
+/// need to bump `SCHEMA_VERSION` without touching call-sites.
+pub fn version_supported(v: u32) -> bool {
+    v >= MIN_VERSION && v <= SCHEMA_VERSION
+}
+
 /// In-memory representation of a layout file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Layout {
@@ -235,7 +247,7 @@ pub fn list() -> io::Result<Vec<String>> {
         }
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(layout) = serde_json::from_slice::<Layout>(&bytes) {
-                if matches!(layout.version, 1 | 3 | 4 | 5 | SCHEMA_VERSION) {
+                if crate::layout::version_supported(layout.version) {
                     names.push(layout.name);
                 }
             }
@@ -252,7 +264,7 @@ pub fn load(name: &str) -> io::Result<Layout> {
     // Accept v1 (legacy `TimeSeries`), v3 (no markers), and v4 (chain-based
     // markers) layout files and migrate them on load. v4 chain groups are
     // converted to explicit links. Reject anything else.
-    if !matches!(layout.version, 1 | 3 | 4 | 5 | SCHEMA_VERSION) {
+    if !crate::layout::version_supported(layout.version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(

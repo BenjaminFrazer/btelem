@@ -388,7 +388,7 @@ impl ViewerApp {
             Ok(l) => l,
             Err(e) => return Some(format!("layout sidecar parse failed: {e}")),
         };
-        if !matches!(layout.version, 1 | 3 | 4 | 5 | crate::layout::SCHEMA_VERSION) {
+        if !crate::layout::version_supported(layout.version) {
             return Some(format!(
                 "layout sidecar version {} unsupported",
                 layout.version
@@ -430,7 +430,7 @@ impl ViewerApp {
                 return;
             }
         };
-        if !matches!(layout.version, 1 | 3 | 4 | 5 | crate::layout::SCHEMA_VERSION) {
+        if !crate::layout::version_supported(layout.version) {
             self.flash(format!(
                 "layout version {} unsupported",
                 layout.version
