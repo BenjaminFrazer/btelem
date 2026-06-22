@@ -114,6 +114,10 @@ pub struct ViewerApp {
     /// Display name of the most recently loaded/saved layout, if any.
     /// Drives the "Save" menu entry (greyed when None).
     current_layout_name: Option<String>,
+    /// When a layout was loaded from an external file (via `--layout`),
+    /// this holds the source path so "Save" writes back to it instead
+    /// of the config directory.
+    current_layout_path: Option<PathBuf>,
     /// When `Some`, the Save As… popup is open and the contained
     /// string is the in-progress name buffer.
     save_as_buffer: Option<String>,
@@ -224,6 +228,7 @@ impl ViewerApp {
             group_counts: HashMap::new(),
             group_counts_last_refresh: None,
             current_layout_name: None,
+            current_layout_path: None,
             save_as_buffer: None,
             delete_confirm: None,
             status_flash: None,
@@ -443,6 +448,7 @@ impl ViewerApp {
         self.dock = dock;
         self.next_plot_num = self.plots.len() + 1;
         self.current_layout_name = Some(layout.name.clone());
+        self.current_layout_path = Some(path.to_path_buf());
         self.markers.restore(
             layout
                 .markers
@@ -889,7 +895,12 @@ impl ViewerApp {
             let saved = crate::layout::list().unwrap_or_default();
             // Current layout label
             if let Some(name) = &self.current_layout_name {
-                ui.label(egui::RichText::new(format!("current: {name}")).italics().weak());
+                let detail = if let Some(ref p) = self.current_layout_path {
+                    format!("current: {name} ({})", p.display())
+                } else {
+                    format!("current: {name}")
+                };
+                ui.label(egui::RichText::new(detail).italics().weak());
                 ui.separator();
             }
             // Save (only when we know the current name)
@@ -944,12 +955,27 @@ impl ViewerApp {
     fn do_save_layout(&mut self, name: &str) {
         let by_id = self.channels_by_id();
         let snap = crate::layout::capture(name, &self.plots, &self.dock, &by_id, &self.markers);
-        match crate::layout::save(&snap) {
-            Ok(()) => {
-                self.current_layout_name = Some(name.to_string());
-                self.flash(format!("layout '{name}' saved"));
+        if let Some(ref path) = self.current_layout_path {
+            // Save back to the external file the layout was loaded from.
+            let bytes = match serde_json::to_vec_pretty(&snap) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.flash(format!("save failed: {e}"));
+                    return;
+                }
+            };
+            match std::fs::write(path, bytes) {
+                Ok(()) => self.flash(format!("layout '{name}' saved to {}", path.display())),
+                Err(e) => self.flash(format!("save failed: {e}")),
             }
-            Err(e) => self.flash(format!("save failed: {e}")),
+        } else {
+            match crate::layout::save(&snap) {
+                Ok(()) => {
+                    self.current_layout_name = Some(name.to_string());
+                    self.flash(format!("layout '{name}' saved"));
+                }
+                Err(e) => self.flash(format!("save failed: {e}")),
+            }
         }
     }
 
@@ -970,6 +996,7 @@ impl ViewerApp {
         // numbering, so just count past existing.
         self.next_plot_num = self.plots.len() + 1;
         self.current_layout_name = Some(layout.name.clone());
+        self.current_layout_path = None; // loaded from config dir, not external file
         self.markers.restore(
             layout
                 .markers
